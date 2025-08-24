@@ -1,0 +1,2358 @@
+import numpy as np
+from tqdm import tqdm, trange
+import torch
+import torch.multiprocessing as mp
+import torch.nn as nn
+import copy
+import matplotlib.pyplot as plt
+import os
+import time
+import math
+import pynvml
+from math import ceil, log2
+from scipy.linalg import hadamard
+from scipy.fftpack import dct, idct
+from itertools import combinations
+from PIL import Image
+import io
+
+
+class BinaryQuadraticQuantization():
+    def __init__(self): pass
+
+
+    def patchify(self, tensor, max_patch_size):
+        """
+        テンソルをパッチに分割する関数
+
+        Args:
+            tensor: 分割するテンソル (バッチxチャンネルx高さx幅)
+            max_patch_size: パッチの最大サイズ (int)
+
+        Returns:
+            パッチに分割されたテンソル
+        """
+
+        height, width = tensor.shape
+
+        # 各次元の最大約数を計算 (256以下)
+        
+        def get_max_divisor(num, max_value):
+            """
+            与えられた数値の最大約数を、指定された最大値以下で求める関数
+
+            Args:
+                num: 約数を求める数値
+                max_value: 最大約数の最大値
+
+            Returns:
+                最大約数
+            """
+
+            # 最大約数の探索範囲を決定
+            limit = max(int(math.sqrt(num)), max_value)
+
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        patch_height = get_max_divisor(height, max_patch_size)
+        patch_width = get_max_divisor(width, max_patch_size)
+        print('Patch Size:({0}x{1})'.format(patch_height, patch_width))
+
+        # unfold関数でパッチに分割 (パッチサイズはpatch_height x patch_width, patch_height x patch_width間隔で切り出す)
+        return tensor.unfold(0, patch_height, patch_height).unfold(1, patch_width, patch_width)
+    
+    def unpatchify(self, patches, original_shape):
+        """
+        パッチから元のテンソルを復元する関数
+
+        Args:
+            patches: パッチに分割されたテンソル (バッチxパッチ高さxパッチ幅xパッチサイズxパッチサイズ)
+            original_shape: 元のテンソルの形状 (チャンネルx高さx幅)
+
+        Returns:
+            復元されたテンソル
+        """
+        num_patches_h, num_patches_w, patch_height, patch_width = patches.shape
+        height, width = original_shape
+
+        # 元の形状と整合性の確認
+        assert height == num_patches_h * patch_height, "Height mismatch between patches and original shape"
+        assert width == num_patches_w * patch_width, "Width mismatch between patches and original shape"
+
+        # パッチを再構成
+        reconstructed_tensor = torch.zeros((height, width), device=patches.device)
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                reconstructed_tensor[
+                    i * patch_height: (i + 1) * patch_height,
+                    j * patch_width: (j + 1) * patch_width
+                ] = patches[i, j, :, :]
+
+        return reconstructed_tensor
+
+
+    def run_bqq_compile(self, x, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, device_id=0, seed=1):
+        torch.set_float32_matmul_precision('high')
+        torch.manual_seed(seed)
+
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        if len(x.shape)!=2:
+            raise ValueError('Dimention Error: Please Input 2-dim Matrix !!')
+        n, m = x.shape
+        x = x.to(device).float()
+        maximum = (x.max() - x.min())
+        x = x / maximum
+        coeff = -2 * x.sum()
+        num_element = torch.tensor(n * m, device=device)
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+        temp = copy.copy(Tinit)
+
+        rank = round(rank_scale*(n*m)/(n+m))
+    
+        yb = torch.rand((n, rank), device=device).float()
+        zb = torch.rand((rank, m), device=device).float()
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+        
+
+
+        def compute_a(y, z):
+
+            yz, sigma_y, sigma_z = y @ z, y.sum(dim=1, keepdim=True), z.sum(dim=0, keepdim=True)
+            # スケーリング係数の最適化
+            r0c0 = (yz**2 + yz - (y**2 @ z**2)).sum()
+            r0c1 = ((sigma_y + 1) * yz - y**2 @ z).sum()
+            r0c2 = ((1 + sigma_z) * yz - y @ z**2).sum()
+            r0c3 = yz.sum()
+            r1c1 = (sigma_y**2 + sigma_y - (y**2).sum(axis=1).unsqueeze(1)).sum() * m
+            r1c2 = (sigma_y * sigma_z).sum()
+            r1c3 = sigma_y.sum() * m
+            r2c2 = (sigma_z**2 + sigma_z - (z**2).sum(axis=0).unsqueeze(0)).sum() * n
+            r2c3 = sigma_z.sum() * n
+            r3c3 = num_element
+            
+            # hesseとvをインプレースでなく再生成
+            hesse = 2 * torch.stack([
+                torch.stack([r0c0, r0c1, r0c2, r0c3]),
+                torch.stack([r0c1, r1c1, r1c2, r1c3]),
+                torch.stack([r0c2, r1c2, r2c2, r2c3]),
+                torch.stack([r0c3, r1c3, r2c3, r3c3])
+            ])
+            
+            v = torch.stack([
+                (-2 * x * yz).sum(),
+                (-2 * x * sigma_y).sum(),
+                (-2 * x * sigma_z).sum(),
+                coeff
+            ])
+  
+            try:
+                # 通常の解法を試みる
+                return -torch.linalg.solve(hesse, v)
+            except RuntimeError as e:
+                # 特異な場合などにエラーが出たら pinv を使って解く
+                if "singular" in str(e) or "input is not invertible" in str(e):
+                    return -torch.matmul(torch.linalg.pinv(hesse, rcond=1e-15), v)
+                else: raise
+        
+
+        a = compute_a(y, z)
+
+        @torch.compile(mode="max-autotune", backend="inductor")
+        def loop_body(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+                part = x - (a[3] + a[0] * (yf @ zf) + a[1] * yf.sum(dim=1, keepdim=True) + a[2] * zf.sum(dim=0, keepdim=True))
+
+                y_energy_grad = (-2 * part @ (a[0] * zf + a[1]).T) + (a[0]**2 + 2*a[0]*a[1]*(1 - 2*yf) + 2*a[0]*a[2]) * (zf.sum(axis=1).unsqueeze(0)) - 2 * (a[0]*a[2] + a[0]**2 * yf) * (zf**2).sum(axis=1).unsqueeze(0) + (a[1]**2) * (1 - 2 * yf) * m
+                z_energy_grad = (-2 * (a[0] * yf + a[2]).T @ part) + (a[0]**2 + 2*a[0]*a[1] + 2*a[0]*a[2]*(1 - 2*zf)) * (yf.sum(axis=0).unsqueeze(1)) - 2 * (a[0]**2 * zf + a[0]*a[1]) * (yf**2).sum(axis=0).unsqueeze(1) + (a[2]**2) * (1 - 2 * zf) * n
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(torch.where((y<0.0) | (y>1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+                za = torch.clamp(torch.where((z<0.0) | (z>1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+
+                a = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0))
+            return ya, za, y, z, a
+
+        # gpuに移動
+        temp = torch.tensor(temp, device=device)
+        delta_temp = torch.tensor(delta_temp, device=device)
+        # for _ in trange(Nstep, desc='Decomposing', mininterval=10.0): 
+        for _ in range(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp -= delta_temp
+
+        # 後処理
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_a(y, z)
+
+        return y, z, maximum * a
+    
+    def run_bqq_multibit(self, x, bit_width, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, damping=1e-2, device_id=0, seed=1):
+        torch.set_float32_matmul_precision('high')
+        torch.manual_seed(seed)
+
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        if len(x.shape)!=2:
+            raise ValueError('Dimention Error: Please Input 2-dim Matrix !!')
+        n, m = x.shape
+        x = x.to(device).float()
+        maximum = (x.max() - x.min())
+        x = x / maximum
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+        temp = copy.copy(Tinit)
+
+        rank = round(rank_scale*(n*m)/(n+m))
+
+        def f(x, y, z, a):
+            return ((x - (a[:,0].unsqueeze(-1).unsqueeze(-1)*y@z + a[:,1].unsqueeze(-1).unsqueeze(-1)*y.sum(dim=-1, keepdim=True) + a[:,2].unsqueeze(-1).unsqueeze(-1)*z.sum(dim=-2, keepdim=True) + a[:,3].unsqueeze(-1).unsqueeze(-1)).sum(dim=0))**2).sum()
+
+        grad_y = torch.func.grad(f, argnums=1)
+        grad_z = torch.func.grad(f, argnums=2)
+        grad_a = torch.func.grad(f, argnums=3)
+        hesse_a = torch.func.hessian(f, argnums=3)
+        yb = torch.rand((bit_width, n, rank), device=device).float()
+        zb = torch.rand((bit_width, rank, m), device=device).float()
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+        
+
+
+        def compute_a(y, z, damping=torch.tensor(damping, device=device)):
+            
+            v = grad_a(x, y, z, torch.zeros((bit_width, 4), device=device))
+            v_flat = v.reshape(-1)
+            hesse_flat = hesse_a(x, y, z, torch.zeros((bit_width, 4), device=device)).reshape(v_flat.shape[0], -1)
+            # print('Hesse shape:', hesse_flat, 'v shape:', v_flat)
+  
+            try:
+                # 通常の解法を試みる
+                # return -torch.linalg.solve(hesse_flat + damping*torch.eye(hesse_flat.shape[0], device=hesse_flat.device), v_flat).reshape_as(v)
+                return torch.cholesky_solve(-v_flat.unsqueeze(-1), torch.linalg.cholesky(hesse_flat + damping*torch.eye(hesse_flat.shape[0], device=hesse_flat.device))).squeeze().reshape_as(v)
+                # return torch.linalg.lstsq(hesse_flat + damping*torch.eye(hesse_flat.shape[0], device=hesse_flat.device), -v_flat)[0].squeeze().reshape_as(v)
+            except Exception as e:
+                return -torch.matmul(torch.linalg.pinv(hesse_flat, rcond=1e-15), v_flat).reshape_as(v)
+        
+
+        a = compute_a(y, z)
+
+        @torch.compile(mode="reduce-overhead")
+        def loop_body(y, z, yb, zb, a, temp):
+            yf = (y + zeta * (y - yb))
+            zf = (z + zeta * (z - zb))
+            gy = grad_y(x, yf, zf, a)
+            gz = grad_z(x, yf, zf, a)
+            ggy = 2 * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * zf + a[:,1].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-1).unsqueeze(-2)# (2 * (a[:,0]**2).unsqueeze(-1) * (zf**2).sum(dim=-1) + 2 * (a[:,1]**2).unsqueeze(-1) * m + 4 * a[:,0].unsqueeze(-1) * a[:,1].unsqueeze(-1) * zf.sum(dim=-1)).unsqueeze(-2) 
+            ggz = 2 * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * yf + a[:,2].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-2).unsqueeze(-1)# (2 * (a[:,0]**2).unsqueeze(-1) * (yf**2).sum(dim=-2) + 2 * (a[:,2]**2).unsqueeze(-1) * n + 4 * a[:,0].unsqueeze(-1) * a[:,2].unsqueeze(-1) * yf.sum(dim=-2)).unsqueeze(-1)
+            y_energy_grad = gy + (0.5-yf)*ggy
+            z_energy_grad = gz + (0.5-zf)*ggz
+
+            y_entropy_grad = temp * (y - 0.5)
+            z_entropy_grad = temp * (z - 0.5)
+
+            ya = torch.clamp(torch.where((y<0.0) | (y>1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+            za = torch.clamp(torch.where((z<0.0) | (z>1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+
+            a = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0))
+            return ya, za, y, z, a
+
+        # gpuに移動
+        temp = torch.tensor(temp, device=device)
+        delta_temp = torch.tensor(delta_temp, device=device)
+        zeta = torch.tensor(zeta, device=device).float()
+        eta = torch.tensor(eta, device=device).float()
+        # for _ in trange(Nstep, desc='Decomposing', mininterval=10.0): 
+        for _ in trange(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp -= delta_temp
+            # if _ % 100 == 0:
+            #     print('energy:', f(x, y, z, a).item())
+
+        # 後処理
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_a(y, z)#, damping=damping)
+
+        return y, z, maximum * a
+    
+    def run_activation_aware_bqq_multibit(self, x, input, bit_width, rank_scale=1, zeta=4, eta=15, Tinit=0.007, Tfin=0.0, Nstep=50000, damping=1e-3, clipping=1, device_id=0, seed=1):
+        torch.set_float32_matmul_precision('high')
+        torch.manual_seed(seed)
+
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        if len(x.shape)!=2:
+            raise ValueError('Dimention Error: Please Input 2-dim Matrix !!')
+        n, m = x.shape
+        x = x.to(device).float()
+        maximum = (x.max() - x.min())
+        x = x / maximum
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+        temp = copy.copy(Tinit)
+
+        # preprocess for input tensor
+        input = input.reshape(-1, input.size(-1)).to(device).float()
+        input /= (input.max() - input.min()) 
+        
+
+        s = (input.T @ input)/input.shape[0] # average covariance matrix
+        mean_input = input.mean(dim=0, keepdim=True) # average mean vector
+        
+        # preventing from overflow
+        damping = torch.tensor(float(damping), device=device).float()
+        scale = input.numel() 
+
+        rank = round(rank_scale*(n*m)/(n+m))
+
+        # quantization error function
+        def f(x, y, z, a, s=s):
+            q = (a[:,0].unsqueeze(-1).unsqueeze(-1)*y@z + a[:,1].unsqueeze(-1).unsqueeze(-1)*y.sum(dim=-1, keepdim=True) + a[:,2].unsqueeze(-1).unsqueeze(-1)*z.sum(dim=-2, keepdim=True) + a[:,3].unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
+            return torch.trace((x - q) @ s @ (x - q).T)
+
+        grad_y = torch.func.grad(f, argnums=1)
+        grad_z = torch.func.grad(f, argnums=2)
+        grad_a = torch.func.grad(f, argnums=3)
+        hesse_a = torch.func.hessian(f, argnums=3)
+        yb = torch.rand((bit_width, n, rank), device=device).float()
+        zb = torch.rand((bit_width, rank, m), device=device).float()
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+        
+
+
+        def compute_a(y, z, a):
+            v = grad_a(x, y, z, torch.zeros((bit_width, 4), device=device))
+            v_flat = v.reshape(-1)
+            # scaling in order to prevent from overflow
+            # scale = input.numel() 
+            H_scaled = hesse_a(x, y, z, torch.zeros((bit_width, 4), device=device), s/scale).reshape(v_flat.shape[0], -1)
+            v_scaled = v_flat / scale
+
+            try:
+                sol = torch.cholesky_solve(
+                    -v_scaled.unsqueeze(-1),
+                    torch.linalg.cholesky(H_scaled + damping * torch.eye(H_scaled.shape[0], device=device))
+                )
+                # if torch.isnan(sol).any() and not (torch.isnan(H_scaled).any() or torch.isnan(v_scaled).any()):
+                #     print('solving squared error 1')
+                return   sol.squeeze().reshape_as(v)
+            except Exception as e:
+                sol =  - torch.matmul(torch.linalg.pinv(H_scaled, rcond=1e-8), v_scaled).reshape_as(v).float()
+                return sol
+
+
+        a = compute_a(y, z, torch.zeros((bit_width, 4), device=device))
+
+        @torch.compile(mode="reduce-overhead")
+        def loop_body(y, z, yb, zb, a, temp):
+            yf = (y + zeta * (y - yb))
+            # yf = torch.clamp((y + zeta * (y - yb)), 0, 1)
+            zf = (z + zeta * (z - zb))
+            # zf = torch.clamp((z + zeta * (z - zb)), 0, 1)
+            gy = grad_y(x, yf, zf, a)
+            gz = grad_z(x, yf, zf, a)
+            ggy = 2 * mean_input.unsqueeze(0) @ torch.transpose((a[:,0].unsqueeze(-1).unsqueeze(-1) * zf + a[:,1].unsqueeze(-1).unsqueeze(-1))**2, -1, -2)
+            ggz = 2 * mean_input.unsqueeze(0) * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * yf + a[:,2].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-2).unsqueeze(-1)
+            y_energy_grad = torch.clamp(gy + (0.5-yf) * ggy, -clipping, clipping)
+            z_energy_grad = torch.clamp(gz + (0.5-zf) * ggz, -clipping, clipping)
+
+            y_entropy_grad = temp * (y - 0.5)
+            z_entropy_grad = temp * (z - 0.5)
+
+            # print('ygrad, zgrad', gy.mean(), gz.mean(), ggy.mean(), ggz.mean())
+            # ya = torch.clamp(torch.where((yf<=0.0) | (yf>=1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+            # za = torch.clamp(torch.where((zf<=0.0) | (zf>=1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+            ya = torch.clamp(torch.where((2*y - yb<=0.0) | (2*y - yb>=1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+            za = torch.clamp(torch.where((2*z - zb<=0.0) | (2*z - zb>=1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+            # ya = torch.clamp(2*y - yb - eta * (y_energy_grad + y_entropy_grad), 0, 1)
+            # za = torch.clamp(2*z - zb - eta * (z_energy_grad + z_entropy_grad), 0, 1)
+
+
+            # a = torch.nan_to_num(compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0), a), nan=0.0)
+            a_new = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0), a)
+            a = torch.where(torch.isnan(a_new), a, a_new)
+            # a = compute_a(ya, za, a)
+            # if torch.isnan(ya).any() or torch.isnan(za).any() or torch.isnan(a).any():
+            #     print(torch.isnan(ya).any(), torch.isnan(ya).any(), torch.isnan(a).any())
+            return ya, za, y, z, a
+
+        # gpuに移動
+        temp = torch.tensor(float(temp), device=device).float()
+        delta_temp = torch.tensor(float(delta_temp), device=device).float()
+        zeta = torch.tensor(float(zeta), device=device).float()
+        eta = torch.tensor(float(eta), device=device).float()
+        # for _ in trange(Nstep, desc='Decomposing', mininterval=10.0): 
+        for _ in trange(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp -= delta_temp
+
+            if _ % 1000 == 0:
+                # print(torch.isnan(y).any(), torch.isnan(z).any(), torch.isnan(a).any(), torch.isnan(f(x, y, z, a, s).any()))
+                print('(y,z):', ((y-0.5)**2).mean().item(),((z-0.5)**2).mean().item())
+                print('energy:', f(x, y, z, a, s).item())
+
+        # 後処理
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_a(y, z, a)
+
+        return y, z, maximum * a
+    
+
+    def bqq_worker_task(self, queue, result_list, rank_scale, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
+
+        """ 各ワーカーが処理する行列分解タスク """
+        torch.manual_seed(seed)
+        torch.cuda.set_device(device_id)
+        # print(f"[PID {os.getpid()}] Using device: cuda:{device_id}")
+        if save_name is None:
+            save = False
+        else: save = True
+        while not queue.empty():
+            try:
+                data = queue.get_nowait()
+            except:
+                break
+
+            i, j, patch = data['i'], data['j'], data['patch']
+            device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+            res_x = patch.detach().clone().to(device)
+
+            decomposed_patches = []
+
+
+            for bit_idx in range(bit_width):
+                y, z, a = BinaryQuadraticQuantization().run_bqq_compile(x=res_x.detach().clone(), rank_scale=rank_scale, zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin, Nstep=Nstep, device_id=device_id, seed=seed)
+                reconst = a[0] * y@z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
+                res_x -= reconst
+
+                if save:
+                    data = {'patch_row': i, 'patch_col': j, 'coeff': a.cpu(), 'mat1': y.cpu(), 'mat2': z.cpu(), 'bit_idx': bit_idx}
+                    decomposed_patches.append(data)
+
+            if save:
+                torch.save(decomposed_patches, f"{save_name}_row{i}_col{j}.pth")
+            result_list.append({'i': i, 'j': j, 'reconstructed': (patch.cpu() - res_x.cpu()).clone().detach()})
+            queue.task_done()
+
+
+    def hadamard_bqq_worker_task(self, queue, result_list, rank_scale, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
+
+        """ 各ワーカーが処理する行列分解タスク """
+        torch.manual_seed(seed)
+        torch.cuda.set_device(device_id)
+        # print(f"[PID {os.getpid()}] Using device: cuda:{device_id}")
+        if save_name is None:
+            save = False
+        else: save = True
+        while not queue.empty():
+            try:
+                data = queue.get_nowait()
+            except:
+                break
+
+            i, j, patch = data['i'], data['j'], data['patch']
+            device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+            n_row, n_col = patch.shape
+            assert (n_col & (n_col - 1) == 0) and n_col > 0, "Patch n_col must be 2^k"
+            patch = (patch @ hadamard(n_col))/n_col # hadamard変換を適用
+            patch = patch.detach().clone().cpu()
+            res_x = patch.detach().clone().to(device)
+
+            decomposed_patches = []
+
+
+            for bit_idx in range(bit_width):
+                y, z, a = BinaryQuadraticQuantization().run_bqq_compile(x=res_x.detach().clone(), rank_scale=rank_scale, zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin, Nstep=Nstep, device_id=device_id, seed=seed)
+                reconst = a[0] * y@z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
+                res_x -= reconst
+
+                if save:
+                    data = {'patch_row': i, 'patch_col': j, 'coeff': a.cpu(), 'mat1': y.cpu(), 'mat2': z.cpu(), 'bit_idx': bit_idx}
+                    decomposed_patches.append(data)
+
+            if save:
+                torch.save(decomposed_patches, f"{save_name}_row{i}_col{j}.pth")
+            result_list.append({'i': i, 'j': j, 'reconstructed': (patch.to(device) - res_x).clone().detach().cpu()})
+            queue.task_done()
+
+
+    def bqq_large_matrix_multi_worker(self, x, rank_scale, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
+        """
+        大きな行列をパッチに分割し、並列に行列分解を実行して復元
+        """
+        torch.manual_seed(seed)
+        mp.set_start_method("spawn", force=True)
+        x_copy = x.cpu().float().clone()
+        divided_tensor = self.patchify(x_copy, max_patch_size=max_patch_size)
+        num_patches_h, num_patches_w, _, _ = divided_tensor.shape
+
+        manager = mp.Manager()
+        queue = manager.Queue()
+        result_list = manager.list()
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                patch = divided_tensor[i, j, :, :]
+                queue.put({'i': i, 'j': j, 'patch': patch})
+        
+        num_gpus = torch.cuda.device_count()
+        num_workers = num_gpus * workers_per_gpu
+        processes = []
+        for worker_id in range(min(num_workers, num_patches_h*num_patches_w)):
+            device_id = (worker_id+main_gpu_id) % (num_gpus)
+            p = mp.Process(target=self.bqq_worker_task, args=(queue, result_list, rank_scale, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
+            p.start()
+            processes.append(p)
+        
+        for p in processes:
+            p.join()
+        
+        for data in result_list:
+            i, j = data['i'], data['j']
+            divided_tensor[i, j, :, :] = data['reconstructed']
+        
+        reconstructed_tensor = self.unpatchify(divided_tensor, x.shape)
+        
+        return reconstructed_tensor
+    
+    def hbqq_large_matrix_multi_worker(self, x, rank_scale, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
+        """
+        大きな行列をパッチに分割し、並列に行列分解を実行して復元
+        """
+        torch.manual_seed(seed)
+        mp.set_start_method("spawn", force=True)
+        divided_tensor = self.patchify(x, max_patch_size=max_patch_size)
+        num_patches_h, num_patches_w, _, _ = divided_tensor.shape
+
+        manager = mp.Manager()
+        queue = manager.Queue()
+        result_list = manager.list()
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                patch = divided_tensor[i, j, :, :]
+                queue.put({'i': i, 'j': j, 'patch': patch})
+        
+        num_gpus = torch.cuda.device_count()
+        num_workers = num_gpus * workers_per_gpu
+        processes = []
+        for worker_id in range(min(num_workers, num_patches_h*num_patches_w)):
+            device_id = (worker_id+main_gpu_id) % (num_gpus)
+            p = mp.Process(target=self.hadamard_bqq_worker_task, args=(queue, result_list, rank_scale, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
+            p.start()
+            processes.append(p)
+        
+        for p in processes:
+            p.join()
+        
+        for data in result_list:
+            i, j = data['i'], data['j']
+            divided_tensor[i, j, :, :] = data['reconstructed']
+        
+        reconstructed_tensor = self.unpatchify(divided_tensor, x.shape)
+        
+        return reconstructed_tensor
+
+    
+
+
+
+
+class QuadraticQuantization():
+
+    def __init__(self, x, rank=None, rank_scale=1):
+        self.rank_scale=rank_scale
+        if isinstance(x, torch.Tensor):
+        # GPU上に存在する場合はCPUに移動
+            if x.is_cuda:
+                x = x.detach().cpu()
+                # NumPy配列に変換
+            x = x.float().numpy()
+
+        self.x = copy.copy(x)
+        self.ndim = self.x.ndim
+        self.numel = self.x.size
+        if self.ndim == 2:
+            self.Nrow, self.Ncol = x.shape
+        elif self.ndim ==3:
+            self.batch_size, self.Nrow, self.Ncol = x.shape
+        else:
+            raise ValueError('2次元または3次元のテンソルを入力してください')
+        if rank is None:
+            self.rank = int(self.rank_scale*self.Ncol*self.Nrow/(self.Nrow + self.Ncol))
+        else:
+            self.rank = rank
+    
+        
+
+    def run_qq(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='numpy'):
+        self.delta_temp = (Tinit - Tfin) / (Nstep - 1)
+        temp = copy.copy(Tinit)
+        # GPU デバイスを指定
+        device = torch.device("cuda:{}".format(device_id) if torch.cuda.is_available() else "cpu")
+        n, m = self.x.shape
+        # 初期値
+        torch.manual_seed(seed)
+        yb = torch.rand((n, self.rank), device=device)
+        zb = torch.rand((self.rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+
+        # 入力をGPUに転送
+        x = torch.from_numpy(self.x).float().to(device)
+        maximum = (x.max() - x.min()) #最大幅(最大-最小)
+        x = x/maximum
+        # スケーリングファクタの最終要素の１次係数
+        coeff = -2 * x.sum()
+
+        # パーツの計算
+        yz, y2z2, sigma_y, sigma_y2, sigma_z, sigma_z2 = y @ z, y**2 @ z**2, y.sum(axis=1).unsqueeze(1), (y**2).sum(axis=1).unsqueeze(1), z.sum(axis=0).unsqueeze(0), (z**2).sum(axis=0).unsqueeze(0) 
+
+        # スケーリング係数の最適化
+        r0c0, r0c1, r0c2, r0c3, r1c1, r1c2, r1c3, r2c2, r2c3, r3c3 = (yz**2 + yz - y2z2).sum(), ((sigma_y + 1) * yz - y**2 @ z).sum(), ((1 + sigma_z) * yz - y @ z**2).sum(), yz.sum(), (sigma_y**2 + sigma_y - sigma_y2).sum() * m, (sigma_y * sigma_z).sum(), sigma_y.sum() * m, (sigma_z**2 + sigma_z - sigma_z2).sum() * n, sigma_z.sum() * n, n * m
+        hesse = 2*torch.tensor([[r0c0, r0c1, r0c2, r0c3],
+                    [r0c1, r1c1, r1c2, r1c3],
+                    [r0c2, r1c2, r2c2, r2c3],
+                    [r0c3, r1c3, r2c3, r3c3]], device=device)
+        v = torch.tensor([(-2 * x * yz).sum(), (-2 * x * sigma_y).sum(), (-2 * x * sigma_z).sum(), coeff], device=device)
+        
+        # スケーリング係数の初期値 
+        a = - torch.linalg.solve(hesse, v)
+
+        for _ in range(Nstep):#tqdm(range(Nstep)):
+            # 前進点での計算
+            yf = (y + zeta * (y - yb))
+            zf = (z + zeta * (z - zb))
+
+            # パーツの計算
+            yz, sigma_y, sigma_z = yf @ zf, yf.sum(axis=1).unsqueeze(1), zf.sum(axis=0).unsqueeze(0)
+            part = x - (a[3] + a[0] * yz + a[1] * sigma_y + a[2] * sigma_z) ## sigma_zはaxis=1でsumだけどここではaxis=0でsumなことに注意 (yも同様)
+
+            # 平均場エネルギー勾配の計算 (改良版)
+            y_energy_grad = (-2 * part @ (a[0] * zf + a[1]).T) + (a[0]**2 + 2*a[0]*a[1]*(1 - 2*yf) + 2*a[0]*a[2]) * (zf.sum(axis=1).unsqueeze(0)) - 2 * (a[0]*a[2] + a[0]**2 * yf) * (zf**2).sum(axis=1).unsqueeze(0) + (a[1]**2) * (1 - 2 * yf) * m
+            z_energy_grad = (-2 * (a[0] * yf + a[2]).T @ part) + (a[0]**2 + 2*a[0]*a[1] + 2*a[0]*a[2]*(1 - 2*zf)) * (yf.sum(axis=0).unsqueeze(1)) - 2 * (a[0]**2 * zf + a[0]*a[1]) * (yf**2).sum(axis=0).unsqueeze(1) + (a[2]**2) * (1 - 2 * zf) * n
+
+
+            # yとzの更新
+            y_entropy_grad = temp * (y - 0.5)
+            z_entropy_grad = temp * (z - 0.5)
+
+            ya = torch.clamp(torch.where((y<0.0) | (y>1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb  - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+            za = torch.clamp(torch.where((z<0.0) | (z>1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+
+            # 前の状態を保持
+            yb = y.clone().detach()
+            zb = z.clone().detach()
+            y = ya.clone().detach()
+            z = za.clone().detach()
+
+            # パーツの計算
+            yz, y2z2, sigma_y, sigma_y2, sigma_z, sigma_z2 = y @ z, y**2 @ z**2, y.sum(axis=1).unsqueeze(1), (y**2).sum(axis=1).unsqueeze(1), z.sum(axis=0).unsqueeze(0), (z**2).sum(axis=0).unsqueeze(0) 
+
+            # スケーリング係数の最適化 (改良版)
+            r0c0, r0c1, r0c2, r0c3, r1c1, r1c2, r1c3, r2c2, r2c3, r3c3 = (yz**2 + yz - y2z2).sum(), ((sigma_y + 1) * yz - y**2 @ z).sum(), ((1 + sigma_z) * yz - y @ z**2).sum(), yz.sum(), (sigma_y**2 + sigma_y - sigma_y2).sum() * m, (sigma_y * sigma_z).sum(), sigma_y.sum() * m, (sigma_z**2 + sigma_z - sigma_z2).sum() * n, sigma_z.sum() * n, n * m
+            hesse = 2*torch.tensor([[r0c0, r0c1, r0c2, r0c3],
+                        [r0c1, r1c1, r1c2, r1c3],
+                        [r0c2, r1c2, r2c2, r2c3],
+                        [r0c3, r1c3, r2c3, r3c3]], device=device)
+            v = torch.tensor([(-2 * x * yz).sum(), (-2 * x * sigma_y).sum(), (-2 * x * sigma_z).sum(), coeff], device=device)
+            a = - torch.linalg.solve(hesse, v)
+    
+            # tempの減少
+            temp -= self.delta_temp
+
+        y = torch.where(y>0.5, 1.0, 0.0)
+        z = torch.where(z>0.5, 1.0, 0.0)
+        # パーツの計算
+        yz, y2z2, sigma_y, sigma_y2, sigma_z, sigma_z2 = y @ z, y**2 @ z**2, y.sum(axis=1).unsqueeze(1), (y**2).sum(axis=1).unsqueeze(1), z.sum(axis=0).unsqueeze(0), (z**2).sum(axis=0).unsqueeze(0) 
+        # スケーリング係数の最適化
+        r0c0, r0c1, r0c2, r0c3, r1c1, r1c2, r1c3, r2c2, r2c3, r3c3 = (yz**2 + yz - y2z2).sum(), ((sigma_y + 1) * yz - y**2 @ z).sum(), ((1 + sigma_z) * yz - y @ z**2).sum(), yz.sum(), (sigma_y**2 + sigma_y - sigma_y2).sum() * m, (sigma_y * sigma_z).sum(), sigma_y.sum() * m, (sigma_z**2 + sigma_z - sigma_z2).sum() * n, sigma_z.sum() * n, n * m
+        hesse = 2*torch.tensor([[r0c0, r0c1, r0c2, r0c3],
+                    [r0c1, r1c1, r1c2, r1c3],
+                    [r0c2, r1c2, r2c2, r2c3],
+                    [r0c3, r1c3, r2c3, r3c3]], device=device)
+        v = torch.tensor([(-2 * x * yz).sum(), (-2 * x * sigma_y).sum(), (-2 * x * sigma_z).sum(), coeff], device=device)
+        a = - torch.linalg.solve(hesse, v)
+
+
+        if output_type == 'torch':
+            return y, z, maximum*a
+        else:
+            return y.detach().cpu().numpy(), z.detach().cpu().numpy(), (maximum*a).detach().cpu().numpy()
+        
+
+
+        
+
+    def run_qq_compile(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='numpy'):
+        torch.set_float32_matmul_precision('medium')
+
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        n, m = self.x.shape
+
+        self.delta_temp = (Tinit - Tfin) / (Nstep - 1)
+        temp = copy.copy(Tinit)
+
+        torch.manual_seed(seed)
+        yb = torch.rand((n, self.rank), device=device)
+        zb = torch.rand((self.rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+        
+        x = torch.from_numpy(self.x).float().to(device)
+        maximum = (x.max() - x.min())
+        x = x / maximum
+        coeff = -2 * x.sum()
+        num_element = torch.tensor(n * m, device=device)
+
+
+        def compute_a(y, z):
+
+            yz, sigma_y, sigma_z = y @ z, y.sum(dim=1, keepdim=True), z.sum(dim=0, keepdim=True)
+            # スケーリング係数の最適化
+            r0c0 = (yz**2 + yz - (y**2 @ z**2)).sum()
+            r0c1 = ((sigma_y + 1) * yz - y**2 @ z).sum()
+            r0c2 = ((1 + sigma_z) * yz - y @ z**2).sum()
+            r0c3 = yz.sum()
+            r1c1 = (sigma_y**2 + sigma_y - (y**2).sum(axis=1).unsqueeze(1)).sum() * m
+            r1c2 = (sigma_y * sigma_z).sum()
+            r1c3 = sigma_y.sum() * m
+            r2c2 = (sigma_z**2 + sigma_z - (z**2).sum(axis=0).unsqueeze(0)).sum() * n
+            r2c3 = sigma_z.sum() * n
+            r3c3 = num_element
+            
+            # hesseとvをインプレースでなく再生成
+            hesse = 2 * torch.stack([
+                torch.stack([r0c0, r0c1, r0c2, r0c3]),
+                torch.stack([r0c1, r1c1, r1c2, r1c3]),
+                torch.stack([r0c2, r1c2, r2c2, r2c3]),
+                torch.stack([r0c3, r1c3, r2c3, r3c3])
+            ])
+            
+            v = torch.stack([
+                (-2 * x * yz).sum(),
+                (-2 * x * sigma_y).sum(),
+                (-2 * x * sigma_z).sum(),
+                coeff
+            ])
+  
+            # return -torch.linalg.solve(hesse, v)
+            try:
+                # 通常の解法を試みる
+                return -torch.linalg.solve(hesse, v)
+            except RuntimeError as e:
+                # 特異な場合などにエラーが出たら pinv を使って解く
+                if "singular" in str(e) or "input is not invertible" in str(e):
+                    return -torch.matmul(torch.linalg.pinv(hesse, rcond=1e-15), v)
+                else:
+                    raise  # その他のエラーは再送出
+
+        a = compute_a(y, z)
+
+        @torch.compile(mode="max-autotune", backend="inductor")
+        def loop_body(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+                part = x - (a[3] + a[0] * (yf @ zf) + a[1] * yf.sum(dim=1, keepdim=True) + a[2] * zf.sum(dim=0, keepdim=True))
+
+                y_energy_grad = (-2 * part @ (a[0] * zf + a[1]).T) + (a[0]**2 + 2*a[0]*a[1]*(1 - 2*yf) + 2*a[0]*a[2]) * (zf.sum(axis=1).unsqueeze(0)) - 2 * (a[0]*a[2] + a[0]**2 * yf) * (zf**2).sum(axis=1).unsqueeze(0) + (a[1]**2) * (1 - 2 * yf) * m
+                z_energy_grad = (-2 * (a[0] * yf + a[2]).T @ part) + (a[0]**2 + 2*a[0]*a[1] + 2*a[0]*a[2]*(1 - 2*zf)) * (yf.sum(axis=0).unsqueeze(1)) - 2 * (a[0]**2 * zf + a[0]*a[1]) * (yf**2).sum(axis=0).unsqueeze(1) + (a[2]**2) * (1 - 2 * zf) * n
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(torch.where((y<0.0) | (y>1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+                za = torch.clamp(torch.where((z<0.0) | (z>1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+
+                a = compute_a(ya, za)
+            return ya, za, y, z, a
+
+        # gpuに移動
+        temp = torch.tensor(temp, device=device)
+        self.delta_temp = torch.tensor(self.delta_temp, device=device)
+        for _ in range(Nstep): # trange(Nstep, desc='Decomposing', mininterval=10.0): 
+        # for _ in range(Nstep): 
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp -= self.delta_temp
+
+        # 後処理
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_a(y, z)
+
+        if output_type == 'torch':
+            return y, z, maximum * a
+        else:
+            return y.detach().cpu().numpy(), z.detach().cpu().numpy(), (maximum * a).detach().cpu().numpy()
+        
+
+
+    def patchify(self, tensor, max_patch_size):
+        """
+        テンソルをパッチに分割する関数
+
+        Args:
+            tensor: 分割するテンソル (バッチxチャンネルx高さx幅)
+            max_patch_size: パッチの最大サイズ (int)
+
+        Returns:
+            パッチに分割されたテンソル
+        """
+
+        height, width = tensor.shape
+
+        # 各次元の最大約数を計算 (256以下)
+        
+        def get_max_divisor(num, max_value):
+            """
+            与えられた数値の最大約数を、指定された最大値以下で求める関数
+
+            Args:
+                num: 約数を求める数値
+                max_value: 最大約数の最大値
+
+            Returns:
+                最大約数
+            """
+
+            # 最大約数の探索範囲を決定
+            limit = max(int(math.sqrt(num)), max_value)
+
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        patch_height = get_max_divisor(height, max_patch_size)
+        patch_width = get_max_divisor(width, max_patch_size)
+        print('Patch Size:({0}x{1})'.format(patch_height, patch_width))
+
+        # unfold関数でパッチに分割 (パッチサイズはpatch_height x patch_width, patch_height x patch_width間隔で切り出す)
+        return tensor.unfold(0, patch_height, patch_height).unfold(1, patch_width, patch_width)
+
+    def patchify_3d(self, tensor, max_patch_size=256):
+        """
+        テンソルをパッチに分割する関数
+
+        Args:
+            tensor: 分割するテンソル (バッチxチャンネルx高さx幅)
+            max_patch_size: パッチの最大サイズ (int)
+
+        Returns:
+            パッチに分割されたテンソル
+        """
+
+        channels, height, width = tensor.shape
+
+        # 各次元の最大約数を計算 (256以下)
+        
+        def get_max_divisor(num, max_value):
+            """
+            与えられた数値の最大約数を、指定された最大値以下で求める関数
+
+            Args:
+                num: 約数を求める数値
+                max_value: 最大約数の最大値
+
+            Returns:
+                最大約数
+            """
+
+            # 最大約数の探索範囲を決定
+            limit = max(int(math.sqrt(num)), max_value)
+
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        patch_height = get_max_divisor(height, max_patch_size)
+        patch_width = get_max_divisor(width, max_patch_size)
+        print('Patch Size:({0}x{1})'.format(patch_height, patch_width))
+
+        # unfold関数でパッチに分割 (パッチサイズはpatch_height x patch_width, patch_height x patch_width間隔で切り出す)
+        return tensor.unfold(1, patch_height, patch_height).unfold(2, patch_width, patch_width)
+    
+    def unpatchify(self, patches, original_shape):
+        """
+        パッチから元のテンソルを復元する関数
+
+        Args:
+            patches: パッチに分割されたテンソル (バッチxパッチ高さxパッチ幅xパッチサイズxパッチサイズ)
+            original_shape: 元のテンソルの形状 (チャンネルx高さx幅)
+
+        Returns:
+            復元されたテンソル
+        """
+        num_patches_h, num_patches_w, patch_height, patch_width = patches.shape
+        height, width = original_shape
+
+        # 元の形状と整合性の確認
+        assert height == num_patches_h * patch_height, "Height mismatch between patches and original shape"
+        assert width == num_patches_w * patch_width, "Width mismatch between patches and original shape"
+
+        # パッチを再構成
+        reconstructed_tensor = torch.zeros((height, width), device=patches.device)
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                reconstructed_tensor[
+                    i * patch_height: (i + 1) * patch_height,
+                    j * patch_width: (j + 1) * patch_width
+                ] = patches[i, j, :, :]
+
+        return reconstructed_tensor
+    
+    def unpatchify_3d(self, patches, original_shape):
+        """
+        パッチから元のテンソルを復元する関数
+
+        Args:
+            patches: パッチに分割されたテンソル (バッチxパッチ高さxパッチ幅xパッチサイズxパッチサイズ)
+            original_shape: 元のテンソルの形状 (チャンネルx高さx幅)
+
+        Returns:
+            復元されたテンソル
+        """
+        batch_size, num_patches_h, num_patches_w, patch_height, patch_width = patches.shape
+        channels, height, width = original_shape
+
+        # 元の形状と整合性の確認
+        assert height == num_patches_h * patch_height, "Height mismatch between patches and original shape"
+        assert width == num_patches_w * patch_width, "Width mismatch between patches and original shape"
+
+        # パッチを再構成
+        reconstructed_tensor = torch.zeros((channels, height, width), device=patches.device)
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                reconstructed_tensor[
+                    :, 
+                    i * patch_height: (i + 1) * patch_height,
+                    j * patch_width: (j + 1) * patch_width
+                ] = patches[:, i, j, :, :]
+
+        return reconstructed_tensor
+
+    
+    
+    def get_least_used_gpu(self, num_gpus):
+        # NVML 初期化
+        pynvml.nvmlInit()
+
+        min_usage = float('inf')
+        best_device = 0
+
+        for i in range(num_gpus):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            
+            # メモリ使用率 (使用量 / 合計)
+            usage = mem_info.used / mem_info.total
+            # print(f"GPU {i}: {usage * 100:.2f}% 使用中")
+            
+            # 最も使用率の低いGPUを選択
+            if usage < min_usage:
+                min_usage = usage
+                best_device = i
+
+        # NVML 終了
+        pynvml.nvmlShutdown()
+
+        return best_device
+    
+    def qq_worker_task(self, queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
+        torch.manual_seed(seed)
+        torch.cuda.set_device(device_id)
+        """ 各ワーカーが処理する行列分解タスク """
+        if save_name is None:
+            save = False
+        else: save = True
+        while not queue.empty():
+            try:
+                data = queue.get_nowait()
+            except:
+                break
+
+            i, j, patch = data['i'], data['j'], data['patch']
+            device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
+            patch = patch.to(device)
+            original_x = patch.detach().clone()
+            update_x = patch.detach().clone()
+
+            decomposed_patches = []
+
+
+            for bit_idx in range(bit_width):
+                decomp_instance = QuadraticQuantization(x=update_x.clone(), rank_scale=rank_scale_copy)
+                y, z, a = decomp_instance.run_qq_compile(zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type='torch')
+                reconst = a[0] * y@z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
+                update_x -= reconst
+
+                if save:
+                    data = {'patch_row': i, 'patch_col': j, 'coeff': a.cpu(), 'mat1': y.cpu(), 'mat2': z.cpu(), 'bit_idx': bit_idx}
+                    decomposed_patches.append(data)
+
+            if save:
+                torch.save(decomposed_patches, f"{save_name}_row{i}_col{j}.pth")
+            result_list.append({'i': i, 'j': j, 'reconstructed': (original_x - update_x).clone().detach().cpu()})
+            queue.task_done()
+
+
+    def qq_large_matrix_multi_worker(self, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
+        """
+        大きな行列をパッチに分割し、並列に行列分解を実行して復元
+        """
+        mp.set_start_method("spawn", force=True)
+        rank_scale_copy = copy.copy(self.rank_scale)
+        x_copy = copy.deepcopy(self.x)
+        divided_tensor = self.patchify(torch.tensor(x_copy), max_patch_size=max_patch_size)
+        num_patches_h, num_patches_w, _, _ = divided_tensor.shape
+
+        manager = mp.Manager()
+        queue = manager.Queue()
+        result_list = manager.list()
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                patch = divided_tensor[i, j, :, :]
+                queue.put({'i': i, 'j': j, 'patch': patch})
+        
+        num_gpus = torch.cuda.device_count()
+        num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
+        processes = []
+        for worker_id in range(num_workers):
+            device_id = (worker_id+main_gpu_id) % num_gpus
+            p = mp.Process(target=self.qq_worker_task, args=(queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
+            p.start()
+            processes.append(p)
+        
+        for p in processes:
+            p.join()
+        
+        for data in result_list:
+            i, j = data['i'], data['j']
+            divided_tensor[i, j, :, :] = data['reconstructed']
+        
+        reconstructed_tensor = self.unpatchify(divided_tensor, x_copy.shape)
+        self.x = copy.copy(x_copy)
+        
+        return reconstructed_tensor
+    
+
+class BinaryMatrixFactorization():
+    def __init__(self):
+        pass
+
+    def diag_zero_3d(self, y):
+        # 各スライスごとに対角成分を0にする
+        batch_size, _, _ = y.size()
+        diag = torch.eye(y.shape[1], dtype=y.dtype, device=y.device).unsqueeze(0).expand(batch_size, -1, -1)
+        return y * (1 - diag)
+
+    def gradients_3d(self, x, y, z, a):
+        
+        common = (a**2).view(x.shape[0], 1, 1) - 2*a.view(x.shape[0], 1, 1)*x
+        
+        # バッチ次元で計算
+        y_grad = torch.matmul(common, z.transpose(1, 2)) + 2*(a**2).view(x.shape[0], 1, 1) * torch.matmul(y, self.diag_zero_3d(torch.matmul(z, z.transpose(1, 2))))
+        z_grad = torch.matmul(y.transpose(1, 2), common) + 2*(a**2).view(x.shape[0], 1, 1) * torch.matmul(self.diag_zero_3d(torch.matmul(y.transpose(1, 2), y)), z)
+
+        return y_grad, z_grad
+
+    
+
+    def run_binary_multi(self, x, rank_scale, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1):
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+        torch.manual_seed(seed)
+        # GPU デバイスを指定
+        device = torch.device("cuda:{}".format(device_id) if torch.cuda.is_available() else "cpu")
+        batch_size, n, m = x.shape
+        self.rank = int(round(rank_scale * ((n * m) / (n + m))))  # rank_scaleはスケーリング係数
+        self.delta_temp = torch.tensor((Tinit - Tfin) / (Nstep - 1), device=device)  
+        temp = torch.tensor(Tinit, device=device)
+
+        
+        # 入力をGPUに転送
+        x = x.to(device)
+        maximum = x.max(dim=2)[0].max(dim=1)[0] - x.min(dim=2)[0].min(dim=1)[0]  # 最大幅(最大-最小)
+        x = x/maximum.view(x.shape[0], 1, 1)
+        
+        
+        yb = torch.rand((batch_size, n, self.rank), device=device)
+        zb = torch.rand((batch_size, self.rank, m), device=device)
+        
+        
+        # 初期化
+        y = yb - eta * yb
+        z = zb - eta * zb
+        matrix = (y.transpose(1, 2)@y)*(z@z.transpose(1, 2))
+        up = torch.triu(matrix, diagonal=1)
+        down = torch.tril(matrix, diagonal=-1)
+        a = ((x * (y @ z)).sum(dim=(1, 2))) / ((y @ z).sum(dim=(1, 2)) + up.sum(dim=(1, 2)) + down.sum(dim=(1, 2)))
+
+        @torch.compile(mode="reduce-overhead")
+        def loop_body(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+                # 更新計算
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+
+                y_energy_grad, z_energy_grad = self.gradients_3d(x, yf, zf, a)
+
+                # yとzの更新
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(torch.where((y<0.0) | (y>1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb  - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
+                za = torch.clamp(torch.where((z<0.0) | (z>1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
+
+                # aの更新
+                matrix = ((ya.transpose(1, 2)@ya)*(za@za.transpose(1, 2)))
+
+                up = torch.triu(matrix, diagonal=1) 
+                # down = torch.tril(matrix, diagonal=-1) # up.sum()=down.sum()だから省略
+                common = ya @ za
+
+                a = ((x * common).sum(dim=(1, 2))) / (common.sum(dim=(1, 2)) + 2*up.sum(dim=(1,2)))
+
+            return ya, za, y, z, a
+
+        for _ in tqdm(range(Nstep)):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp -= self.delta_temp
+            
+
+        y = torch.where(y>0.5, 1.0, 0.0)
+        z = torch.where(z>0.5, 1.0, 0.0)
+        # aの更新
+        matrix = ((y.transpose(1, 2)@y)*(z@z.transpose(1, 2)))
+        up = torch.triu(matrix, diagonal=1) 
+        common = y @ z
+        a = ((x * common).sum(dim=(1, 2))) / (common.sum(dim=(1, 2)) + 2*up.sum(dim=(1,2)))
+        
+
+        # print('Final Energy', H, self.energy_binary_multi(x, y, z, a))
+        return y.detach(), z.detach(), (maximum*a).view(x.shape[0], 1, 1).detach()
+   
+
+
+
+
+
+class BinaryCodingQuantization():
+    def __init__(self):
+        pass
+    
+
+    @torch.inference_mode()
+    def run_bcq(self, w, bit_width, Nstep=15, group_size=-1, transpose=False, exponent=0.0, clipping=1.0, pruning=0.0, use_bst=True):
+        qbits = bit_width
+        w_org = copy.deepcopy(w)
+        w = w.flatten().unsqueeze(0)
+        rounds = Nstep
+        '''
+        Post-training Weighted Quantization (BCQ format)
+        https://openreview.net/pdf?id=2Id6XxTjz7c
+
+        rounds == 0: greedy algorithm
+        rounds == 1: refined greedy algorithm
+        rounds >= 2: alternating algorithm
+
+        :param w: a weight tensor of layer
+        :param qbits: number of quantization bits for the `w`
+        :param rounds: number of iterations for refining both alpha and B
+        :param group_size: number of weights in which a scaling factor can be shared
+        :param transpose: if `transpose` is True, `w` is a transposed when using this method.
+        :param exponent: the exponent term of weighted factor.
+                        if `exponent` is zero, this method is exactly the same as conventional BCQ method.
+        :param clipping: the clipping importance term(0 <= clipping <= 1) of weighted factor.
+        :param pruning: the pruning ratio(0 <= pruning <= 1) of weighted factor.
+        :param use_bst: if `use_bst` is True(default), the binary matrix is calculated using BST algorithm.
+                        if `use_bst` is False, the binary matrix is calculated with greedy algorithm.
+        '''
+        w_ = w.clone().float()
+        w_ = w_.cuda()
+
+        if transpose:
+            assert len(w_.shape) == 2, f'Check your weight shape {w_.shape}'
+            w_ = w_.transpose(1, 0).contiguous()
+        
+        orig_shape = w_.shape
+        group_size = group_size if group_size > 0 else orig_shape[-1]
+        w_ = w_.view([-1, group_size])
+    
+        # init weighted
+        w_abs = w_.abs()
+        ws, _ = w_abs.view(-1).sort()
+        wf = torch.ones(w_.shape, dtype=torch.float32, device=w.device)
+        if pruning > 0.0:
+            wf = wf * (w_ != 0.0)
+        if exponent > 0.0 or clipping < 1.0:
+            wf = w_abs / w_abs.max()
+        # weighted factor for C
+        if clipping < 1.0:
+            c_th = ws[int(ws.size(0) * clipping)].item()
+            wf = wf * w_abs.max() / c_th
+            wf[wf > 1.0] = 1.0
+        # weighted factor for E
+        if exponent > 0.0:
+            wf = wf ** exponent
+        # weighted factor for P
+        if pruning > 0.0:
+            p_th = ws[int(ws.shape[0] * pruning)].item()
+            wf[w_abs <= p_th] = 0.0
+            w_[w_abs <= p_th] = 0.0
+
+        wf = wf.to(w_.device)
+        # greedy & alternating algo.
+        ret, B, alpha = self.greedy_mean_torch(w_, n_bits=qbits, wf=wf)
+        if rounds > 0 and qbits > 1:
+            # for _ in range(rounds):
+            for _ in range(rounds):
+                ret, B, alpha = self.refine_mean_torch(w_, ret, B, alpha, wf=wf, use_bst=use_bst)
+
+        ret = ret.view(orig_shape) 
+        if transpose:
+            ret = ret.transpose(1, 0).contiguous()
+
+        del w_
+        
+        B = B.reshape([orig_shape[0], orig_shape[1] // group_size, group_size, qbits])
+        alpha = alpha.reshape([orig_shape[0], orig_shape[1] // group_size, qbits])
+        m, n = w_org.shape
+        B = B.reshape(m, n, qbits)
+        alpha = alpha.squeeze(0).squeeze(0)
+        ret = ret.reshape_as(w_org)
+
+        return ret, B, alpha
+
+    def greedy_mean_torch(self, w, n_bits=1, wf=None):
+        B = torch.zeros(w.shape + (n_bits,), device=w.device)
+        Alpha = torch.zeros(w.shape[0], n_bits, device=w.device)
+    
+        r, w_hat = w.clone(), 0.
+        for i in range(n_bits):
+            b = r.sign()
+            
+            if wf is not None:
+                a1sum = torch.sum(wf, dim=1)
+                alpha = (r.abs()*wf).sum(dim=1) / torch.sum(wf, dim=1)
+                alpha[torch.isnan(alpha)] = 0.
+                alpha = alpha.view(alpha.shape[0], 1)
+            else:
+                alpha = r.abs().mean(dim=1, keepdim=True)
+            
+            r -= b * alpha
+            w_hat += b * alpha
+            B[:,:,i] = b
+            Alpha[:,i] = alpha.view(-1)
+        
+        # del r, b, alpha
+        # gc.collect()
+        # torch.cuda.empty_cache()
+
+        return w_hat, B, Alpha
+
+    def refine_mean_torch(self, w, w_hat, B, Alpha, wf=None, use_bst=True):
+        w = w.float()
+        d1, d2 = w.shape
+        with torch.no_grad():
+            n_bits = B.shape[-1]
+            Bt = B.transpose(1, 2)
+            if wf is not None:
+                Bt = Bt * wf.unsqueeze(1)
+            B_cov = Bt.bmm(B)
+            Btw = Bt.bmm(w.unsqueeze(-1)).view(d1, n_bits)
+
+            Alpha_new = self.batch_cg_torch(B_cov, Btw, x=Alpha)
+            Alpha_new, _ = Alpha_new.abs().sort(descending=True)
+
+            if use_bst == False:
+                r = w.clone()
+                B_new = torch.zeros_like(B)
+                for i in range(n_bits):
+                    B_new[:, :, i] = r.sign()
+                    r -= B_new[:, :, i] * Alpha_new[:, i].view([-1, 1])
+                del r
+            else:
+                B_new = self.find_B_torch(w, Alpha_new)
+                B_new = B_new * (wf != 0.0).unsqueeze(-1)
+            w_hat_new = torch.einsum('ijl,il->ij', (B_new, Alpha_new))
+
+        return w_hat_new, B_new, Alpha_new
+
+    def list_binary_vecs(self, n):
+        ListBinaryVecs = {0 : [[]]}
+        for m in range(1, n+1):
+            ListBinaryVecs[m] = [[1.] + l for l in ListBinaryVecs[m-1]] + [[-1.] + l for l in ListBinaryVecs[m-1]]
+        return ListBinaryVecs
+
+    def find_B_torch(self, w, Alpha):
+        '''Find optimal quantization assignment via binary search (torch)'''
+        n_bits = Alpha.shape[-1]
+
+        ListBinaryVecs = self.list_binary_vecs(n_bits)
+        bin_mat = torch.from_numpy(np.vstack(ListBinaryVecs[n_bits]).astype(np.float32)).to(w.device)
+
+        d1, d2 = w.shape
+        row_inds = torch.arange(d1, dtype=torch.long).view(d1, 1).repeat([1, d2]).view(-1)
+        # w is d1xd2, Alpha is d1xk, v is d1x2^k
+        v = Alpha.mm(bin_mat.t())
+        v_sorted, inds = torch.sort(v)
+        # Binary search to find nearest neighbor
+        w_flat = w.view([-1])
+        Left = torch.zeros(d1*d2, dtype=torch.long, device=w.device)
+        Right = torch.ones(d1*d2, dtype=torch.long, device=w.device) * (2 ** n_bits - 1)
+        for i in range(n_bits):
+            Mid_Left = torch.div(Left + Right - 1, 2, rounding_mode='trunc')
+            Mid_Right = Mid_Left + 1
+            mid_vals = (v_sorted[row_inds, Mid_Left] + v_sorted[row_inds, Mid_Right]) / 2
+            inds_left = (w_flat < mid_vals)
+            Right[inds_left] = Mid_Left[inds_left]
+            Left[~inds_left] = Mid_Right[~inds_left]
+        assignment_inds = inds[row_inds, Left].view(d1, d2)
+        return bin_mat[assignment_inds, :]
+
+    def batch_cg_torch(self, A, b, x=None):
+        '''Batch conjugate gradient for solving Ax = b'''
+        d1, k, _ = A.shape
+        # Initialize
+        x = x.clone().view(d1, k, 1)
+        b = b.view(d1, k, 1)
+        r = b - A.bmm(x)
+        rtr_new = r.transpose(1, 2).bmm(r)
+        p = r.clone()
+        # Perform batch CG
+        for i in range(k):
+            rtr = rtr_new
+            Ap = A.bmm(p)
+            alpha = rtr / (p.transpose(1, 2).bmm(Ap) + 1e-6)
+            x += alpha * p
+            r -= alpha * Ap
+            rtr_new = r.transpose(1, 2).bmm(r)
+            beta = rtr_new / (rtr + 1e-6)
+            p = r + beta * p
+        return x.view(d1, k)
+
+    def patchify(self, tensor, max_patch_size=256):
+        """
+        テンソルをパッチに分割する関数
+
+        Args:
+            tensor: 分割するテンソル (バッチxチャンネルx高さx幅)
+            max_patch_size: パッチの最大サイズ (int)
+
+        Returns:
+            パッチに分割されたテンソル
+        """
+
+        height, width = tensor.shape
+
+        # 各次元の最大約数を計算 (256以下)
+        
+        def get_max_divisor(num, max_value):
+            """
+            与えられた数値の最大約数を、指定された最大値以下で求める関数
+
+            Args:
+                num: 約数を求める数値
+                max_value: 最大約数の最大値
+
+            Returns:
+                最大約数
+            """
+
+            # 最大約数の探索範囲を決定
+            limit = max(int(math.sqrt(num)), max_value)
+
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        patch_height = get_max_divisor(height, max_patch_size)
+        patch_width = get_max_divisor(width, max_patch_size)
+        print('Patch Size:({0}x{1})'.format(patch_height, patch_width))
+
+        # unfold関数でパッチに分割 (パッチサイズはpatch_height x patch_width, patch_height x patch_width間隔で切り出す)
+        return tensor.unfold(0, patch_height, patch_height).unfold(1, patch_width, patch_width)
+    
+
+    
+    def unpatchify(self, patches, original_shape):
+        """
+        パッチから元のテンソルを復元する関数
+
+        Args:
+            patches: パッチに分割されたテンソル (バッチxパッチ高さxパッチ幅xパッチサイズxパッチサイズ)
+            original_shape: 元のテンソルの形状 (チャンネルx高さx幅)
+
+        Returns:
+            復元されたテンソル
+        """
+        num_patches_h, num_patches_w, patch_height, patch_width = patches.shape
+        height, width = original_shape
+
+        # 元の形状と整合性の確認
+        assert height == num_patches_h * patch_height, "Height mismatch between patches and original shape"
+        assert width == num_patches_w * patch_width, "Width mismatch between patches and original shape"
+
+        # パッチを再構成
+        reconstructed_tensor = torch.zeros((height, width), device=patches.device)
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                reconstructed_tensor[
+                    i * patch_height: (i + 1) * patch_height,
+                    j * patch_width: (j + 1) * patch_width
+                ] = patches[i, j, :, :]
+
+        return reconstructed_tensor
+    
+    def bcq_large_matrix(self, w, max_patch_size, bit_width, Nstep=50, save_name=None):
+        """
+        大きな行列をパッチに分け、それぞれのパッチで行列分解を行い、復元する関数
+
+        Args:
+            max_patch_size: パッチの最大サイズ
+            zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type: 行列分解に関するパラメータ
+
+        Returns:
+            元の形状に復元されたテンソル
+        
+        注意：入力のテンソルは３次元(batch_num, row_num, colum_num)になっていないといけないので、２次元の場合は変換してから入力すること
+        """
+        if save_name is None:
+            save = False
+        else: save = True
+
+        
+
+        # テンソルをパッチに分割
+        divided_tensor = self.patchify(w, max_patch_size=max_patch_size)
+
+        # パッチサイズと数を取得
+        num_patches_h, num_patches_w, patch_height, patch_width = divided_tensor.shape
+
+
+        # 各パッチで行列分解を実行
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                patch = divided_tensor[i, j, :, :]
+
+                # 分解結果を保存するリスト
+                decomposed_patches = []
+
+                reconst, B, alpha = self.run_bcq(patch, bit_width, Nstep=Nstep, group_size=-1, transpose=False, exponent=0.0, clipping=1.0, pruning=0.0, use_bst=True)
+                if save:
+                    data = {'patch_row':i, 'patch_col':j, 'coeff':alpha, 'binary_matrix':B, 'bit_width':bit_width}
+                    decomposed_patches.append(data)
+                    torch.save(decomposed_patches, (save_name + f'_row{i}_col{j}.pth'))
+                
+                # 分解結果を保存
+                divided_tensor[i, j, :, :] = (reconst).clone().detach()
+
+        # パッチから元の形状に復元
+        reconstructed_tensor = self.unpatchify(divided_tensor, w.shape)
+
+        return reconstructed_tensor
+    
+class UniformQuantization():
+    def __init__(self):
+        pass
+
+    def run_uq(self, matrix, n_bits, device=torch.device("cpu")):
+        matrix = matrix.to(device)
+        num_levels = 2**n_bits
+        """
+        行列を量子化し、最適な量子化を選ぶ関数。
+
+        Parameters:
+            matrix (np.ndarray): 量子化する行列
+            num_levels (int): 量子化のビット深度（例えば256なら8ビット量子化）
+
+        Returns:
+            quantized_matrix (np.ndarray): 最適な量子化結果
+            best_scale (float): 最適なスケール
+            min_error (float): 最小誤差 (RMSE)
+        """
+        # 標準偏差と範囲を計算
+        mean = (matrix).mean()
+        min = (matrix).min()
+        max = (matrix).max()
+        
+        # 量子化スケールを標準偏差の倍率としていくつか試す
+        min_error = float('inf')
+        best_scale = None
+        quantized_matrix = None
+        
+        for range_max in (torch.linspace(mean, max, 100)):
+            for range_min in torch.linspace(min, mean, 100):
+                range_min = range_min.to(device)
+                range_max = range_max.to(device)
+                # 行列を量子化
+                quantized = torch.clamp(matrix, range_min, range_max)  # 範囲外をクリップ
+                if range_max == range_min:buffer=1e-8
+                else:buffer=0
+                quantized = torch.round(
+                    (quantized - range_min) / (range_max - range_min + buffer) * (num_levels - 1)
+                ) / (num_levels - 1) * (range_max - range_min) + range_min
+            
+                # MSEを計算
+                error = (((matrix - quantized) ** 2).mean())
+                
+                # 最適スケールを更新
+                if error < min_error:
+                    min_error = error
+                    best_scale = (range_min, range_max)
+                    quantized_matrix = quantized
+
+        return quantized_matrix
+    
+    def channel_wise_uq(self, tensor, n_bits):
+        matrix_list = []
+        for i in range(tensor.shape[0]):
+            matrix_list.append(self.run_uq(tensor[i], n_bits))
+        return (torch.stack(matrix_list, axis=0))
+    
+    def patchify(self, tensor, max_patch_size=256):
+        """
+        テンソルをパッチに分割する関数
+
+        Args:
+            tensor: 分割するテンソル (バッチxチャンネルx高さx幅)
+            max_patch_size: パッチの最大サイズ (int)
+
+        Returns:
+            パッチに分割されたテンソル
+        """
+
+        height, width = tensor.shape
+
+        # 各次元の最大約数を計算 (256以下)
+        
+        def get_max_divisor(num, max_value):
+            """
+            与えられた数値の最大約数を、指定された最大値以下で求める関数
+
+            Args:
+                num: 約数を求める数値
+                max_value: 最大約数の最大値
+
+            Returns:
+                最大約数
+            """
+
+            # 最大約数の探索範囲を決定
+            limit = max(int(math.sqrt(num)), max_value)
+
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        patch_height = get_max_divisor(height, max_patch_size)
+        patch_width = get_max_divisor(width, max_patch_size)
+        print('Patch Size:({0}x{1})'.format(patch_height, patch_width))
+
+        # unfold関数でパッチに分割 (パッチサイズはpatch_height x patch_width, patch_height x patch_width間隔で切り出す)
+        return tensor.unfold(0, patch_height, patch_height).unfold(1, patch_width, patch_width)
+    
+
+    
+    def unpatchify(self, patches, original_shape):
+        """
+        パッチから元のテンソルを復元する関数
+
+        Args:
+            patches: パッチに分割されたテンソル (バッチxパッチ高さxパッチ幅xパッチサイズxパッチサイズ)
+            original_shape: 元のテンソルの形状 (チャンネルx高さx幅)
+
+        Returns:
+            復元されたテンソル
+        """
+        num_patches_h, num_patches_w, patch_height, patch_width = patches.shape
+        height, width = original_shape
+
+        # 元の形状と整合性の確認
+        assert height == num_patches_h * patch_height, "Height mismatch between patches and original shape"
+        assert width == num_patches_w * patch_width, "Width mismatch between patches and original shape"
+
+        # パッチを再構成
+        reconstructed_tensor = torch.zeros((height, width), device=patches.device)
+
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                reconstructed_tensor[
+                    i * patch_height: (i + 1) * patch_height,
+                    j * patch_width: (j + 1) * patch_width
+                ] = patches[i, j, :, :]
+
+        return reconstructed_tensor
+    
+    def uq_large_matrix(self, w, max_patch_size, bit_width, save_name=None, device=torch.device("cpu")):
+        """
+        大きな行列をパッチに分け、それぞれのパッチで行列分解を行い、復元する関数
+
+        Args:
+            max_patch_size: パッチの最大サイズ
+            zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type: 行列分解に関するパラメータ
+
+        Returns:
+            元の形状に復元されたテンソル
+        
+        注意：入力のテンソルは３次元(batch_num, row_num, colum_num)になっていないといけないので、２次元の場合は変換してから入力すること
+        """
+        if save_name is None:
+            save = False
+        else: save = True
+
+        
+
+        # テンソルをパッチに分割
+        divided_tensor = self.patchify(w, max_patch_size=max_patch_size)
+
+        # パッチサイズと数を取得
+        num_patches_h, num_patches_w, patch_height, patch_width = divided_tensor.shape
+
+
+        # 各パッチで行列分解を実行
+        for i in range(num_patches_h):
+            for j in range(num_patches_w):
+                patch = divided_tensor[i, j, :, :]
+
+                # 分解結果を保存するリスト
+                decomposed_patches = []
+
+                reconst = self.run_uq(patch, bit_width, device)
+                if save:
+                    data = {'patch_row':i, 'patch_col':j, 'q_matrix':reconst.to('cpu'), 'bit_width':bit_width}
+                    decomposed_patches.append(data)
+                    torch.save(decomposed_patches, (save_name + f'_row{i}_col{j}.pth'))
+                
+                # 分解結果を保存
+                divided_tensor[i, j, :, :] = (reconst).clone().detach()
+
+        # パッチから元の形状に復元
+        reconstructed_tensor = self.unpatchify(divided_tensor, w.shape)
+
+        return reconstructed_tensor
+    
+
+
+
+class LatticeQuantization:
+    def __init__(self):
+        pass
+
+    def generate_identity_e8_lattice(self):
+        """
+        E8格子における240個の最短ベクトル（ノルムの2乗が2）を生成する。
+        これらはE8リー代数のルート系を構成する。
+        """
+        e8_vectors = []
+
+        # --- タイプ A: 全ての成分が +/- 0.5 で、負の符号の数が偶数 ---
+        # 8次元ベクトルのすべての符号の組み合わせを生成 (2^8 = 256通り)
+        for i in range(2**8):
+            vector = np.zeros(8)
+            negative_count = 0
+            for j in range(8):
+                if (i >> j) & 1:  # j-th bit is 1, so set to -0.5
+                    vector[j] = -0.5
+                    negative_count += 1
+                else:             # j-th bit is 0, so set to +0.5
+                    vector[j] = 0.5
+            
+            # 負の符号の数が偶数である場合のみ追加
+            if negative_count % 2 == 0:
+                e8_vectors.append(vector)
+                
+        # 確認: 128個のベクトルが生成されたはず
+        # print(f"Generated Type A vectors: {len(e8_vectors)}") # Expected: 128
+
+        # --- タイプ B: 2つの成分が +/- 1 で、残りが 0 ---
+        # 8つの位置から2つの位置を選ぶ組み合わせ (binomial(8, 2) = 28通り)
+        # その選ばれた2つの位置の符号の組み合わせ (2 * 2 = 4通り)
+        for i in range(8):
+            for j in range(i + 1, 8): # Ensure j > i to avoid duplicates
+                # (i, j) の位置に +/- 1 を配置
+                for sign1 in [-1, 1]:
+                    for sign2 in [-1, 1]:
+                        vector = np.zeros(8)
+                        vector[i] = sign1
+                        vector[j] = sign2
+                        e8_vectors.append(vector)
+        
+        # 確認: 112個のベクトルが生成されたはず (28 * 4 = 112)
+        # print(f"Generated Type A + Type B vectors: {len(e8_vectors)}") # Expected: 128 + 112 = 240
+
+        return e8_vectors
+
+
+    def round_nearest_even_sum(self, x):
+        """Dn格子: 要素の和が偶数になるように調整する整数ベクトル"""
+        rounded = torch.round(x)
+        if int(torch.sum(rounded).item()) % 2 != 0:
+            idx = torch.argmax(torch.abs(x - rounded))
+            rounded[idx] += -1 if x[idx] > rounded[idx] else 1
+        return rounded
+
+    def quantize_vector(self, vec: torch.Tensor) -> torch.Tensor:
+        """vec: (8,) ベクトルを E8 格子に量子化"""
+        # そのままDnに量子化
+        mirror1 = self.round_nearest_even_sum(vec)
+        diff1 = vec - mirror1
+        dist1 = torch.sum(diff1**2)
+
+        # Dn+(=Dnシフト) にも試して、より近い方を選ぶ
+        offset = 0.5
+        shifted = vec - offset
+        mirror2 = self.round_nearest_even_sum(shifted)
+        diff2 = shifted - mirror2
+        dist2 = torch.sum(diff2**2)
+
+        if dist2 < dist1:
+            return mirror2 + offset
+        else:
+            return mirror1
+
+    def run_dn_lq_no_scale(self, x: torch.Tensor, n: int) -> torch.Tensor:
+        """
+        2Dテンソル x に対し、全要素数が n の倍数であることを仮定し、
+        フラット化して n 次元単位で Dₙ ∪ Dₙ⁺ 量子化し、元の形に復元。
+
+        Args:
+            x (torch.Tensor): 入力テンソル (2D)
+            n (int): Dₙ格子の次元
+
+        Returns:
+            torch.Tensor: 量子化後テンソル（元の形状と同じ）
+        """
+        assert x.dim() == 2, "入力は2次元テンソルである必要があります。"
+        total_elements = x.numel()
+        assert total_elements % n == 0, f"要素数 {total_elements} は {n} の倍数である必要があります。"
+
+        original_shape = x.shape
+        x_flat = x.reshape(-1, n)
+
+
+        # 各ベクトルを量子化
+        quantized = torch.stack([
+            self.quantize_vector(vec) for vec in x_flat
+        ], dim=0)
+
+        # 元の形に戻す
+        return quantized.reshape(original_shape)
+    
+    def run_dn_lq(self, x: torch.Tensor, n: int, scale_steps: int = 20, n_bits=8) -> torch.Tensor:
+        """
+        2Dテンソル x に対し、全要素数が n の倍数であることを仮定し、
+        フラット化して n 次元単位で Dₙ ∪ Dₙ⁺ 量子化し、元の形に復元。
+        スケーリング係数をグリッドサーチし、
+        二乗誤差が最小のscaleを選ぶ。
+
+        Args:
+            x (torch.Tensor): 入力テンソル (2D)
+            n (int): Dₙ格子の次元
+            scale_steps (int): スケールグリッドの分割数（デフォルト20）
+
+        Returns:
+            torch.Tensor: 量子化後テンソル（元の形状と同じ）
+        """
+        original_shape = x.shape
+        x_flat = x.reshape(-1)
+
+        # パディング（nの倍数にする）
+        total_elements = x_flat.numel()
+        remainder = total_elements % n
+        if remainder != 0:
+            pad_size = n - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
+
+        x_flat = x_flat.reshape(-1, n)
+
+        # 絶対値最小値を探す
+        x_min = x_flat.min().item()
+        x_max = x_flat.max().item()
+        x_mean = x_flat.mean().item()
+
+
+        cutmin_scales = torch.linspace(x_min, x_mean, steps=scale_steps)
+        cutmax_scales = torch.linspace(x_mean, x_max, steps=scale_steps)
+
+
+        best_quantized = None
+        best_error = float('inf')
+
+        for cut_min in cutmin_scales:
+            for cut_max in cutmax_scales:
+                if cut_min >= cut_max:
+                    continue
+                quantized_vectors = []
+                scaled_x_flat = (torch.clamp(x_flat, cut_min, cut_max) - cut_min)/(cut_max - cut_min) * (2**n_bits - 1) # [0, 2^n - 1]にする
+                for vec in scaled_x_flat:
+                    q_vec = self.quantize_vector(vec)
+                    quantized_vectors.append(q_vec)
+                quantized_tensor = torch.stack(quantized_vectors, dim=0) / (2**n_bits - 1) * (cut_max - cut_min) + cut_min
+
+                error = torch.norm(quantized_tensor - x_flat) ** 2
+                if error < best_error:
+                    best_error = error
+                    best_quantized = quantized_tensor
+                    best_scale = (cut_max - cut_min) / (2**n_bits - 1)
+                    best_bias = cut_min
+
+        best_quantized = best_quantized.reshape(-1)[:original_shape.numel()] 
+
+        return best_quantized.reshape(original_shape), best_scale, best_bias
+
+
+    
+
+
+    def calc_memory_size(self, quantized_tensor: torch.Tensor, n, bias, scale) -> float:
+        """
+        Dn量子化後の2Dテンソルのメモリサイズ（バイト単位）を概算する。
+        各コードワード（n要素ベクトル）ごとに必要なビット数を計算する。
+
+        Args:
+            quantized_tensor: 2D torch.Tensor (N, M), Dn量子化済み
+            n: 格子の次元（1コードワードあたりの次元数）
+            scale: 量子化で使用されたスケーリング係数
+
+        Returns:
+            float: 推定メモリサイズ（バイト単位）
+        """
+        assert quantized_tensor.dim() == 2, "量子化テンソルは2次元である必要があります。"
+
+        x_flat = (quantized_tensor.reshape(-1) - bias) / scale
+        total_elements = x_flat.numel()
+        remainder = total_elements % n
+        if remainder != 0:
+            pad_size = n - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x_flat.device, dtype=x_flat.dtype)])
+        x_flat  = torch.clamp(torch.ceil(x_flat),min=0)
+        min_val = torch.floor(x_flat.min()).item()
+        max_val = torch.ceil(x_flat.max()).item()
+        value_range = max_val - min_val 
+        bits_per_component = int(torch.ceil(torch.log2(torch.tensor(value_range, dtype=torch.float32))).item())
+        total_bits = bits_per_component * quantized_tensor.numel()
+        
+
+        return total_bits / 8.0 + 4 + 4 # バイト単位
+    
+
+
+
+class LatticeVectorQuantization:
+    def __init__(self):
+        pass
+
+
+
+    def generate_e8_root(self):
+        e8_vectors = []
+
+        # --- Type A: ±0.5 with even number of - signs ---
+        signs = np.array(np.meshgrid(*[[0.5, -0.5]] * 8)).T.reshape(-1, 8)
+        even_signs = signs[np.sum(signs == -0.5, axis=1) % 2 == 0]
+        e8_vectors.append(even_signs)
+
+        # --- Type B: ±1 at 2 positions, rest 0 ---
+        for i, j in combinations(range(8), 2):
+            for s1 in [-1, 1]:
+                for s2 in [-1, 1]:
+                    vec = np.zeros(8)
+                    vec[i] = s1
+                    vec[j] = s2
+                    e8_vectors.append(vec)
+
+        return np.vstack(e8_vectors)
+    
+    def expand_codebook_with_scaling(self, codebook, x, num_scales=17):
+        """
+        - codebook: [240, 8] テンソル
+        - x: 入力データ行列 [N, 8]
+        - num_scales: 係数の数（デフォルト17）
+        """
+        # 1. 入力データのノルム最大値を計算
+        max_norm = torch.norm(x, dim=1).max()
+
+        # 2. 係数を0〜max_normの間で等間隔に分割（ただし0は除く）
+        scale_factors = torch.linspace(0, max_norm, steps=num_scales + 1)[1:]  # 長さ17, index 1~17
+
+        # 3. スケーリングされたコードブックを生成（240 × 17 = 4080個）
+        expanded_codebook = torch.cat([
+            scale * codebook for scale in scale_factors
+        ], dim=0)  # shape: [4080, 8]
+
+        return expanded_codebook
+    
+    def run_e8_lvq(self, x, n_bits, scale_bits=2):
+        original_shape = x.shape
+        x_flat = x.reshape(-1)
+
+        # パディング（nの倍数にする）
+        total_elements = x_flat.numel()
+        remainder = total_elements % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
+
+        D = x_flat.reshape(-1, 8).float()
+
+        C = torch.tensor(self.generate_e8_root()).float() # make codebook
+
+        """
+        C: (240, 8) コードブック（コードベクトルの集合）
+        D: (n, 8)   データ行列（元のベクトル）
+
+        Returns:
+            D_hat: (n, 8) 復元された行列
+        """
+        totalD = torch.zeros_like(D)
+        for bit in range(n_bits):
+            # Normalize C and D for cosine similarity
+            C_norm = torch.nn.functional.normalize(C, dim=1)  # (240, 8)
+            D_norm = torch.nn.functional.normalize(D, dim=1)  # (n, 8)
+
+            # (n, 240) の cosine 類似度行列を計算
+            similarity = D_norm @ C_norm.T
+
+            # 各D[i]に対して最も類似度の高いC[j]のインデックス
+            indices = torch.argmax(similarity, dim=1)  # (n,)
+
+            # 対応するコードベクトルを取り出す
+            selected_codes = C[indices]  # (n, 8)
+
+            # スカラー係数 α を最小二乗で計算（α = (x・c) / (c・c)）
+            numerators = torch.sum(D * selected_codes, dim=1)        # (n,)
+            denominators = torch.sum(selected_codes ** 2, dim=1)     # (n,)
+            alpha = numerators / denominators                        # (n,)
+            alpha = UniformQuantization().run_uq(alpha, n_bits=scale_bits)
+
+            # αを (n,1) に reshape して selected_codes にかける
+            D_hat = alpha.unsqueeze(1) * selected_codes  # (n, 8)
+            D = D - D_hat
+            totalD += D_hat
+
+        totalD = totalD.reshape(-1)[:original_shape.numel()]
+
+        return totalD.reshape(original_shape)
+    
+    def calc_memory_size(self, x, n_bits, scale_bits=2):
+        x_flat = x.reshape(-1)
+
+        # パディング（nの倍数にする）
+        total_elements = x_flat.numel()
+        remainder = total_elements % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
+
+        D = x_flat.reshape(-1, 8)
+        num_data, _ = D.shape
+        memory = (num_data * (8 + scale_bits) + 32) * n_bits # id:8bit, scales bits:scale_bits, scale of scales: 32bit
+        return memory / 8 # byte
+    
+
+    def run_scaled_e8_lvq(self, x, n_bits, num_scales=273):
+        """
+        Args:
+            x: 任意shapeのテンソル（例: [B, D]）
+            expanded_codebook: [4080, 8] のテンソル（スケーリングされたE8コードブック）
+
+        Returns:
+            totalD: x と同じ shape の量子化復元テンソル
+            indices: 各ブロックに対応するコードブックの index（[num_blocks]）
+        """
+        original_shape = x.shape
+        x_flat = x.reshape(-1)
+
+        # パディングして8の倍数に
+        total_elements = x_flat.numel()
+        remainder = total_elements % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
+
+        # (N, 8) に変換
+        D = x_flat.reshape(-1, 8).float()
+
+        # コードブック (M, 8)
+        codebook = self.generate_e8_root()
+        expanded_codebook = self.expand_codebook_with_scaling(codebook=codebook, x=D, num_scales=num_scales)
+        C = expanded_codebook.to(D.device).float()
+
+        totalD = torch.zeros_like(D)
+
+        for bit in range(n_bits):
+            # L2距離（二乗誤差）をバッチで計算
+            # D: (N, 8), C: (M, 8) → dist^2[i,j] = ||D[i] - C[j]||^2
+            D2 = (D ** 2).sum(dim=1, keepdim=True)      # (N, 1)
+            C2 = (C ** 2).sum(dim=1).unsqueeze(0)       # (1, M)
+            DC = D @ C.T                                 # (N, M)
+            dist2 = D2 - 2 * DC + C2                     # (N, M)
+
+            # 最も距離が小さいセントロイドを選ぶ
+            indices = torch.argmin(dist2, dim=1)         # (N,)
+            selected_codes = C[indices]                  # (N, 8)
+
+            totalD += selected_codes
+            D -= selected_codes
+
+        # 復元された量子化テンソル
+        # totalD = selected_codes.reshape(-1)[:x_flat.numel()]
+        totalD = totalD[:total_elements]             # パディング除去
+
+        return totalD.reshape(original_shape)
+    
+
+    def calc_scaled_memory_size(self, x, n_bits, num_scales):
+        x_flat = x.reshape(-1)
+
+        # パディング（nの倍数にする）
+        total_elements = x_flat.numel()
+        remainder = total_elements % 8
+        if remainder != 0:
+            pad_size = 8 - remainder
+            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
+
+        D = x_flat.reshape(-1, 8)
+        num_data, _ = D.shape
+        memory = (num_data * (math.ceil(math.log2(240*num_scales)))) * n_bits # id:8bit, scale:32bit
+        return memory / 8 # byte
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class TransformQuantization:
+    def __init__(self):
+        self.uq = UniformQuantization()
+
+    def run_hq(self, matrix, n_bits, n_reshape=None):
+        """
+        アダマール変換 + 量子化 + 復元 を行う。
+
+        Parameters:
+        - matrix: ndarray of shape (n_samples, n_features)
+        - n_bits: int, 量子化ビット数
+
+        Returns:
+        - reconstructed_matrix: 復元後の行列（元の空間に近い）
+        """
+        matrix = np.array(matrix)
+        if n_reshape is None:
+            n_reshape = matrix.shape[-1]
+        original_shape = matrix.shape
+        matrix = matrix.reshape((-1, n_reshape))
+        n_samples, n_features = matrix.shape
+
+        # 列数が2のべき乗でなければパディング
+        target_dim = 2 ** int(np.ceil(np.log2(n_features)))
+        pad_width = target_dim - n_features
+        if pad_width > 0:
+            matrix = np.pad(matrix, ((0, 0), (0, pad_width)), mode='constant')
+
+        # アダマール行列
+        H = hadamard(matrix.shape[1])
+
+        # アダマール変換（列方向）
+        transformed = matrix @ H.T
+
+        # 量子化
+        quantized = UniformQuantization().run_uq(torch.tensor(transformed), n_bits)
+
+        # 逆アダマール変換
+        inverse_transformed = quantized.float() @ torch.tensor(H).float() / H.shape[0]  # Hadamard is self-inverse up to scaling
+
+        # パディングを戻す
+        if pad_width > 0:
+            inverse_transformed = inverse_transformed[:, :n_features]
+
+
+        return inverse_transformed.reshape(original_shape)
+
+    def calc_memory_size(self, matrix, n_bits, n_reshape=None):
+        matrix = np.array(matrix)
+        if n_reshape is None:
+            n_reshape = matrix.shape[-1]
+        matrix = matrix.reshape(-1, n_reshape)
+        n_samples, n_features = matrix.shape
+        target_dim = 2 ** int(np.ceil(np.log2(n_features)))
+        pad_width = target_dim - n_features
+        if pad_width > 0:
+            n_features = target_dim  # パディング後の列数を使う
+
+        data_bytes = n_samples * n_features * n_bits / 8
+        param_bytes = 4 + 4  # scale と bias をfloat32で2つ分
+
+        total_bytes = data_bytes + param_bytes
+        return total_bytes
+
+    def next_power_of_two(self, x):
+        return 1 << (x - 1).bit_length()
+
+
+
+    def run_ht_compress(self, X, remaining_ratio, n_bits=32):
+        """
+        アダマール変換を右から（列方向のみ）かけて圧縮する。
+        - X: 実数行列（NumPy）
+        - remaining_ratio: 保持する列数の割合（0〜1）
+        - n_bits: 量子化ビット数（32でfloat圧縮、他はスカラー量子化）
+        """
+        original_shape = X.shape
+        m, n = original_shape
+
+        # 列数（右）を2のべき乗にパディング
+        n_pad = self.next_power_of_two(n)
+        X_padded = np.zeros((m, n_pad))
+        X_padded[:, :n] = X
+
+        # アダマール行列（列方向のみ）
+        Hn = hadamard(n_pad)
+
+        # 右から変換
+        Y = X_padded @ Hn
+
+        # 列方向だけをカット
+        k_col = min(n, math.ceil(n * remaining_ratio))
+
+        if n_bits == 32:
+            Y_compress = Y[:, :k_col]
+        else:
+            Y_compress = UniformQuantization().run_uq(torch.tensor(Y[:, :k_col]), n_bits=n_bits).numpy()
+
+        # マスクして埋め戻す
+        Y_masked = np.zeros_like(Y)
+        Y_masked[:, :k_col] = Y_compress
+
+        # 逆変換（右から）
+        X_recon_padded = Y_masked @ Hn / n_pad
+
+        # 元のサイズに戻す
+        X_recon = X_recon_padded[:, :n]
+
+        # メモリサイズ計算
+        if n_bits == 32:
+            memory_size = m * k_col * n_bits / 8  # bytes
+        else:
+            memory_size = m * k_col * n_bits / 8 + 4 + 4  # bias + scale
+
+        return X_recon, memory_size
+
+    
+    
+
+
+
+    def run_dct_compress(self, X, remaining_ratio, n_bits=32):
+        m, n = X.shape
+
+        # DCT-II（2次元 DCT）
+        def dct2(a):
+            if isinstance(a, torch.Tensor):
+                a = a.cpu().numpy()
+            return dct(dct(a.T, norm='ortho').T, norm='ortho')
+
+        # 逆 DCT（IDCT-II）
+        def idct2(a):
+            if isinstance(a, torch.Tensor):
+                a = a.cpu().numpy()
+            return idct(idct(a.T, norm='ortho').T, norm='ortho')
+
+        # DCT変換（パディングなし）
+        Y = dct2(X)
+
+        # 残す比率に基づいて行・列の数を直接決定
+        scale = math.sqrt(remaining_ratio)
+        k_row = min(m, math.ceil(m * scale))
+        k_col = min(n, math.ceil(n * scale))
+
+        # マスク処理（必要な部分だけ残す）
+        if n_bits == 32:
+            Y_compress = Y[:k_row, :k_col]
+        else:
+            Y_compress = UniformQuantization().run_uq(torch.tensor(Y[:k_row, :k_col]), n_bits=n_bits).numpy()
+
+        Y_masked = np.zeros_like(Y)
+        Y_masked[:k_row, :k_col] = Y_compress
+
+
+        # 逆DCT（パディングなし）
+        X_recon = idct2(Y_masked)
+
+        # メモリサイズの見積もり（量子化された場合は補正）
+        if n_bits == 32:
+            memory_size = k_col * k_row * n_bits / 8  # byte
+        else:
+            memory_size = k_col * k_row * n_bits / 8 + 4 + 4  # byte (bias and scale)
+
+        return X_recon, memory_size
+    
+
+
+class JPEG():
+    def __init__(self):
+        pass
+    
+
+
+
+    def run_jpeg_compress(self, X: np.ndarray, n_bits=4):
+        """
+        NumPyの実数行列 X（0〜1正規化前提）をJPEGに圧縮し、
+        再度復元したNumPy配列を返す。
+        """
+        num_elements = X.shape[0] * X.shape[1]
+        target_bytes = n_bits * num_elements / 8
+        # 0〜255にスケーリングしてuint8に変換
+        X8 = UniformQuantization().run_uq(torch.tensor(X), n_bits=8).numpy()
+        bias = X8.min()
+        scale = X8.max() - X8.min()
+        X_clipped = (X8 - bias)/scale
+        X_uint8 = (X_clipped * 255).astype(np.uint8)
+
+        # グレースケール画像に変換
+        img = Image.fromarray(X_uint8, mode='L')  # 'L' = 8bitグレースケール
+
+
+        # JPEG品質を調整しながら圧縮
+        best_quality = 100
+        best_size = float('inf')
+        for quality in range(100, 0, -1):  # 高品質から試す
+            buffer = io.BytesIO()
+            img.save(buffer, format='JPEG', quality=quality)
+            size = len(buffer.getvalue())
+            if size <= target_bytes:
+                best_quality = quality
+                best_size = size
+                break
+
+        # 圧縮したJPEGを復元
+        buffer = io.BytesIO()
+        img.save(buffer, format='JPEG', quality=best_quality)
+        buffer.seek(0)
+        img_recon = Image.open(buffer)
+        X_recon = np.array(img_recon).astype(np.float32) / 255.0
+        X_recon = X_recon * scale + bias
+
+        return X_recon, best_size + 4 + 4  # +bias, +scale (同様のオーバーヘッド)
+
+    
+
+
+
+
+
+
+
+
+class VectorQuantization():
+    def __init__(self):
+        pass        
+
+    def run_vq(self, matrix, num_centroid, centroid_bits=32):
+        """
+        ベクトル量子化を行い、復元行列を返す。
+
+        Parameters:
+        - matrix: ndarray of shape (n_samples, n_features), 各行が量子化対象のベクトル
+        - num_centroid: int, セントロイド（クラスタ）の数
+
+        Returns:
+        - reconstructed_matrix: ndarray of shape (n_samples, n_features)
+        """
+        # 入力をnumpy配列に変換（念のため）
+        matrix = np.array(matrix)
+
+        # KMeansクラスタリングを実行（量子化）
+        from sklearn.cluster import KMeans
+        kmeans = KMeans(n_clusters=num_centroid, random_state=0, n_init='auto')
+        kmeans.fit(matrix)
+
+        # 各ベクトルが割り当てられたセントロイドのインデックスを取得
+        labels = kmeans.predict(matrix)
+
+        # セントロイドから復元行列を作成
+        if centroid_bits == 32:
+            centroids = kmeans.cluster_centers_
+        else:
+            centroids = UniformQuantization().run_uq(torch.tensor(kmeans.cluster_centers_), centroid_bits)
+        reconstructed_matrix = centroids[labels]
+
+        return reconstructed_matrix
+    
+
+    def calc_memory_size(self, matrix, num_centroid, centroid_bits=32):
+        num_row, num_col = matrix.shape
+
+        # インデックスに必要なビット数 → バイト換算（切り上げ）
+        bits_per_index = ceil(log2(num_centroid))
+        bytes_per_index = ceil(bits_per_index / 8)
+        idx_memory = num_row * bytes_per_index  # 単位: バイト
+
+        # セントロイド部分（float32 = 4バイト）
+        if centroid_bits == 32:
+            centroid_memory = num_centroid * num_col * centroid_bits/8   # 単位: バイト
+        else: centroid_memory = num_centroid * num_col * centroid_bits/8 + 32/8
+
+        return idx_memory + centroid_memory
+
+
+
