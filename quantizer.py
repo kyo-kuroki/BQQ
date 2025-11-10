@@ -296,7 +296,7 @@ class BinaryQuadraticQuantization():
 
         return y, z, maximum * a
     
-    def run_activation_aware_bqq_multibit(self, x, input, bit_width, rank_scale=1, zeta=4, eta=15, Tinit=0.007, Tfin=0.0, Nstep=50000, damping=1e-3, clipping=1, device_id=0, seed=1):
+    def run_activation_aware_bqq_multibit(self, x, input, bit_width, rank_scale=1, zeta=4, eta=15, Tinit=0.007, Tfin=0.0, Nstep=50000, damping=1e-3, device_id=0, seed=1):
         torch.set_float32_matmul_precision('high')
         torch.manual_seed(seed)
 
@@ -305,30 +305,30 @@ class BinaryQuadraticQuantization():
             raise ValueError('Dimention Error: Please Input 2-dim Matrix !!')
         n, m = x.shape
         x = x.to(device).float()
-        maximum = (x.max() - x.min())
-        x = x / maximum
 
         delta_temp = (Tinit - Tfin) / (Nstep - 1)
         temp = copy.copy(Tinit)
 
         # preprocess for input tensor
         input = input.reshape(-1, input.size(-1)).to(device).float()
-        input /= (input.max() - input.min()) 
         
 
-        s = (input.T @ input)/input.shape[0] # average covariance matrix
-        mean_input = input.mean(dim=0, keepdim=True) # average mean vector
+        # s = (input.T @ input)/input.shape[0] # average covariance matrix
+        # mean_input = input.mean(dim=0, keepdim=True) # average mean vector
         
         # preventing from overflow
         damping = torch.tensor(float(damping), device=device).float()
         scale = input.numel() 
+        # numel = input.shape[0] * x.shape[0]
 
         rank = round(rank_scale*(n*m)/(n+m))
 
         # quantization error function
-        def f(x, y, z, a, s=s):
+        # def f(x, y, z, a, s=s):
+        def f(x, y, z, a):
             q = (a[:,0].unsqueeze(-1).unsqueeze(-1)*y@z + a[:,1].unsqueeze(-1).unsqueeze(-1)*y.sum(dim=-1, keepdim=True) + a[:,2].unsqueeze(-1).unsqueeze(-1)*z.sum(dim=-2, keepdim=True) + a[:,3].unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
-            return torch.trace((x - q) @ s @ (x - q).T)
+            # return torch.trace((x - q) @ s @ (x - q).T)/numel
+            return ((input @ (x-q).T)**2).mean() 
 
         grad_y = torch.func.grad(f, argnums=1)
         grad_z = torch.func.grad(f, argnums=2)
@@ -345,8 +345,7 @@ class BinaryQuadraticQuantization():
             v = grad_a(x, y, z, torch.zeros((bit_width, 4), device=device))
             v_flat = v.reshape(-1)
             # scaling in order to prevent from overflow
-            # scale = input.numel() 
-            H_scaled = hesse_a(x, y, z, torch.zeros((bit_width, 4), device=device), s/scale).reshape(v_flat.shape[0], -1)
+            H_scaled = hesse_a(x, y, z, torch.zeros((bit_width, 4), device=device)).reshape(v_flat.shape[0], -1)
             v_scaled = v_flat / scale
 
             try:
@@ -354,8 +353,6 @@ class BinaryQuadraticQuantization():
                     -v_scaled.unsqueeze(-1),
                     torch.linalg.cholesky(H_scaled + damping * torch.eye(H_scaled.shape[0], device=device))
                 )
-                # if torch.isnan(sol).any() and not (torch.isnan(H_scaled).any() or torch.isnan(v_scaled).any()):
-                #     print('solving squared error 1')
                 return   sol.squeeze().reshape_as(v)
             except Exception as e:
                 sol =  - torch.matmul(torch.linalg.pinv(H_scaled, rcond=1e-8), v_scaled).reshape_as(v).float()
@@ -366,35 +363,23 @@ class BinaryQuadraticQuantization():
 
         @torch.compile(mode="reduce-overhead")
         def loop_body(y, z, yb, zb, a, temp):
-            yf = (y + zeta * (y - yb))
-            # yf = torch.clamp((y + zeta * (y - yb)), 0, 1)
-            zf = (z + zeta * (z - zb))
-            # zf = torch.clamp((z + zeta * (z - zb)), 0, 1)
+            yf = torch.where(y + zeta * (y - yb)>0.5, 1.0, 0.0)
+            zf = torch.where(z + zeta * (z - zb)>0.5, 1.0, 0.0)
             gy = grad_y(x, yf, zf, a)
             gz = grad_z(x, yf, zf, a)
-            ggy = 2 * mean_input.unsqueeze(0) @ torch.transpose((a[:,0].unsqueeze(-1).unsqueeze(-1) * zf + a[:,1].unsqueeze(-1).unsqueeze(-1))**2, -1, -2)
-            ggz = 2 * mean_input.unsqueeze(0) * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * yf + a[:,2].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-2).unsqueeze(-1)
-            y_energy_grad = torch.clamp(gy + (0.5-yf) * ggy, -clipping, clipping)
-            z_energy_grad = torch.clamp(gz + (0.5-zf) * ggz, -clipping, clipping)
+            # ggy = 2 * mean_input.unsqueeze(0) @ torch.transpose((a[:,0].unsqueeze(-1).unsqueeze(-1) * zf + a[:,1].unsqueeze(-1).unsqueeze(-1))**2, -1, -2)
+            # ggz = 2 * mean_input.unsqueeze(0) * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * yf + a[:,2].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-2).unsqueeze(-1)
+            y_energy_grad = gy/gy.abs().max() #+ (0.5-yf) * ggy
+            z_energy_grad = gz/gz.abs().max() #+ (0.5-zf) * ggz
 
             y_entropy_grad = temp * (y - 0.5)
             z_entropy_grad = temp * (z - 0.5)
 
-            # print('ygrad, zgrad', gy.mean(), gz.mean(), ggy.mean(), ggz.mean())
-            # ya = torch.clamp(torch.where((yf<=0.0) | (yf>=1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
-            # za = torch.clamp(torch.where((zf<=0.0) | (zf>=1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
             ya = torch.clamp(torch.where((2*y - yb<=0.0) | (2*y - yb>=1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
             za = torch.clamp(torch.where((2*z - zb<=0.0) | (2*z - zb>=1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
-            # ya = torch.clamp(2*y - yb - eta * (y_energy_grad + y_entropy_grad), 0, 1)
-            # za = torch.clamp(2*z - zb - eta * (z_energy_grad + z_entropy_grad), 0, 1)
 
-
-            # a = torch.nan_to_num(compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0), a), nan=0.0)
             a_new = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0), a)
             a = torch.where(torch.isnan(a_new), a, a_new)
-            # a = compute_a(ya, za, a)
-            # if torch.isnan(ya).any() or torch.isnan(za).any() or torch.isnan(a).any():
-            #     print(torch.isnan(ya).any(), torch.isnan(ya).any(), torch.isnan(a).any())
             return ya, za, y, z, a
 
         # gpuに移動
@@ -403,7 +388,7 @@ class BinaryQuadraticQuantization():
         zeta = torch.tensor(float(zeta), device=device).float()
         eta = torch.tensor(float(eta), device=device).float()
         # for _ in trange(Nstep, desc='Decomposing', mininterval=10.0): 
-        for _ in trange(Nstep):
+        for _ in range(Nstep):
             y = y.detach().clone()
             yb = yb.detach().clone()
             z = z.detach().clone()
@@ -414,15 +399,89 @@ class BinaryQuadraticQuantization():
 
             if _ % 1000 == 0:
                 # print(torch.isnan(y).any(), torch.isnan(z).any(), torch.isnan(a).any(), torch.isnan(f(x, y, z, a, s).any()))
-                print('(y,z):', ((y-0.5)**2).mean().item(),((z-0.5)**2).mean().item())
-                print('energy:', f(x, y, z, a, s).item())
+                print('norm (y,z):', ((y-0.5)**2).mean().item(),((z-0.5)**2).mean().item())
+                print('energy:', f(x, y, z, a).item())
 
         # 後処理
         y = torch.where(y > 0.5, 1.0, 0.0)
         z = torch.where(z > 0.5, 1.0, 0.0)
         a = compute_a(y, z, a)
 
-        return y, z, maximum * a
+        return y, z, a
+    
+    def scale_calibration(self, x, y, z, a, b, c, d, input, device_id=0):
+        torch.set_float32_matmul_precision('high')
+        # もしゼロで埋めたい場合は:
+        d_padded = torch.zeros(a.shape, device=a.device)
+        d_padded[0] = d  # 例えば最初だけ埋めるなど用途に応じて
+
+        # 4つのテンソルを結合
+        scale_parameters = torch.stack([a, b, c, d_padded], dim=0)
+
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+        if len(x.shape)!=2:
+            raise ValueError('Dimention Error: Please Input 2-dim Matrix !!')
+        x = x.to(device).float()
+        a_shape = a.shape
+
+        # preprocess for input tensor
+        input = input.reshape(-1, input.size(-1)).to(device).float() # reshape to 2-dim matrix
+        scale_parameters = scale_parameters.to(device).float()
+        
+
+        s = (input.T @ input)/input.shape[0] # average covariance matrix
+        
+        # preventing from overflow
+        scale = input.numel() 
+
+
+        # quantization error function
+
+        def reconstruction(y, z, scale_parameters):        # (p, j, k, m, l) @ (p, j, k, l, n) → (p, j, k, m, n)
+            # y.shape, z.shape → (p, j, k, m, l), (p, j, k, l, n)
+            bit_width, row_width, col_width, y_row, inter_dimension =  y.shape
+            _, _, _, _, z_col =  z.shape
+
+            a, b, c, d = scale_parameters[0], scale_parameters[1], scale_parameters[2], scale_parameters[3].sum(dim=0)
+            W_core = torch.matmul(y, z)  # Y @ Z
+
+            # Y.sum over l → (p, j, k, m)
+            Y_sum = y.sum(dim=-1, keepdim=True)  # → (p, j, k, m, 1)
+            Z_sum = z.sum(dim=-2, keepdim=True)  # → (p, j, k, 1, n)
+
+            # 総和項
+            W = a * W_core + b * Y_sum + c * Z_sum 
+
+            # p に沿って加算 → (j, k, m, n)
+            W = W.sum(dim=0) + d
+            W = W.permute(0, 2, 1, 3).reshape(row_width * y_row, col_width * z_col)
+
+            return W
+        
+        def error(x, y, z, scale_parameters, s=s):
+            q = reconstruction(y, z, scale_parameters)
+            return torch.trace((x - q) @ s @ (x - q).T)
+
+
+        grad_scale = torch.func.grad(error, argnums=3)
+        hesse_scale = torch.func.hessian(error, argnums=3)
+        
+
+
+        def optimize_scale(y, z, scale_parameters, s=s):
+            v = grad_scale(x, y, z, scale_parameters)
+            v_flat = v.reshape(-1)
+            H_scaled = hesse_scale(x, y, z, scale_parameters, s/scale).reshape(v_flat.shape[0], -1)
+            v_scaled = v_flat / scale
+
+
+            sol = scale_parameters - torch.matmul(torch.linalg.pinv(H_scaled, rcond=1e-16), v_scaled).reshape_as(v).float()
+            return sol
+
+        print('before calibration:', error(x, y, z, scale_parameters).item())
+        scale_parameters = optimize_scale(y, z, torch.zeros((a_shape), device=device))
+        print('after calibration:', error(x, y, z, scale_parameters).item())
+        return scale_parameters
     
 
     def bqq_worker_task(self, queue, result_list, rank_scale, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
@@ -585,7 +644,7 @@ class BinaryQuadraticQuantization():
 
 
 
-class QuadraticQuantization():
+class BinaryQuadraticQuantization2():
 
     def __init__(self, x, rank=None, rank_scale=1):
         self.rank_scale=rank_scale
@@ -612,7 +671,7 @@ class QuadraticQuantization():
     
         
 
-    def run_qq(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='numpy'):
+    def run_bqq(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='numpy'):
         self.delta_temp = (Tinit - Tfin) / (Nstep - 1)
         temp = copy.copy(Tinit)
         # GPU デバイスを指定
@@ -711,7 +770,7 @@ class QuadraticQuantization():
 
         
 
-    def run_qq_compile(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='numpy'):
+    def run_bqq_compile(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='torch'):
         torch.set_float32_matmul_precision('medium')
 
         device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
@@ -995,7 +1054,7 @@ class QuadraticQuantization():
 
         return best_device
     
-    def qq_worker_task(self, queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
+    def bqq_worker_task(self, queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
         torch.manual_seed(seed)
         torch.cuda.set_device(device_id)
         """ 各ワーカーが処理する行列分解タスク """
@@ -1018,8 +1077,8 @@ class QuadraticQuantization():
 
 
             for bit_idx in range(bit_width):
-                decomp_instance = QuadraticQuantization(x=update_x.clone(), rank_scale=rank_scale_copy)
-                y, z, a = decomp_instance.run_qq_compile(zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type='torch')
+                decomp_instance = BinaryQuadraticQuantization2(x=update_x.clone(), rank_scale=rank_scale_copy)
+                y, z, a = decomp_instance.run_bqq_compile(zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type='torch')
                 reconst = a[0] * y@z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
                 update_x -= reconst
 
@@ -1033,7 +1092,7 @@ class QuadraticQuantization():
             queue.task_done()
 
 
-    def qq_large_matrix_multi_worker(self, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
         """
         大きな行列をパッチに分割し、並列に行列分解を実行して復元
         """
@@ -1057,7 +1116,7 @@ class QuadraticQuantization():
         processes = []
         for worker_id in range(num_workers):
             device_id = (worker_id+main_gpu_id) % num_gpus
-            p = mp.Process(target=self.qq_worker_task, args=(queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
+            p = mp.Process(target=self.bqq_worker_task, args=(queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
             p.start()
             processes.append(p)
         
@@ -1288,9 +1347,6 @@ class BinaryCodingQuantization():
             B[:,:,i] = b
             Alpha[:,i] = alpha.view(-1)
         
-        # del r, b, alpha
-        # gc.collect()
-        # torch.cuda.empty_cache()
 
         return w_hat, B, Alpha
 
@@ -1682,207 +1738,6 @@ class UniformQuantization():
 
 
 
-class LatticeQuantization:
-    def __init__(self):
-        pass
-
-    def generate_identity_e8_lattice(self):
-        """
-        E8格子における240個の最短ベクトル（ノルムの2乗が2）を生成する。
-        これらはE8リー代数のルート系を構成する。
-        """
-        e8_vectors = []
-
-        # --- タイプ A: 全ての成分が +/- 0.5 で、負の符号の数が偶数 ---
-        # 8次元ベクトルのすべての符号の組み合わせを生成 (2^8 = 256通り)
-        for i in range(2**8):
-            vector = np.zeros(8)
-            negative_count = 0
-            for j in range(8):
-                if (i >> j) & 1:  # j-th bit is 1, so set to -0.5
-                    vector[j] = -0.5
-                    negative_count += 1
-                else:             # j-th bit is 0, so set to +0.5
-                    vector[j] = 0.5
-            
-            # 負の符号の数が偶数である場合のみ追加
-            if negative_count % 2 == 0:
-                e8_vectors.append(vector)
-                
-        # 確認: 128個のベクトルが生成されたはず
-        # print(f"Generated Type A vectors: {len(e8_vectors)}") # Expected: 128
-
-        # --- タイプ B: 2つの成分が +/- 1 で、残りが 0 ---
-        # 8つの位置から2つの位置を選ぶ組み合わせ (binomial(8, 2) = 28通り)
-        # その選ばれた2つの位置の符号の組み合わせ (2 * 2 = 4通り)
-        for i in range(8):
-            for j in range(i + 1, 8): # Ensure j > i to avoid duplicates
-                # (i, j) の位置に +/- 1 を配置
-                for sign1 in [-1, 1]:
-                    for sign2 in [-1, 1]:
-                        vector = np.zeros(8)
-                        vector[i] = sign1
-                        vector[j] = sign2
-                        e8_vectors.append(vector)
-        
-        # 確認: 112個のベクトルが生成されたはず (28 * 4 = 112)
-        # print(f"Generated Type A + Type B vectors: {len(e8_vectors)}") # Expected: 128 + 112 = 240
-
-        return e8_vectors
-
-
-    def round_nearest_even_sum(self, x):
-        """Dn格子: 要素の和が偶数になるように調整する整数ベクトル"""
-        rounded = torch.round(x)
-        if int(torch.sum(rounded).item()) % 2 != 0:
-            idx = torch.argmax(torch.abs(x - rounded))
-            rounded[idx] += -1 if x[idx] > rounded[idx] else 1
-        return rounded
-
-    def quantize_vector(self, vec: torch.Tensor) -> torch.Tensor:
-        """vec: (8,) ベクトルを E8 格子に量子化"""
-        # そのままDnに量子化
-        mirror1 = self.round_nearest_even_sum(vec)
-        diff1 = vec - mirror1
-        dist1 = torch.sum(diff1**2)
-
-        # Dn+(=Dnシフト) にも試して、より近い方を選ぶ
-        offset = 0.5
-        shifted = vec - offset
-        mirror2 = self.round_nearest_even_sum(shifted)
-        diff2 = shifted - mirror2
-        dist2 = torch.sum(diff2**2)
-
-        if dist2 < dist1:
-            return mirror2 + offset
-        else:
-            return mirror1
-
-    def run_dn_lq_no_scale(self, x: torch.Tensor, n: int) -> torch.Tensor:
-        """
-        2Dテンソル x に対し、全要素数が n の倍数であることを仮定し、
-        フラット化して n 次元単位で Dₙ ∪ Dₙ⁺ 量子化し、元の形に復元。
-
-        Args:
-            x (torch.Tensor): 入力テンソル (2D)
-            n (int): Dₙ格子の次元
-
-        Returns:
-            torch.Tensor: 量子化後テンソル（元の形状と同じ）
-        """
-        assert x.dim() == 2, "入力は2次元テンソルである必要があります。"
-        total_elements = x.numel()
-        assert total_elements % n == 0, f"要素数 {total_elements} は {n} の倍数である必要があります。"
-
-        original_shape = x.shape
-        x_flat = x.reshape(-1, n)
-
-
-        # 各ベクトルを量子化
-        quantized = torch.stack([
-            self.quantize_vector(vec) for vec in x_flat
-        ], dim=0)
-
-        # 元の形に戻す
-        return quantized.reshape(original_shape)
-    
-    def run_dn_lq(self, x: torch.Tensor, n: int, scale_steps: int = 20, n_bits=8) -> torch.Tensor:
-        """
-        2Dテンソル x に対し、全要素数が n の倍数であることを仮定し、
-        フラット化して n 次元単位で Dₙ ∪ Dₙ⁺ 量子化し、元の形に復元。
-        スケーリング係数をグリッドサーチし、
-        二乗誤差が最小のscaleを選ぶ。
-
-        Args:
-            x (torch.Tensor): 入力テンソル (2D)
-            n (int): Dₙ格子の次元
-            scale_steps (int): スケールグリッドの分割数（デフォルト20）
-
-        Returns:
-            torch.Tensor: 量子化後テンソル（元の形状と同じ）
-        """
-        original_shape = x.shape
-        x_flat = x.reshape(-1)
-
-        # パディング（nの倍数にする）
-        total_elements = x_flat.numel()
-        remainder = total_elements % n
-        if remainder != 0:
-            pad_size = n - remainder
-            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x.device, dtype=x.dtype)])
-
-        x_flat = x_flat.reshape(-1, n)
-
-        # 絶対値最小値を探す
-        x_min = x_flat.min().item()
-        x_max = x_flat.max().item()
-        x_mean = x_flat.mean().item()
-
-
-        cutmin_scales = torch.linspace(x_min, x_mean, steps=scale_steps)
-        cutmax_scales = torch.linspace(x_mean, x_max, steps=scale_steps)
-
-
-        best_quantized = None
-        best_error = float('inf')
-
-        for cut_min in cutmin_scales:
-            for cut_max in cutmax_scales:
-                if cut_min >= cut_max:
-                    continue
-                quantized_vectors = []
-                scaled_x_flat = (torch.clamp(x_flat, cut_min, cut_max) - cut_min)/(cut_max - cut_min) * (2**n_bits - 1) # [0, 2^n - 1]にする
-                for vec in scaled_x_flat:
-                    q_vec = self.quantize_vector(vec)
-                    quantized_vectors.append(q_vec)
-                quantized_tensor = torch.stack(quantized_vectors, dim=0) / (2**n_bits - 1) * (cut_max - cut_min) + cut_min
-
-                error = torch.norm(quantized_tensor - x_flat) ** 2
-                if error < best_error:
-                    best_error = error
-                    best_quantized = quantized_tensor
-                    best_scale = (cut_max - cut_min) / (2**n_bits - 1)
-                    best_bias = cut_min
-
-        best_quantized = best_quantized.reshape(-1)[:original_shape.numel()] 
-
-        return best_quantized.reshape(original_shape), best_scale, best_bias
-
-
-    
-
-
-    def calc_memory_size(self, quantized_tensor: torch.Tensor, n, bias, scale) -> float:
-        """
-        Dn量子化後の2Dテンソルのメモリサイズ（バイト単位）を概算する。
-        各コードワード（n要素ベクトル）ごとに必要なビット数を計算する。
-
-        Args:
-            quantized_tensor: 2D torch.Tensor (N, M), Dn量子化済み
-            n: 格子の次元（1コードワードあたりの次元数）
-            scale: 量子化で使用されたスケーリング係数
-
-        Returns:
-            float: 推定メモリサイズ（バイト単位）
-        """
-        assert quantized_tensor.dim() == 2, "量子化テンソルは2次元である必要があります。"
-
-        x_flat = (quantized_tensor.reshape(-1) - bias) / scale
-        total_elements = x_flat.numel()
-        remainder = total_elements % n
-        if remainder != 0:
-            pad_size = n - remainder
-            x_flat = torch.cat([x_flat, torch.zeros(pad_size, device=x_flat.device, dtype=x_flat.dtype)])
-        x_flat  = torch.clamp(torch.ceil(x_flat),min=0)
-        min_val = torch.floor(x_flat.min()).item()
-        max_val = torch.ceil(x_flat.max()).item()
-        value_range = max_val - min_val 
-        bits_per_component = int(torch.ceil(torch.log2(torch.tensor(value_range, dtype=torch.float32))).item())
-        total_bits = bits_per_component * quantized_tensor.numel()
-        
-
-        return total_bits / 8.0 + 4 + 4 # バイト単位
-    
 
 
 
@@ -2259,10 +2114,12 @@ class JPEG():
         NumPyの実数行列 X（0〜1正規化前提）をJPEGに圧縮し、
         再度復元したNumPy配列を返す。
         """
+        if isinstance(X, np.ndarray):
+            X = torch.from_numpy(X)
         num_elements = X.shape[0] * X.shape[1]
         target_bytes = n_bits * num_elements / 8
         # 0〜255にスケーリングしてuint8に変換
-        X8 = UniformQuantization().run_uq(torch.tensor(X), n_bits=8).numpy()
+        X8 = UniformQuantization().run_uq(X, n_bits=8).detach().numpy()
         bias = X8.min()
         scale = X8.max() - X8.min()
         X_clipped = (X8 - bias)/scale
