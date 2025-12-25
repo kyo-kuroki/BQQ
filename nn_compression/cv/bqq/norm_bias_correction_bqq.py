@@ -15,7 +15,7 @@ import sys
 from tqdm import tqdm
 sys.path.append('./../../../quantizer')
 # quantizerをインポート
-from quantizer import BinaryQuadraticQuantization2 as BQQ
+from BQQ.nn_compression.cv.bqq.bqq_network import BinaryQuadraticQuantization2 as BQQ
 import queue
 from multiprocessing import Process, Queue, current_process
 import pandas as pd
