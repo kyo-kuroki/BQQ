@@ -171,7 +171,7 @@ def iterative_lplr(
     X_app = torch.zeros_like(X, device=X.device)
 
     for k in range(K):
-        Xq = lplr(X=Xres, r=r, B1=B1, B2=B2)
+        Xq = lplr_svd(X=Xres, r=r, B1=B1, B2=B2)
         X_app += Xq
         Xres -= Xq
 

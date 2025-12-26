@@ -1,31 +1,29 @@
-1. associative_memory.py
-連想記憶に関して既存の行列分解との精度とモデルの比較を行う
-手順：画像をフラット化-->データを並べて行列化-->行列分解で学習-->マスクをかけた欠損値画像を推論(画像復元)
-
-2. comparison_with_other_MF.ipynb
-画像圧縮に関して既存の行列分解や量子化とモデルサイズと誤差のトレードオフを比べる
 
 
-3. fine_tuning.py
-ImageNet事前学習済みモデルをヘッドを変えてCIFAR10やCIFAR100用にファインチューニングする
+## 📂 Project Structure
 
-4. load_model.py
-行列分解した学習重みを読み込んで精度を確認する
+This repository contains two complementary modules that evaluate BQQ from different perspectives:
 
-5. NN_compression_diveide_patch_multi_worker.py
-DNNの学習重みに対してバイナリ行列分解を並列に実行して適用する(重みが大規模行列になると時間がかかるのでパッチに分けて処理を行う)
+### **`matrix_compression/`**
 
-6. NN_compression_no_patch_multi_worker.py
-DNNの学習重みに対してバイナリ行列分解を並列に実行して適用する(パッチに分けずに行う)
+Focuses on **generic matrix datasets**.
+It studies the trade-off between:
 
-7. NN_compression_parallel.py
-DNNの学習重みに対してバイナリ行列分解を並列に実行して適用するが1つのGPUに対して1つの処理しか割り当てない(1つのGPUに対して複数の処理を割り当てるのは6.を使う)
+* model (compressed) size, and
+* reconstruction error
 
-8. NN_quantization_parallel.py
-DNNの学習重みに対して量子化を並列に実行して適用するが1つのGPUに対して1つの処理しか割り当てない(ここでの量子化は非対称量子化)
+This module is useful for understanding BQQ as a **matrix compression method**, independent of downstream neural networks.
 
-9. save_model.py
-事前学習済みモデルをファイルに保存する
+---
 
-10. watch_sensitivity.py
-各レイヤーがどのくらい精度劣化をもたらしたかを調べる
+### **`nn_compression/`**
+
+Focuses on **neural network quantization**.
+It evaluates how BQQ affects:
+
+* model accuracy,
+* task performance, and
+* robustness after quantization.
+
+This module connects BQQ to practical deep-learning use cases.
+

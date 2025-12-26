@@ -296,7 +296,7 @@ class BinaryQuadraticQuantization():
 
         return y, z, maximum * a
     
-    def run_activation_aware_bqq_multibit(self, x, input, bit_width, rank_scale=1, zeta=4, eta=15, Tinit=0.007, Tfin=0.0, Nstep=50000, damping=1e-3, device_id=0, seed=1):
+    def run_activation_aware_bqq_multibit(self, x, input, bit_width, group_size=32, rank_scale=1, top_percent=0.5, quant_bias=True, Nstep=50000, device_id=0, seed=1):
         torch.set_float32_matmul_precision('high')
         torch.manual_seed(seed)
 
@@ -306,108 +306,191 @@ class BinaryQuadraticQuantization():
         n, m = x.shape
         x = x.to(device).float()
 
-        delta_temp = (Tinit - Tfin) / (Nstep - 1)
-        temp = copy.copy(Tinit)
-
         # preprocess for input tensor
         input = input.reshape(-1, input.size(-1)).to(device).float()
         
-
-        # s = (input.T @ input)/input.shape[0] # average covariance matrix
-        # mean_input = input.mean(dim=0, keepdim=True) # average mean vector
-        
         # preventing from overflow
-        damping = torch.tensor(float(damping), device=device).float()
         scale = input.numel() 
-        # numel = input.shape[0] * x.shape[0]
+        input = input / scale
 
-        rank = round(rank_scale*(n*m)/(n+m))
 
+        def _best_divisor_leq(n: int, cap: int) -> int:
+            """n を割り切る約数のうち、cap 以下で最大のものを返す。"""
+            if cap < 1:
+                raise ValueError("group_size must be >= 1")
+            cap = min(cap, n)
+            # 上から順に探すのが最短（n の約数はそう多くない）
+            for d in range(cap, 0, -1):
+                if n % d == 0:
+                    return d
+            return 1  # ここには通常来ない
+        
+        def patchify_2d(x: torch.Tensor, group_size: int):
+            """
+            x: 2次元テンソル (H, W)
+            group_size: パッチの辺長の上限
+            返り値: (x_patches, (j, k, m, n))
+            - x_patches: 形状 (j, k, m, n)
+            - j: 行方向パッチ数, k: 列方向パッチ数
+            - m: パッチの高さ(行数), n: パッチの幅(列数)
+            """
+            if x.dim() != 2:
+                raise ValueError("x must be a 2D tensor of shape (H, W)")
+            H, W = x.shape
+            m = _best_divisor_leq(H, group_size)  # 行側パッチ高（group_size 以下で最大）
+            n = _best_divisor_leq(W, group_size)  # 列側パッチ幅（group_size 以下で最大）
+            j, k = H // m, W // n
+
+            # (H, W) -> (j, m, k, n) -> (j, k, m, n)
+            x_p = x.reshape(j, m, k, n).permute(0, 2, 1, 3).contiguous()
+            return x_p, (j, k, m, n)
+
+        # forward function
+        def binary_quadratic_forward(X, Y, Z, A, quant_bias=True):
+            """
+            X: (j*m, k*n)
+            Y: (p, j, k, m, l)  -- binarized inside (>0.5)
+            Z: (p, j, k, l, n)  -- binarized inside (>0.5)
+            A: (p, j, k, 4)     -- scaling factors (a, b, c, d) if quant_bias else (p, j, k) 
+            bias: Optional[(j*m,)] or broadcastable to output
+            
+            Returns: (j*m, k*n)
+            """
+            dtype = X.dtype
+            device = Y.device
+
+            # Shapes
+            p, j, k, m, l = Y.shape
+            _, _, _, _, n = Z.shape
+
+            # Core terms
+            W_core = torch.matmul(Y.to(dtype), Z.to(dtype))                     # (p, j, k, m, n)
+
+            if quant_bias:
+                # Scale factors
+                a = A[..., 0].unsqueeze(-1).unsqueeze(-1)  # (p, j, k, 1, 1)
+                b = A[..., 1].unsqueeze(-1).unsqueeze(-1)  # (p, j, k, 1, 1)
+                c = A[..., 2].unsqueeze(-1).unsqueeze(-1)  # (p, j, k, 1, 1)
+                d = A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0)  # (j, k, 1, 1)
+
+                Y_sum  = Y.sum(dim=-1, keepdim=True).to(dtype)                       # (p, j, k, m, 1)
+                Z_sum  = Z.sum(dim=-2, keepdim=True).to(dtype)                       # (p, j, k, 1, n)
+
+                # Combine with scales
+                W = a.to(dtype) * W_core + b.to(dtype) * Y_sum + c.to(dtype) * Z_sum  # (p, j, k, m, n)
+
+                # Sum over bit width p, add offset d
+                W = W.sum(dim=0) + d.to(dtype)                                        # (j, k, m, n)
+            else:
+                a = A.unsqueeze(-1).unsqueeze(-1)  # (p, j, k, 1, 1)
+                W = a.to(dtype) * W_core  # (p, j, k, m, n)
+
+            # Reorder and flatten to (j*m, k*n)
+            W = W.permute(0, 2, 1, 3).reshape(j * m, k * n)
+
+            # Output
+            out = X.to(device) @ W.T
+            return out
+        
         # quantization error function
-        # def f(x, y, z, a, s=s):
-        def f(x, y, z, a):
-            q = (a[:,0].unsqueeze(-1).unsqueeze(-1)*y@z + a[:,1].unsqueeze(-1).unsqueeze(-1)*y.sum(dim=-1, keepdim=True) + a[:,2].unsqueeze(-1).unsqueeze(-1)*z.sum(dim=-2, keepdim=True) + a[:,3].unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
-            # return torch.trace((x - q) @ s @ (x - q).T)/numel
-            return ((input @ (x-q).T)**2).mean() 
 
+        def f(x, y, z, a):
+            output_quant = binary_quadratic_forward(input, torch.where(y>0.5, 1.0, 0.0), torch.where(z>0.5, 1.0, 0.0), a, quant_bias=quant_bias)
+            output_org = input @ x.T
+            return ((output_org - output_quant)**2).mean()
+
+        _, shape_info = patchify_2d(x, group_size)
+        j, k, m, n = shape_info
+        l = int(round(rank_scale * (m * n) / (m + n)))
         grad_y = torch.func.grad(f, argnums=1)
         grad_z = torch.func.grad(f, argnums=2)
         grad_a = torch.func.grad(f, argnums=3)
         hesse_a = torch.func.hessian(f, argnums=3)
-        yb = torch.rand((bit_width, n, rank), device=device).float()
-        zb = torch.rand((bit_width, rank, m), device=device).float()
-        y = yb - eta * (yb - 0.5)
-        z = zb - eta * (zb - 0.5)
+        y = 2*torch.randint(0, 2, (bit_width, j, k, m, l), device=device).float() - 1
+        z = 2*torch.randint(0, 2, (bit_width, j, k, l, n), device=device).float() - 1
+
+        if quant_bias:
+            a_shape = (bit_width, j, k, 4)
+        else:
+            a_shape = (bit_width, j, k)
         
 
 
-        def compute_a(y, z, a):
-            v = grad_a(x, y, z, torch.zeros((bit_width, 4), device=device))
+        def compute_a(y, z):
+            v = grad_a(x, y, z, torch.zeros(a_shape, device=device))
             v_flat = v.reshape(-1)
             # scaling in order to prevent from overflow
-            H_scaled = hesse_a(x, y, z, torch.zeros((bit_width, 4), device=device)).reshape(v_flat.shape[0], -1)
-            v_scaled = v_flat / scale
+            H_flat = hesse_a(x, y, z, torch.zeros(a_shape, device=device)).reshape(v_flat.shape[0], -1)
+            sol =  - torch.matmul(torch.linalg.pinv(H_flat, rcond=1e-8), v_flat).reshape_as(v).float()
+            return sol
+        
+        def flip_top_positive(y, gy, top_percent=0.1):
+            """
+            gy*y > 0 のパラメータのうち、|gy*y| の上位 top_percent を反転させる。
 
-            try:
-                sol = torch.cholesky_solve(
-                    -v_scaled.unsqueeze(-1),
-                    torch.linalg.cholesky(H_scaled + damping * torch.eye(H_scaled.shape[0], device=device))
-                )
-                return   sol.squeeze().reshape_as(v)
-            except Exception as e:
-                sol =  - torch.matmul(torch.linalg.pinv(H_scaled, rcond=1e-8), v_scaled).reshape_as(v).float()
-                return sol
+            Args:
+                y (torch.Tensor): 対象のパラメータテンソル
+                gy (torch.Tensor): 勾配テンソル（y と同形）
+                top_percent (float): 反転させる割合 (0~1)
+
+            Returns:
+                torch.Tensor: 符号を一部反転させた新しい y
+            """
+            # gy*y > 0 のインデックスを取得
+            mask = (gy * y) > 0
+            if mask.sum() == 0:
+                return y.clone()  # 対象がなければそのまま返す
+
+            # 対象部分のスコアを計算（符号反転対象の重要度）
+            scores = (gy * y).abs()
+            scores_masked = scores[mask]
+
+            # 上位 top_percent の閾値を求める
+            k = max(1, int(len(scores_masked) * top_percent))
+            threshold = torch.topk(scores_masked, k).values.min()
+
+            # 反転対象のマスク
+            flip_mask = mask & (scores >= threshold)
+
+            # 符号反転
+            y_flipped = y.clone()
+            y_flipped[flip_mask] *= -1
+
+            return y_flipped
 
 
-        a = compute_a(y, z, torch.zeros((bit_width, 4), device=device))
+        a = compute_a(y, z)
 
         @torch.compile(mode="reduce-overhead")
-        def loop_body(y, z, yb, zb, a, temp):
-            yf = torch.where(y + zeta * (y - yb)>0.5, 1.0, 0.0)
-            zf = torch.where(z + zeta * (z - zb)>0.5, 1.0, 0.0)
-            gy = grad_y(x, yf, zf, a)
-            gz = grad_z(x, yf, zf, a)
-            # ggy = 2 * mean_input.unsqueeze(0) @ torch.transpose((a[:,0].unsqueeze(-1).unsqueeze(-1) * zf + a[:,1].unsqueeze(-1).unsqueeze(-1))**2, -1, -2)
-            # ggz = 2 * mean_input.unsqueeze(0) * ((a[:,0].unsqueeze(-1).unsqueeze(-1) * yf + a[:,2].unsqueeze(-1).unsqueeze(-1))**2).sum(dim=-2).unsqueeze(-1)
-            y_energy_grad = gy/gy.abs().max() #+ (0.5-yf) * ggy
-            z_energy_grad = gz/gz.abs().max() #+ (0.5-zf) * ggz
+        def loop_body(y, z, a):
+            gy = grad_y(x, y, z, a)
+            gz = grad_z(x, y, z, a)
 
-            y_entropy_grad = temp * (y - 0.5)
-            z_entropy_grad = temp * (z - 0.5)
+            y = flip_top_positive(y, gy, top_percent=top_percent)
+            z = flip_top_positive(z, gz, top_percent=top_percent)
 
-            ya = torch.clamp(torch.where((2*y - yb<=0.0) | (2*y - yb>=1.0), 2*y - yb - eta * y_entropy_grad, 2*y - yb - eta * (y_energy_grad + y_entropy_grad)), 0, 1)
-            za = torch.clamp(torch.where((2*z - zb<=0.0) | (2*z - zb>=1.0), 2*z - zb - eta * z_entropy_grad, 2*z - zb - eta * (z_energy_grad + z_entropy_grad)), 0, 1)
-
-            a_new = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0), a)
-            a = torch.where(torch.isnan(a_new), a, a_new)
-            return ya, za, y, z, a
+            a = compute_a(y, z)
+            return y, z, a
 
         # gpuに移動
-        temp = torch.tensor(float(temp), device=device).float()
-        delta_temp = torch.tensor(float(delta_temp), device=device).float()
-        zeta = torch.tensor(float(zeta), device=device).float()
-        eta = torch.tensor(float(eta), device=device).float()
+        top_percent = torch.tensor(top_percent, device=device).float()
         # for _ in trange(Nstep, desc='Decomposing', mininterval=10.0): 
         for _ in range(Nstep):
             y = y.detach().clone()
-            yb = yb.detach().clone()
             z = z.detach().clone()
-            zb = zb.detach().clone()
             a = a.detach().clone()
-            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
-            temp -= delta_temp
+            y, z, a = loop_body(y, z, a)
 
             if _ % 1000 == 0:
-                # print(torch.isnan(y).any(), torch.isnan(z).any(), torch.isnan(a).any(), torch.isnan(f(x, y, z, a, s).any()))
-                print('norm (y,z):', ((y-0.5)**2).mean().item(),((z-0.5)**2).mean().item())
                 print('energy:', f(x, y, z, a).item())
 
         # 後処理
-        y = torch.where(y > 0.5, 1.0, 0.0)
-        z = torch.where(z > 0.5, 1.0, 0.0)
-        a = compute_a(y, z, a)
+        y = torch.where(y > 0.0, 1.0, -1.0)
+        z = torch.where(z > 0.0, 1.0, -1.0)
+        a = compute_a(y, z)
 
         return y, z, a
+    
     
     def scale_calibration(self, x, y, z, a, b, c, d, input, device_id=0):
         torch.set_float32_matmul_precision('high')

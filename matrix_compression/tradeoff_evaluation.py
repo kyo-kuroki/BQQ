@@ -16,7 +16,7 @@ from quantizer import (
     LatticeVectorQuantization as LVQ,
     JPEG,
 )
-from lplr.compressors import direct_svd_quant, lplr, lplr_svd
+from lplr.compressors import direct_svd_quant, lplr, lplr_svd, iterative_lplr
 
 
 
@@ -97,7 +97,7 @@ def crop_to_max_power_of_two(matrices):
 
 def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_id=1):
     num_matrices = len(matrix_list)
-    fig = plt.figure(figsize=(8.5 * (num_matrices+1), 35))  # 4行×N列
+    fig = plt.figure(figsize=(8 * (num_matrices+1), 36))  # 4行×N列
     n_row = 4
     records = []
 
@@ -113,6 +113,7 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
         vq4_e_list, vq4_m_list = [], []
         vq8_e_list, vq8_m_list = [], []
         lq_e_list, lq_m_list = [], []
+        lplr_e_list, lplr_m_list = [], []
         jpeg_e_list, jpeg_m_list = [], []
         stack = torch.zeros_like(matrix)
 
@@ -133,21 +134,30 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
 
         # SVD + Quantization
         for bit in [4, 8]:
-            print(f'running svd + {bit}-bit uq...')
+            print(f'running LPLR {bit}-bit...')
             svd_e_list = []
             svd_m_list = []
             for r in torch.linspace(bitwidth_list[0]*matrix.numel()/(bit*(matrix.shape[0]+matrix.shape[1])), bitwidth_list[-1]*matrix.numel()/(bit*(matrix.shape[0]+matrix.shape[1])), 5):
                 r = int(r)
-                U, s, V = svd_matrix(matrix, rank=r)
-                Uq, Vq = UQ().run_uq(U, bit), UQ().run_uq(torch.diag(s)@V, bit)
-                approx_tensor = Uq@Vq
-                # approx_tensor = lplr(X=matrix, r=r, B1=bit, B2=bit, normalize_and_shift=True)
+                # U, s, V = svd_matrix(matrix, rank=r)
+                # Uq, Vq = UQ().run_uq(U, bit), UQ().run_uq(torch.diag(s)@V, bit)
+                # approx_tensor = Uq@Vq
+                approx_tensor = lplr_svd(X=matrix, r=r, B1=bit, B2=bit, normalize_and_shift=True)
                 error = MSE(matrix, approx_tensor)
                 svd_m_list.append((bit * (U.shape[0] * r + r * V.shape[1]) + 32*4)/8000)
                 svd_e_list.append(error)
+                break
+            # if bit==8:
+            #     ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='indigo', linewidth=8, markersize=20)
+            # elif bit==4: ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='orchid', linewidth=8, markersize=20)
+            # elif bit==2: ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='violet', linewidth=8, markersize=20)
+            # elif bit==1: ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='mediumvioletred', linewidth=8, markersize=20)
             if bit==8:
-                ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='indigo', linewidth=8, markersize=20)
-            elif bit==4: ax1.plot(svd_m_list, svd_e_list, label=f'SVD + {bit}-bit UQ', marker='p', color='orchid', linewidth=8, markersize=20)
+                ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit ', marker='p', color='indigo', linewidth=8, markersize=20)
+            elif bit==4: ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit', marker='p', color='orchid', linewidth=8, markersize=20)
+            elif bit==2: ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit', marker='p', color='violet', linewidth=8, markersize=20)
+            elif bit==1: ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit', marker='p', color='mediumvioletred', linewidth=8, markersize=20)
+
 
         for bw in (bitwidth_list):
             # UQ
@@ -200,6 +210,13 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
             lq_e_list.append(MSE(matrix, quantized))
             lq_m_list.append(LVQ().calc_memory_size(quantized, n_bits=bw, scale_bits=1)/1000)
 
+            # LPLR
+            print('running lplr...')
+            r = int(matrix.numel()/((matrix.shape[0]+matrix.shape[1])))
+            quantized = lplr_svd(matrix, r=r , B1=bw, B2=bw, normalize_and_shift=True)
+            lplr_e_list.append(MSE(matrix, quantized))
+            lplr_m_list.append((bw * r * (matrix.shape[0]+matrix.shape[1]) + 32*4)/8000)
+
 
             # JPEG
             print('running jpeg...')
@@ -210,7 +227,7 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
 
         dic = ['DeiT','ImageNet','Random', 'Distance', 'SIFT']
 
-
+        ax1.plot(lplr_m_list, lplr_e_list, label='LPLR', marker='x', color='magenta', linewidth=8, markersize=20)
         ax1.plot(q_m_list, q_e_list, label='UQ', marker='s', color='black', linewidth=8, markersize=20)
         ax1.plot(bcq_m_list, bcq_e_list, label='BCQ', marker='^', color='blue', linewidth=8, markersize=20)
         ax1.plot(vq_m_list, vq_e_list, label='VQ', marker='<', color='orange', linewidth=8, markersize=20)
