@@ -21,9 +21,8 @@ This module is useful for understanding BQQ as a **matrix compression method**, 
 Focuses on **neural network quantization**.
 It evaluates how BQQ affects:
 
-* model accuracy,
-* task performance, and
-* robustness after quantization.
+* model size,
+* task performance
 
 This module connects BQQ to practical deep-learning use cases.
 
