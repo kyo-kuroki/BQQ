@@ -1,4 +1,4 @@
-
+# Binary Quadratic Quantization (BQQ)
 
 ## 📂 Project Structure
 
