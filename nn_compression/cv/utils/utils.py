@@ -3,6 +3,7 @@ import torch
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import os
+from pathlib import Path
 import pandas as pd
 from PIL import Image
 import math
@@ -10,7 +11,24 @@ from torch.utils.data import DataLoader
 import random
 from tqdm import tqdm
 
-def get_imagenet(model_name, val_batchsize=32, calib_batchsize=32, num_workers=16, num_traindatas=None, data_path='/ldisk/Shared/Datasets/ILSVRC/ILSVRC2012/', seed=0):
+
+def _resolve_imagenet_path(data_path=None):
+    if data_path:
+        return os.fspath(Path(data_path).expanduser())
+
+    for env_var in ("IMAGENET_DIR", "IMAGENET_ROOT", "ILSVRC2012_DIR"):
+        env_value = os.getenv(env_var)
+        if env_value:
+            return os.fspath(Path(env_value).expanduser())
+
+    raise ValueError(
+        "ImageNet path is not set. Pass data_path or set IMAGENET_DIR, IMAGENET_ROOT, or ILSVRC2012_DIR."
+    )
+
+
+def get_imagenet(model_name, val_batchsize=32, calib_batchsize=32, num_workers=16, num_traindatas=None, data_path=None, seed=0):
+    data_path = _resolve_imagenet_path(data_path)
+
     if "deit" in model_name:
         mean = (0.485, 0.456, 0.406)
         std = (0.229, 0.224, 0.225)

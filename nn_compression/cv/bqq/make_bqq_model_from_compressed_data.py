@@ -1,8 +1,17 @@
 import torch
 import os
+from pathlib import Path
 import sys
 from tqdm import tqdm
-sys.path.append('./../utils')
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CV_DIR = SCRIPT_DIR.parent
+UTILS_DIR = CV_DIR / "utils"
+
+utils_path = str(UTILS_DIR)
+if utils_path not in sys.path:
+    sys.path.insert(0, utils_path)
+
 import pandas as pd
 from build_dataset import get_imagenet
 from build_model import get_model
@@ -31,7 +40,7 @@ def get_parser():
     parser.add_argument("--bit_width", type=int, default=4,
                         help="Bit width for quantization")
     
-    parser.add_argument("--compressed_data_dir", type=str, default='',)
+    parser.add_argument("--compressed_data_dir", type=str, default=None)
 
     parser.add_argument("--num_workers", type=int, default=8,
                         help="Number of workers")
@@ -60,13 +69,17 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, Nstep
 
     for name, param in model.named_parameters():
         print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
-    os.makedirs(os.path.dirname(__file__)+f'/quantized_bqq_model', exist_ok=True)
-    torch.save(model, os.path.dirname(__file__)+f'/quantized_bqq_model/{model_name}-{bit_width}bit-{group_size}gs-{Nstep}step-bqq.pth')
+    output_dir = SCRIPT_DIR / "quantized_bqq_model"
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(model, output_dir / f'{model_name}-{bit_width}bit-{group_size}gs-{Nstep}step-bqq.pth')
 
 if __name__ == '__main__':
     args = get_parser()
+    compressed_data_dir = args.compressed_data_dir
+    if compressed_data_dir is None:
+        compressed_data_dir = SCRIPT_DIR / "bqq_compressed_data" / f"{args.model_name}-{args.Nstep}step-{args.group_size}gs-{args.rank_scale}rankscale"
     save_bqq_model(model_name=args.model_name,
-                   compressed_data_dir=args.compressed_data_dir,
+                   compressed_data_dir=compressed_data_dir,
                    bit_width=args.bit_width,
                    group_size=args.group_size,
                    Nstep=args.Nstep,

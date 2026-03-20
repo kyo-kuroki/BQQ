@@ -3,11 +3,18 @@
 
 import torch
 from datasets import load_dataset
+from pathlib import Path
 from transformers import AutoTokenizer, DataCollatorForLanguageModeling
 from transformers.data.data_collator import _torch_collate_batch, pad_without_fast_tokenizer_warning
 from trl import SFTConfig, SFTTrainer
 from typing import Any, Dict, List, Mapping
 import os
+import argparse
+
+try:
+    from .compressed_data import default_quantized_model_dir, model_basename
+except ImportError:
+    from compressed_data import default_quantized_model_dir, model_basename
 
 
 
@@ -124,9 +131,28 @@ def train(model_path, model_name, train_dataset, test_dataset, output_dir="./out
 
 
 def main():
-    model_path = "/work2/k-kuroki/BQQLLM/fine_tuning/quantized_model_data/Qwen/Qwen2.5-1.5B/Qwen2.5-1.5B-4bit-128gs-50000step.pth"
-    model_name = "Qwen/Qwen2.5-1.5B"
-    
+    parser = argparse.ArgumentParser(description="Fine-tune a quantized language model")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B")
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--bit_width", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=128)
+    parser.add_argument("--num_steps", type=int, default=50000)
+    parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--max_seq_length", type=int, default=512)
+    args = parser.parse_args()
+
+    model_path = args.model_path
+    if model_path is None:
+        model_id = model_basename(args.model_name)
+        model_path = default_quantized_model_dir(args.model_name) / f"{model_id}-{args.bit_width}bit-{args.group_size}gs-{args.num_steps}step.pth"
+
+    output_dir = args.output_dir
+    if output_dir is None:
+        output_dir = Path(__file__).resolve().parent / "fine_tuned_models" / model_basename(args.model_name)
+
 
     def is_not_empty(example):
         text = example['text'].strip()
@@ -135,4 +161,18 @@ def main():
     train_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train').filter(is_not_empty)
     test_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test').select(range(256))
 
-    train(model_path=model_path, model_name=model_name, train_dataset=train_dataset, test_dataset=test_dataset, output_dir=f"./{model_name}", num_train_epochs=1, learning_rate=2e-5, gradient_accumulation_steps=4, max_seq_length=512)
+    train(
+        model_path=str(model_path),
+        model_name=args.model_name,
+        train_dataset=train_dataset,
+        test_dataset=test_dataset,
+        output_dir=str(output_dir),
+        num_train_epochs=args.num_train_epochs,
+        learning_rate=args.learning_rate,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        max_seq_length=args.max_seq_length,
+    )
+
+
+if __name__ == "__main__":
+    main()

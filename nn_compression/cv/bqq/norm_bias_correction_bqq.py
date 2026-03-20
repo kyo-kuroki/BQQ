@@ -11,11 +11,22 @@ from torch.multiprocessing import set_start_method
 import torch.nn.functional as F
 from transformers import AutoImageProcessor, SwinForImageClassification
 import os
+from pathlib import Path
 import sys
 from tqdm import tqdm
-sys.path.append('./../../../quantizer')
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CV_DIR = SCRIPT_DIR.parent
+BQQ_ROOT = CV_DIR.parent.parent
+UTILS_DIR = CV_DIR / "utils"
+
+for path in (BQQ_ROOT, UTILS_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 # quantizerをインポート
-from BQQ.nn_compression.cv.bqq.bqq_network import BinaryQuadraticQuantization2 as BQQ
+from quantizer import BinaryQuadraticQuantization2 as BQQ
 import queue
 from multiprocessing import Process, Queue, current_process
 import pandas as pd
@@ -264,15 +275,7 @@ def load_qq_model(model, weights_dir, bit_width, model_type='deit', qtz_type='qq
                 original_shape = param.shape
                 conversion_shape = param.reshape(param.shape[0], -1).shape
                 emb_list = []
-                # if 'deit-s' in weights_dir:
-                #     emb_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/deit-s-embeddings-50000step-384gs'
-                # elif 'deit-b' in weights_dir:
-                #     emb_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/deit-b-embeddings-50000step-384gs'
-                # elif 'swin-t' in weights_dir:
-                #     emb_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/swin-t-embeddings-50000step-48gs'
-                # elif 'swin-s' in weights_dir:
-                #     emb_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/swin-s-embeddings-50000step-48gs'
-                # else: emb_dir = weights_dir
+                # embedding 用に別ディレクトリを使う場合は、weights_dir と同じ規約のパスを指定する
                 emb_dir = weights_dir
 
 
@@ -297,15 +300,7 @@ def load_qq_model(model, weights_dir, bit_width, model_type='deit', qtz_type='qq
             original_shape = param.shape
             conversion_shape = param.reshape(param.shape[0], -1).shape
             head_list = []
-            # if 'deit-s' in weights_dir:
-            #     head_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/deit-s-head-50000step-100gs'
-            # elif 'deit-b' in weights_dir:
-            #     head_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/deit-b-head-50000step-100gs'
-            # elif 'swin-t' in weights_dir:
-            #     head_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/swin-t-head-50000step-100gs'
-            # elif 'swin-s' in weights_dir:
-            #     head_dir = r'/work2/k-kuroki/quadratic_quantization/nn_compression/cv/qq_compressed_data/swin-s-head-50000step-100gs'
-            # else: head_dir = weights_dir
+            # head 用に別ディレクトリを使う場合は、weights_dir と同じ規約のパスを指定する
             head_dir = weights_dir
 
             # ディレクトリにあるファイルを逐次的に読み込み

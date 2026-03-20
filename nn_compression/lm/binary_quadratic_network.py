@@ -1,8 +1,12 @@
 import torch
 import torch.nn as nn
-import os
 from scipy.linalg import hadamard
 from tqdm import tqdm
+
+try:
+    from .compressed_data import build_patch_index, get_bqq_matrices, load_layer_patches
+except ImportError:
+    from compressed_data import build_patch_index, get_bqq_matrices, load_layer_patches
 
 
 class BinaryQuadratic(nn.Module):
@@ -126,30 +130,20 @@ class HadamardBinaryQuadratic(nn.Module):
 
 
 def get_matrices(patch_list, bit_width):
-    # 特定のビット重みのみ
-    row_width = max(patch['patch_row'] for patch in patch_list)+1
-    col_width = max(patch['patch_col'] for patch in patch_list)+1
-    m, l = patch_list[0]['mat1'].shape
-    l, n = patch_list[0]['mat2'].shape
-    A = torch.zeros((bit_width, row_width, col_width, 4))
-    Y = torch.zeros((bit_width, row_width, col_width, m, l))
-    Z = torch.zeros((bit_width, row_width, col_width, l, n))
-    for patch in patch_list:
-        i, j = patch['patch_row'], patch['patch_col']
-        a, y, z, k = patch['coeff'], patch['mat1'], patch['mat2'], patch['bit_idx']
-
-        
-        if k >= bit_width:
-            continue  # bit_idx が範囲外の場合はスキップ
-        else:
-            A[k,i,j] = a
-            Y[k,i,j] = y
-            Z[k,i,j] = z
-        
-    return A, Y, Z
+    return get_bqq_matrices(patch_list, bit_width)
 
 
-def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=None, show_tqdm=True):
+def _load_layer_matrices(layer_name, patch_index, bit_width, map_location):
+    patch_list = load_layer_patches(layer_name, patch_index, map_location=map_location)
+    if not patch_list:
+        return None
+    return get_matrices(patch_list, bit_width=bit_width)
+
+
+def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=None, show_tqdm=True, patch_index=None):
+    if patch_index is None:
+        patch_index = build_patch_index(weights_dir)
+
     iterator = tqdm(model.named_children()) if show_tqdm else model.named_children()
     for name, module in iterator:
         full_name = f"{prefix}.{name}" if prefix else name
@@ -159,29 +153,36 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=Non
             continue
 
         if isinstance(module, (nn.Linear)):
-            # print(f"Replacing {full_name}: {type(module)}")
-            # print('weight shape:', module.weight.shape, 'bias is None ?:', module.bias is None)
+            matrices = _load_layer_matrices(
+                full_name,
+                patch_index,
+                bit_width,
+                map_location=device if device is not None else module.weight.device,
+            )
+            if matrices is None:
+                continue
 
-            # 重みファイル名にフルネームが入っていると仮定
-            weight_list = []
-            for file in os.listdir(weights_dir):
-                if file.endswith('.pth') and (full_name in file) and ('row' in file):
-                    path = os.path.join(weights_dir, file)
-                    if device is not None:
-                        weight_list += torch.load(path, map_location=device)
-                    else:
-                        weight_list += torch.load(path, map_location=module.weight.device)
-
-            A, Y, Z = get_matrices(weight_list, bit_width=bit_width)
+            A, Y, Z = matrices
             bqq = BinaryQuadratic(Y, Z, A, bias=module.bias)
             setattr(model, name, bqq)
         else:
-            replace_linear_with_bqq(module, weights_dir, bit_width, prefix=full_name, show_tqdm=False, device=device)
+            replace_linear_with_bqq(
+                module,
+                weights_dir,
+                bit_width,
+                prefix=full_name,
+                show_tqdm=False,
+                device=device,
+                patch_index=patch_index,
+            )
 
     return model
 
 
-def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix=''):
+def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix='', patch_index=None):
+    if patch_index is None:
+        patch_index = build_patch_index(weights_dir)
+
     for name, module in model.named_children():
         full_name = f"{prefix}.{name}" if prefix else name
 
@@ -190,26 +191,22 @@ def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix=''):
             continue
 
         if isinstance(module, (nn.Linear)):
-            # print(f"Replacing {full_name}: {type(module)}")
-            # print('weight shape:', module.weight.shape, 'bias is None ?:', module.bias is None)
+            matrices = _load_layer_matrices(full_name, patch_index, bit_width, map_location=module.weight.device)
+            if matrices is None:
+                continue
 
-            # 重みファイル名にフルネームが入っていると仮定
-            weight_list = []
-            for file in os.listdir(weights_dir):
-                if file.endswith('.pth') and (full_name in file) and ('row' in file):
-                    path = os.path.join(weights_dir, file)
-                    weight_list += torch.load(path, map_location=module.weight.device)
-
-            A, Y, Z = get_matrices(weight_list, bit_width=bit_width)
+            A, Y, Z = matrices
             bqq = HadamardBinaryQuadratic(Y, Z, A, bias=module.bias)
             setattr(model, name, bqq)
         else:
-            replace_linear_with_bqq(module, weights_dir, bit_width, prefix=full_name)
+            replace_linear_with_hbqq(module, weights_dir, bit_width, prefix=full_name, patch_index=patch_index)
 
     return model
 
 
 def replace_weight(model, weights_dir, bit_width):
+    patch_index = build_patch_index(weights_dir)
+
     for name, param in model.named_parameters():
 
         if 'head' in name:
@@ -220,14 +217,11 @@ def replace_weight(model, weights_dir, bit_width):
             print(f"Replacing {name}")
             print('weight shape:', param.shape)
 
-            # 重みファイル名にフルネームが入っていると仮定
-            weight_list = []
-            for file in os.listdir(weights_dir):
-                if file.endswith('.pth') and (name in file) and ('row' in file):
-                    path = os.path.join(weights_dir, file)
-                    weight_list += torch.load(path, map_location=param.device)
+            matrices = _load_layer_matrices(name, patch_index, bit_width, map_location=param.device)
+            if matrices is None:
+                continue
 
-            A, Y, Z = get_matrices(weight_list, bit_width=bit_width)
+            A, Y, Z = matrices
             bqq = BinaryQuadratic(Y, Z, A, bias=None)
             param.data.copy_(bqq.get_weight())
 

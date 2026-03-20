@@ -1,60 +1,80 @@
-import sys
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import torch
-import torch.nn as nn
-from transformers import LlamaForCausalLM, AutoModelForCausalLM
-from datautils import get_loaders
-from parsers import parse_args
-from torch.ao.quantization import QuantStub, DeQuantStub
-import os
-from tqdm import tqdm
-import model_loader 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-import binary_quadratic_network
+from transformers import AutoModelForCausalLM
 
-def find_sets(obj, path='model'):
-    if isinstance(obj, set):
-        print(f"Found set at {path}: {obj}")
-    elif isinstance(obj, (list, tuple)):
-        for i, v in enumerate(obj):
-            find_sets(v, f'{path}[{i}]')
-    elif isinstance(obj, dict):
-        for k, v in obj.items():
-            find_sets(v, f'{path}[{k}]')
-    elif hasattr(obj, '__dict__'):
-        for k, v in vars(obj).items():
-            find_sets(v, f'{path}.{k}')
+try:
+    from . import binary_quadratic_network
+    from .compressed_data import (
+        default_compressed_data_dir,
+        default_quantized_model_dir,
+        model_basename,
+    )
+except ImportError:
+    import binary_quadratic_network
+    from compressed_data import (
+        default_compressed_data_dir,
+        default_quantized_model_dir,
+        model_basename,
+    )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Rebuild a BQQ language model from compressed patches")
+    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--bit_widths", type=int, nargs="+", default=[2, 3, 4])
+    parser.add_argument("--group_size", type=int, default=128)
+    parser.add_argument("--num_steps", type=int, default=50000)
+    parser.add_argument("--compressed_data_dir", type=Path, default=None)
+    parser.add_argument("--output_dir", type=Path, default=None)
+    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    return parser.parse_args()
 
 
-if __name__ == '__main__':
-    # args = parse_args()
-    gs = 128
-    step = 50000
-    device = "cuda:2" # module.weight.deviceが読み込まれる
+def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_steps, device, output_dir=None):
+    compressed_data_dir = Path(compressed_data_dir)
+    output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if True:
-        for bit_width in [2, 3, 4]:
-            # print('bit width:', bit_width)
-            # model = model_loader.get_llama(args.model)
-            model_path = "Qwen/Qwen2.5-1.5B"
-            # model_path = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+    model = binary_quadratic_network.replace_linear_with_bqq(
+        model,
+        weights_dir=str(compressed_data_dir),
+        bit_width=bit_width,
+        device=device,
+    )
 
-            model_name = os.path.basename(model_path)
-            model = AutoModelForCausalLM.from_pretrained(model_path)
-            model = binary_quadratic_network.replace_linear_with_bqq(model, weights_dir=f'/work2/k-kuroki/BQQLLM/bqq_compressed_data/{model_name}-{gs}gs-{step}step', bit_width=bit_width, device=device)
+    model_id = model_basename(model_name)
+    output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs-{num_steps}step.pth"
+    torch.save(model, output_path)
 
-            # hadamard transformation version
-            # model = binary_quadratic_network.replace_linear_with_hbqq(model, weights_dir=f'/work2/k-kuroki/BQQLLM/bqq_compressed_data/{model_path.split("/")[-1]}-{gs}gs-{step}step', bit_width=bit_width)
+    for name, param in model.named_parameters():
+        print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
 
-            for name, param in model.named_parameters():
-                print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
-            os.makedirs(os.path.dirname(__file__)+f'/quantized_model_data/{model_name}', exist_ok=True)
-            torch.save(model, os.path.dirname(__file__)+f'/quantized_model_data/{model_name}/{model_name}-{bit_width}bit-{gs}gs-{step}step.pth')
-        
-    if False:
-        for bit_width in [2, 3]:
-            print('bit width:', bit_width)
-            model = model_loader.get_llama(args.model)
-            model = binary_quadratic_network.replace_weight(model, weights_dir='/work2/k-kuroki/quadratic_quantization/nn_compression/llm/qq_compressed_data/Llama-2-7b-hf-256gs-100000step', bit_width=bit_width)
-            model.save_pretrained(os.path.dirname(__file__)+f'/quantized_model_data/{bit_width}bit-bqq-llama2-7b-shape-preserved')
+    print(f"Saved quantized model to {output_path}")
+    return output_path
+
+
+def main():
+    args = parse_args()
+    compressed_data_dir = args.compressed_data_dir
+    if compressed_data_dir is None:
+        compressed_data_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
+
+    for bit_width in args.bit_widths:
+        save_bqq_model(
+            model_name=args.model_name,
+            compressed_data_dir=compressed_data_dir,
+            bit_width=bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            device=args.device,
+            output_dir=args.output_dir,
+        )
+
+
+if __name__ == "__main__":
+    main()

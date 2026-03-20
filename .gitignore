@@ -1,4 +1,5 @@
-__pycache__
+__pycache__/
+*.pyc
 *.pt
 *.pth
 bqq_compressed_data/
@@ -7,4 +8,7 @@ quantized_bqq_model/
 bcq/
 uq/
 results/
-lm/
+/lm/
+nn_compression/lm/bqq_compressed_data/
+nn_compression/lm/quantized_model_data/
+nn_compression/lm/results/

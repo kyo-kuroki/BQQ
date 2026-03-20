@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
+from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer
@@ -13,6 +14,47 @@ from lm_eval.models.huggingface import HFLM
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import glob
 import argparse
+import os
+import sys
+
+try:
+    from .compressed_data import BQQ_ROOT, default_results_dir
+    from .datautils import get_wikitext2_testloader
+except ImportError:
+    from compressed_data import BQQ_ROOT, default_results_dir
+    from datautils import get_wikitext2_testloader
+
+
+WORKSPACE_ROOT = BQQ_ROOT.parent
+
+
+def _maybe_add_repo_to_path(repo_name: str, repo_dir: str | None = None) -> None:
+    candidates = []
+    if repo_dir:
+        candidates.append(Path(repo_dir).expanduser())
+
+    env_dir = os.getenv(f"{repo_name.upper()}_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser())
+
+    candidates.append(WORKSPACE_ROOT / repo_name)
+
+    for candidate in candidates:
+        if candidate.exists():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+            return
+
+
+def _load_gptq_model(model_path: str, repo_dir: str | None = None):
+    try:
+        from gptqmodel import GPTQModel
+    except ImportError:
+        _maybe_add_repo_to_path("GPTQModel", repo_dir=repo_dir)
+        from gptqmodel import GPTQModel
+
+    return GPTQModel.load(model_path)
 
 
 @torch.no_grad()
@@ -73,6 +115,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seq_len", type=int, default=2048, help="sequence length for evaluation")
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
+    parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
     args = parser.parse_args()
 
 
@@ -86,21 +129,16 @@ def main():
         try:
             model = torch.load(args.model_path, weights_only=False)
         except Exception:
-            import sys
-            sys.path.append("/work2/k-kuroki/GPTQModel")
-            from gptqmodel import GPTQModel, QuantizeConfig
-            model = GPTQModel.load(args.model_path)
+            model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 
     print("Evaluating PPL...")
 
     model.eval()
-    from datautils import get_wikitext2_testloader
-    import pandas as pd
-    import os
     test_loader = get_wikitext2_testloader(nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1)
 
     ppl = compute_ppl_from_testloader(model, test_loader, device=args.device)
-    print(f"{os.path.basename(args.model_path)} WikiText-2 Perplexity: {ppl:.4f}")
+    model_label = os.path.splitext(os.path.basename(args.model_path))[0] if args.model_path else args.model_name.replace("/", "_")
+    print(f"{model_label} WikiText-2 Perplexity: {ppl:.4f}")
 
     print("Evaluating Downstream Tasks...")
     dstask_results = evaluate_downstream_task(args, model)
@@ -113,18 +151,18 @@ def main():
             flat_results[f"{task}_{metric_name}"] = value
 
     # 1行の DataFrame にまとめる
-    row = {"model": os.path.splitext(os.path.basename(args.model_path))[0], "PPL": ppl}
+    row = {"model": model_label, "PPL": ppl}
     row.update(flat_results)
     df = pd.DataFrame([row])  # リストで囲むと1行 DataFrame
 
     # CSV 保存
-    df.to_csv(f"/work2/k-kuroki/BQQLLM/results/{os.path.basename(args.model_path)}.csv", index=False)
+    results_dir = default_results_dir()
+    results_dir.mkdir(parents=True, exist_ok=True)
+    df.to_csv(results_dir / f"{model_label}.csv", index=False)
 
 
 if __name__ == "__main__":
-    # /work2/k-kuroki/BQQLLM/quantized_model_data/Qwen2.5-0.5B/Qwen2.5-0.5B-2bit-128gs-50000step-calibrated.pth
     main()
-
 
 
 

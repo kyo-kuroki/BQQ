@@ -10,9 +10,19 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 import inspect
 import copy
 import os
+from pathlib import Path
 import sys
-sys.path.append('./../../../../BQQ')
-sys.path.append('./../utils')
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CV_DIR = SCRIPT_DIR.parent
+BQQ_ROOT = CV_DIR.parent.parent
+UTILS_DIR = CV_DIR / "utils"
+
+for path in (BQQ_ROOT, UTILS_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from build_dataset import get_imagenet
 from build_model import get_model
 
@@ -975,7 +985,15 @@ def main(args):
     print("Reference model ready.")
 
     # --- 2. DataLoader を作る ---
-    train_loader, test_loader = get_imagenet(args.model_name, val_batchsize=args.batch_size, calib_batchsize=args.batch_size, num_workers=args.num_workers, num_traindatas=None, data_path='/ldisk/Shared/Datasets/ILSVRC/ILSVRC2012/', seed=0)
+    train_loader, test_loader = get_imagenet(
+        args.model_name,
+        val_batchsize=args.batch_size,
+        calib_batchsize=args.batch_size,
+        num_workers=args.num_workers,
+        num_traindatas=None,
+        data_path=args.data_path,
+        seed=0,
+    )
 
     # --- 3. ターゲット Linear 層名リスト ---
     # 参照モデルと量子化モデルで構造は同じなので、どちらから取ってもよいが
@@ -1186,7 +1204,8 @@ def main(args):
     del ref_model
     torch.cuda.empty_cache()
     # --- 9. モデルを ./bqq_models に torch.save(model.state_dict(), path) で保存 ---
-    os.makedirs(args.save_dir, exist_ok=True)
+    save_dir = Path(args.save_dir) if args.save_dir is not None else SCRIPT_DIR / "quantized_bqq_model"
+    os.makedirs(save_dir, exist_ok=True)
 
     # モデル名からファイル名を自動生成
     # 例: Qwen/Qwen3-0.6B → Qwen_Qwen3-0.6B_bqq_2bit_128gs_5e-4lr.pt
@@ -1195,7 +1214,7 @@ def main(args):
         f"{safe_name}-{args.p}bit-{args.group_size}gs-{args.lr}lr-{args.calib_mode}calib.pth"
     )
 
-    save_path = os.path.join(args.save_dir, save_name)
+    save_path = save_dir / save_name
     print(f"Saving quantized model object to: {save_path}")
     torch.save(model, save_path)
     print("Model saved.")
@@ -1284,11 +1303,11 @@ if __name__ == "__main__":
                         help="Activation quantization bits (8 means no quantization)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of workers for data loading")
-    parser.add_argument("--data_path", type=str, default='/ldisk/Shared/Datasets/ILSVRC/ILSVRC2012/',
-                        help="Path to ImageNet dataset")
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Path to ImageNet. If omitted, use IMAGENET_DIR or IMAGENET_ROOT.")
     parser.add_argument("--calib_mode", type=str, default="layer",
                         choices=["layer", "block"],)
-    parser.add_argument("--save_dir", type=str, default="./quantized_bqq_model/",
+    parser.add_argument("--save_dir", type=str, default=None,
                         help="Directory to save the quantized model")
     parser.add_argument("--model_path", type=str, default=None,
                         help="Path to the model file to be quantized (if not using model_name directly)")

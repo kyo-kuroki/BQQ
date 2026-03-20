@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+
+
 # バイナリファイルからロード
 def fvecs_read(file_name):
     with open(file_name, 'rb') as f:
@@ -27,7 +31,8 @@ def get_matrix_data():
 
     # TSPLIB距離グラフ
     problem_name = 'rd100'
-    problem_path = r'/work/k-kuroki/problem/tsp/{0}/{0}.tsp'.format(problem_name)
+    problem_root = Path(os.getenv("TSPLIB_DIR", Path(__file__).resolve().parents[3] / "problem" / "tsp"))
+    problem_path = problem_root / problem_name / f"{problem_name}.tsp"
     instance = TSP(problem_path)
     w3 = torch.tensor(instance.Dij)
     torch.save(w3, os.path.dirname(__file__)+'/data/matrix_data/rd100_distance_matrix.pt')
@@ -36,14 +41,17 @@ def get_matrix_data():
     # ANNデータ
     dataname_list = ['siftsmall', 'sift']
     data_name = dataname_list[1]
-    w4 = torch.tensor(fvecs_read(parentparent_dir + '/ann/dataset/{0}/{0}_base.fvecs'.format(data_name))[:128])
+    ann_root = Path(os.getenv("ANN_DATASET_DIR", Path(__file__).resolve().parents[3] / "ann" / "dataset"))
+    w4 = torch.tensor(fvecs_read(str(ann_root / data_name / f"{data_name}_base.fvecs"))[:128])
     torch.save(w4, os.path.dirname(__file__)+'/data/matrix_data/sift_matrix.pt')
     print('ANN data', w4.shape)
 
 
     # ImageNet
-    data_path = '/ldisk/Shared/Datasets/ILSVRC/ILSVRC2012/'
-    train, val = get_imagenet(model_name='deit', num_traindatas=32)
+    data_path = os.getenv("IMAGENET_DIR") or os.getenv("IMAGENET_ROOT") or os.getenv("ILSVRC2012_DIR")
+    if data_path is None:
+        raise ValueError("ImageNet path is not set. Set IMAGENET_DIR, IMAGENET_ROOT, or ILSVRC2012_DIR.")
+    train, val = get_imagenet(model_name='deit', num_traindatas=32, data_path=data_path)
     for batch_idx, (images, _) in enumerate(train):
         w5 = images[5][0]
         break

@@ -1,13 +1,22 @@
 import torch
+from pathlib import Path
 import sys
-sys.path.append('./../../../../BQQ')
-sys.path.append('./../utils')
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CV_DIR = SCRIPT_DIR.parent
+BQQ_ROOT = CV_DIR.parent.parent
+UTILS_DIR = CV_DIR / "utils"
+
+for path in (BQQ_ROOT, UTILS_DIR):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from build_dataset import get_imagenet
 import os
 from utils import test_model_accuracy
 import torch.nn as nn
 import torch.optim as optim
-import os
 from tqdm import tqdm
 
 def fine_tuning(args):
@@ -18,15 +27,9 @@ def fine_tuning(args):
         model = torch.load(args.model_path, map_location=args.device, weights_only=False)
     else:
         if args.fine_tuned_model:
-            model_path = os.path.join(
-                os.path.dirname(__file__),
-                f'quantized_bqq_model/{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq-finetuned.pth'
-            )
+            model_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq-finetuned.pth"
         else:
-            model_path = os.path.join(
-            os.path.dirname(__file__),
-            f'quantized_bqq_model/{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq.pth'
-        )
+            model_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq.pth"
 
         model = torch.load(model_path, map_location=args.device, weights_only=False)
     model.to(args.device)
@@ -71,10 +74,7 @@ def fine_tuning(args):
     if args.model_path is not None:
         save_path = os.path.splitext(args.model_path)[0] + f'-{args.epochs}epochs-fine_tuned.pth'
     else:
-        save_path = os.path.join(
-            os.path.dirname(__file__), 
-            f'quantized_bqq_model/{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.epochs}epochs-finetuned.pth'
-        )
+        save_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.epochs}epochs-finetuned.pth"
     torch.save(model, save_path)
 
     print(f"Fine-tuned model saved to: {save_path}")
@@ -103,8 +103,8 @@ if __name__ == "__main__":
                         help="Batch size for fine-tuning")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="Number of workers for data loading")
-    parser.add_argument("--data_path", type=str, default='/ldisk/Shared/Datasets/ILSVRC/ILSVRC2012/',
-                        help="Path to ImageNet dataset")
+    parser.add_argument("--data_path", type=str, default=None,
+                        help="Path to ImageNet. If omitted, use IMAGENET_DIR or IMAGENET_ROOT.")
     parser.add_argument("--fine_tuned_model", action='store_true',
                         help="Whether to load an already fine-tuned model")
     parser.add_argument("--model_path", type=str, default=None,)

@@ -2,14 +2,23 @@ import sys
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM
-from datautils import get_wikitext2_trainloader, get_wikitext2_testloader, compute_ppl_from_testloader
 import os
 from tqdm import tqdm, trange
-import model_loader 
-sys.path.append(os.path.dirname(os.path.dirname(__file__)) + '/BQQ')
-import binary_quadratic_network
-import quantizer
 import math
+
+try:
+    from .compressed_data import ensure_bqq_root_on_path
+    from .datautils import get_wikitext2_trainloader, get_wikitext2_testloader, compute_ppl_from_testloader
+    from . import model_loader, binary_quadratic_network
+except ImportError:
+    from compressed_data import ensure_bqq_root_on_path
+    from datautils import get_wikitext2_trainloader, get_wikitext2_testloader, compute_ppl_from_testloader
+    import model_loader
+    import binary_quadratic_network
+
+ensure_bqq_root_on_path()
+
+import quantizer
 
 
 import torch
@@ -496,5 +505,4 @@ if __name__ == "__main__":
         test_loader = get_wikitext2_testloader(nsamples=test_nsamples, seed=0, seqlen=seq_len, model=model_path)
         ppl = compute_ppl_from_testloader(q_model, test_loader, device=f'cuda:{gpu_id}')
         print(f"{10}Epochs Calibrated Quantized Model PPL: {ppl:.3f}")
-
 
