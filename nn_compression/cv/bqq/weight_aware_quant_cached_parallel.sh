@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+MODEL_NAME="deit-s"
+BIT_WIDTH=2
+GROUP_SIZE=32
+NUM_STEPS=5000
+RANK_SCALE=1.0
+SEED=0
+WORKERS_PER_GPU=16
+ZETA=4.0
+ETA=0.06
+TINIT=0.2
+TFIN=0.005
+GPU_IDS="${GPU_IDS:-}"
+MAX_JOBS="${MAX_JOBS:-}"
+CACHE_DIR=""
+SAVE_DIR=""
+DATA_PATH=""
+RESULTS_DIR=""
+REFRESH_CACHE=0
+OVERWRITE=0
+FINALIZE=0
+EVALUATE=0
+POLL_INTERVAL=5
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --model_name NAME
+  --bit_width N
+  --group_size N
+  --num_steps N
+  --rank_scale FLOAT
+  --seed N
+  --workers_per_gpu N
+  --zeta FLOAT
+  --eta FLOAT
+  --Tinit FLOAT
+  --Tfin FLOAT
+  --gpu_ids ID0,ID1,...
+  --max_jobs N
+  --cache_dir PATH
+  --save_dir PATH
+  --data_path PATH
+  --results_dir PATH
+  --refresh_cache
+  --overwrite
+  --finalize
+  --evaluate
+  -h, --help
+
+Environment variables:
+  PYTHON_BIN   Python executable to use (default: python3)
+  GPU_IDS      Comma-separated GPU ids to use when --gpu_ids is omitted
+  MAX_JOBS     Maximum concurrent quantization jobs
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model_name)
+            MODEL_NAME="$2"
+            shift 2
+            ;;
+        --bit_width)
+            BIT_WIDTH="$2"
+            shift 2
+            ;;
+        --group_size)
+            GROUP_SIZE="$2"
+            shift 2
+            ;;
+        --num_steps)
+            NUM_STEPS="$2"
+            shift 2
+            ;;
+        --rank_scale)
+            RANK_SCALE="$2"
+            shift 2
+            ;;
+        --seed)
+            SEED="$2"
+            shift 2
+            ;;
+        --workers_per_gpu)
+            WORKERS_PER_GPU="$2"
+            shift 2
+            ;;
+        --zeta)
+            ZETA="$2"
+            shift 2
+            ;;
+        --eta)
+            ETA="$2"
+            shift 2
+            ;;
+        --Tinit)
+            TINIT="$2"
+            shift 2
+            ;;
+        --Tfin)
+            TFIN="$2"
+            shift 2
+            ;;
+        --gpu_ids)
+            GPU_IDS="$2"
+            shift 2
+            ;;
+        --max_jobs)
+            MAX_JOBS="$2"
+            shift 2
+            ;;
+        --cache_dir)
+            CACHE_DIR="$2"
+            shift 2
+            ;;
+        --save_dir)
+            SAVE_DIR="$2"
+            shift 2
+            ;;
+        --data_path)
+            DATA_PATH="$2"
+            shift 2
+            ;;
+        --results_dir)
+            RESULTS_DIR="$2"
+            shift 2
+            ;;
+        --refresh_cache)
+            REFRESH_CACHE=1
+            shift
+            ;;
+        --overwrite)
+            OVERWRITE=1
+            shift
+            ;;
+        --finalize)
+            FINALIZE=1
+            shift
+            ;;
+        --evaluate)
+            FINALIZE=1
+            EVALUATE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$CACHE_DIR" ]]; then
+    CACHE_DIR="$SCRIPT_DIR/cache/${MODEL_NAME//\//_}"
+fi
+
+if [[ -z "$GPU_IDS" ]]; then
+    GPU_COUNT="$($PYTHON_BIN -c 'import torch; print(torch.cuda.device_count())')"
+    if [[ "$GPU_COUNT" -le 0 ]]; then
+        echo "CUDA is required to run cached parallel quantization." >&2
+        exit 1
+    fi
+    GPU_IDS="$(seq -s, 0 $((GPU_COUNT - 1)))"
+fi
+
+IFS=',' read -r -a GPU_ID_ARRAY <<< "$GPU_IDS"
+if [[ "${#GPU_ID_ARRAY[@]}" -eq 0 ]]; then
+    echo "No GPU ids were provided." >&2
+    exit 1
+fi
+
+if [[ -z "$MAX_JOBS" ]]; then
+    MAX_JOBS="${#GPU_ID_ARRAY[@]}"
+fi
+
+PREPARE_CMD=(
+    "$PYTHON_BIN"
+    "$SCRIPT_DIR/weight_aware_quant_cached.py"
+    prepare-cache
+    --model_name "$MODEL_NAME"
+    --cache_dir "$CACHE_DIR"
+)
+
+if [[ "$REFRESH_CACHE" -eq 1 ]]; then
+    PREPARE_CMD+=(--refresh_cache)
+fi
+
+echo "Preparing cache in $CACHE_DIR"
+"${PREPARE_CMD[@]}"
+
+mapfile -t TARGETS < <("$PYTHON_BIN" "$SCRIPT_DIR/weight_aware_quant_cached.py" list-targets --cache_dir "$CACHE_DIR")
+
+if [[ "${#TARGETS[@]}" -eq 0 ]]; then
+    echo "No cached targets were found." >&2
+    exit 1
+fi
+
+declare -a PIDS=()
+declare -a PID_LABELS=()
+START_TS=$(date +%s)
+
+for index in "${!TARGETS[@]}"; do
+    while [[ "$(jobs -pr | wc -l)" -ge "$MAX_JOBS" ]]; do
+        sleep "$POLL_INTERVAL"
+    done
+
+    target_name="${TARGETS[$index]}"
+    gpu_id="${GPU_ID_ARRAY[$((index % ${#GPU_ID_ARRAY[@]}))]}"
+
+    QUANTIZE_CMD=(
+        "$PYTHON_BIN"
+        "$SCRIPT_DIR/weight_aware_quant_cached.py"
+        quantize-target
+        --cache_dir "$CACHE_DIR"
+        --target_name "$target_name"
+        --bit_width "$BIT_WIDTH"
+        --Nstep "$NUM_STEPS"
+        --rank_scale "$RANK_SCALE"
+        --seed "$SEED"
+        --group_size "$GROUP_SIZE"
+        --num_workers_per_gpu "$WORKERS_PER_GPU"
+        --main_gpu_id 0
+        --zeta "$ZETA"
+        --eta "$ETA"
+        --Tinit "$TINIT"
+        --Tfin "$TFIN"
+    )
+
+    if [[ -n "$SAVE_DIR" ]]; then
+        QUANTIZE_CMD+=(--save_dir "$SAVE_DIR")
+    fi
+    if [[ "$OVERWRITE" -eq 1 ]]; then
+        QUANTIZE_CMD+=(--overwrite)
+    fi
+
+    echo "Launching $target_name on GPU $gpu_id"
+    CUDA_VISIBLE_DEVICES="$gpu_id" "${QUANTIZE_CMD[@]}" &
+    PIDS+=("$!")
+    PID_LABELS+=("$target_name on GPU $gpu_id")
+done
+
+FAILED=0
+for index in "${!PIDS[@]}"; do
+    if wait "${PIDS[$index]}"; then
+        echo "Finished ${PID_LABELS[$index]}"
+    else
+        echo "Failed ${PID_LABELS[$index]}" >&2
+        FAILED=1
+    fi
+done
+
+if [[ "$FAILED" -ne 0 ]]; then
+    exit "$FAILED"
+fi
+
+if [[ "$FINALIZE" -eq 1 ]]; then
+    END_TS=$(date +%s)
+    QUANT_MINUTES=$(START_TS="$START_TS" END_TS="$END_TS" python3 - <<'PY'
+import os
+start_ts = int(os.environ["START_TS"])
+end_ts = int(os.environ["END_TS"])
+print((end_ts - start_ts) / 60.0)
+PY
+)
+
+    FINALIZE_CMD=(
+        "$PYTHON_BIN"
+        "$SCRIPT_DIR/weight_aware_quant_cached.py"
+        finalize
+        --cache_dir "$CACHE_DIR"
+        --model_name "$MODEL_NAME"
+        --bit_width "$BIT_WIDTH"
+        --Nstep "$NUM_STEPS"
+        --group_size "$GROUP_SIZE"
+        --rank_scale "$RANK_SCALE"
+        --main_gpu_id 0
+        --quantization_minutes "$QUANT_MINUTES"
+    )
+
+    if [[ -n "$SAVE_DIR" ]]; then
+        FINALIZE_CMD+=(--save_dir "$SAVE_DIR")
+    fi
+    if [[ -n "$RESULTS_DIR" ]]; then
+        FINALIZE_CMD+=(--results_dir "$RESULTS_DIR")
+    fi
+    if [[ "$EVALUATE" -eq 1 ]]; then
+        FINALIZE_CMD+=(--evaluate)
+        if [[ -n "$DATA_PATH" ]]; then
+            FINALIZE_CMD+=(--data_path "$DATA_PATH")
+        fi
+    fi
+
+    CUDA_VISIBLE_DEVICES="${GPU_ID_ARRAY[0]}" START_TS="$START_TS" END_TS="$END_TS" "${FINALIZE_CMD[@]}"
+fi
