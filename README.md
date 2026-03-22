@@ -26,3 +26,5 @@ It evaluates how BQQ affects:
 
 This module connects BQQ to practical deep-learning use cases.
 
+See [`nn_compression/README.md`](nn_compression/README.md) for the workflow details,
+including the new cache-first parallel weight quantization scripts for both LM and CV.
