@@ -119,6 +119,7 @@ Notes:
 
 - The cache is created under `nn_compression/lm/cache/` by default.
 - Quantized compressed patches are written to the same default output location as the existing LM workflow.
+- The parallel shell now schedules work at patch granularity, so large matrices are distributed across GPUs by patch as well.
 - Use `--refresh_cache` to rebuild cached weights.
 - Use `--overwrite` if you want to rerun already-quantized targets.
 
@@ -127,10 +128,24 @@ You can also run each step manually:
 ```bash
 python weight_aware_quant_cached.py list-targets --model_name Qwen/Qwen2.5-1.5B --layer_threshold 4
 
+python weight_aware_quant_cached.py list-patches \
+  --model_name Qwen/Qwen2.5-1.5B \
+  --layer_threshold 4 \
+  --group_size 128
+
 python weight_aware_quant_cached.py quantize-target \
   --model_name Qwen/Qwen2.5-1.5B \
   --layer_threshold 4 \
   --target_name model.layers.4.mlp.down_proj.weight \
+  --bit_width 4 \
+  --group_size 128 \
+  --num_steps 50000
+
+python weight_aware_quant_cached.py quantize-target \
+  --model_name Qwen/Qwen2.5-1.5B \
+  --layer_threshold 4 \
+  --target_name model.layers.4.mlp.down_proj.weight \
+  --patch_index 0 \
   --bit_width 4 \
   --group_size 128 \
   --num_steps 50000
@@ -172,10 +187,28 @@ weights finish:
 Notes:
 
 - The cache is created under `nn_compression/cv/bqq/cache/` by default.
+- The parallel shell now schedules work at patch granularity, so large matrices are distributed across GPUs by patch as well.
 - `--finalize` rebuilds the BQQ model from compressed patches after all per-weight jobs finish.
 - `--evaluate` additionally runs ImageNet evaluation and writes the CSV summary in the usual `results/` directory.
 - Use `--refresh_cache` and `--overwrite` the same way as in the LM workflow.
 
+You can also run each step manually:
+
+```bash
+python weight_aware_quant_cached.py list-targets --model_name deit-s
+
+python weight_aware_quant_cached.py list-patches \
+  --model_name deit-s \
+  --group_size 32
+
+python weight_aware_quant_cached.py quantize-target \
+  --model_name deit-s \
+  --target_name blocks.0.attn.qkv.weight \
+  --patch_index 0 \
+  --bit_width 2 \
+  --group_size 32 \
+  --Nstep 5000
+```
+
 
 ---
-

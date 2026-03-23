@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -63,6 +64,15 @@ def parse_args():
     list_parser.add_argument('--layer_threshold', type=int, default=4)
     list_parser.add_argument('--cache_dir', type=Path, default=None)
 
+    list_patches_parser = subparsers.add_parser(
+        'list-patches',
+        help='Print cached patch jobs as tab-separated target_name, patch_index, patch_row, patch_col',
+    )
+    list_patches_parser.add_argument('--model_name', type=str, default=None)
+    list_patches_parser.add_argument('--layer_threshold', type=int, default=4)
+    list_patches_parser.add_argument('--cache_dir', type=Path, default=None)
+    list_patches_parser.add_argument('--group_size', type=int, default=128)
+
     quantize_parser = subparsers.add_parser(
         'quantize-target',
         help='Quantize one cached target weight',
@@ -80,9 +90,15 @@ def parse_args():
     quantize_parser.add_argument('--cache_dir', type=Path, default=None)
     quantize_parser.add_argument('--save_dir', type=Path, default=None)
     quantize_parser.add_argument(
+        '--patch_index',
+        type=int,
+        default=None,
+        help='0-based patch index within the cached target; when set, only that patch is quantized',
+    )
+    quantize_parser.add_argument(
         '--overwrite',
         action='store_true',
-        help='Overwrite the reconstructed tensor checkpoint if it already exists',
+        help='Overwrite existing outputs if they already exist',
     )
 
     return parser.parse_args()
@@ -130,6 +146,10 @@ def cached_weight_path(cache_dir: Path, target_name: str) -> Path:
     return weights_dir(cache_dir) / f'{target_name}.pt'
 
 
+def patch_output_path(save_dir: Path, target_name: str, patch_row: int, patch_col: int) -> Path:
+    return save_dir / f'{target_name}_row{patch_row}_col{patch_col}.pth'
+
+
 def read_targets(cache_dir: Path) -> list[str]:
     path = targets_file(cache_dir)
     if not path.exists():
@@ -159,6 +179,86 @@ def cache_is_complete(cache_dir: Path) -> bool:
         return False
 
     return all(cached_weight_path(cache_dir, name).exists() for name in targets)
+
+
+def get_max_divisor(num: int, max_value: int) -> int:
+    if max_value <= 0:
+        raise ValueError('group_size must be a positive integer')
+
+    limit = max(int(math.sqrt(num)), max_value)
+    for candidate in range(limit, 0, -1):
+        if num % candidate == 0 and candidate <= max_value:
+            return candidate
+    return 1
+
+
+def get_target_metadata(metadata: dict, target_name: str) -> dict:
+    for target in metadata.get('targets', []):
+        if target.get('name') == target_name:
+            return target
+    raise ValueError(f'Cache metadata does not contain target: {target_name}')
+
+
+def get_patch_layout(shape: list[int] | tuple[int, int], group_size: int) -> dict[str, int]:
+    if len(shape) != 2:
+        raise ValueError(f'Only 2D tensors are supported for patch layout, got shape={tuple(shape)}')
+
+    height, width = int(shape[0]), int(shape[1])
+    patch_height = get_max_divisor(height, group_size)
+    patch_width = get_max_divisor(width, group_size)
+    return {
+        'height': height,
+        'width': width,
+        'patch_height': patch_height,
+        'patch_width': patch_width,
+        'num_patch_rows': height // patch_height,
+        'num_patch_cols': width // patch_width,
+    }
+
+
+def get_patch_spec(
+    *,
+    shape: list[int] | tuple[int, int],
+    group_size: int,
+    patch_index: int,
+) -> dict[str, int]:
+    layout = get_patch_layout(shape, group_size)
+    total_patches = layout['num_patch_rows'] * layout['num_patch_cols']
+    if patch_index < 0 or patch_index >= total_patches:
+        raise ValueError(f'patch_index must be in [0, {total_patches - 1}], got {patch_index}')
+
+    patch_row, patch_col = divmod(patch_index, layout['num_patch_cols'])
+    row_start = patch_row * layout['patch_height']
+    col_start = patch_col * layout['patch_width']
+
+    return {
+        **layout,
+        'patch_index': patch_index,
+        'patch_row': patch_row,
+        'patch_col': patch_col,
+        'row_start': row_start,
+        'row_end': row_start + layout['patch_height'],
+        'col_start': col_start,
+        'col_end': col_start + layout['patch_width'],
+    }
+
+
+def iter_patch_specs(
+    *,
+    shape: list[int] | tuple[int, int],
+    group_size: int,
+):
+    layout = get_patch_layout(shape, group_size)
+    total_patches = layout['num_patch_rows'] * layout['num_patch_cols']
+    for patch_index in range(total_patches):
+        yield get_patch_spec(shape=shape, group_size=group_size, patch_index=patch_index)
+
+
+def extract_patch(weight: torch.Tensor, patch_spec: dict[str, int]) -> torch.Tensor:
+    return weight[
+        patch_spec['row_start']:patch_spec['row_end'],
+        patch_spec['col_start']:patch_spec['col_end'],
+    ].detach().clone()
 
 
 def quantize_weight(
@@ -192,6 +292,62 @@ def quantize_weight(
     )
 
 
+def quantize_patch(
+    patch: torch.Tensor,
+    save_path: Path,
+    *,
+    patch_row: int,
+    patch_col: int,
+    bit_width: int,
+    rank_scale: float,
+    num_steps: int,
+    seed: int,
+    main_gpu_id: int,
+) -> torch.Tensor:
+    if patch.ndim != 2:
+        raise ValueError('The input tensor must be 2-dimensional')
+
+    torch.manual_seed(seed)
+    torch.cuda.set_device(main_gpu_id)
+    device = torch.device(f'cuda:{main_gpu_id}')
+    original_x = patch.to(device)
+    update_x = original_x.detach().clone()
+    decomposed_patches: list[dict] = []
+
+    for bit_idx in range(bit_width):
+        decomp_instance = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
+        y, z, a = decomp_instance.run_bqq_compile(
+            zeta=4,
+            eta=0.06,
+            Tinit=0.2,
+            Tfin=0.005,
+            Nstep=num_steps,
+            device_id=main_gpu_id,
+            seed=seed,
+            output_type='torch',
+        )
+        reconst = a[0] * y @ z
+        reconst += a[1] * y.sum(axis=1, keepdim=True)
+        reconst += a[2] * z.sum(axis=0, keepdim=True)
+        reconst += a[3]
+        update_x -= reconst
+
+        decomposed_patches.append(
+            {
+                'patch_row': patch_row,
+                'patch_col': patch_col,
+                'coeff': a.cpu(),
+                'mat1': y.cpu(),
+                'mat2': z.cpu(),
+                'bit_idx': bit_idx,
+            }
+        )
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(decomposed_patches, save_path)
+    return (original_x - update_x).detach().cpu()
+
+
 def prepare_cache(args) -> Path:
     cache_dir = resolve_cache_dir(
         cache_dir=args.cache_dir,
@@ -220,6 +376,9 @@ def prepare_cache(args) -> Path:
             if not is_quantization_target(name):
                 continue
             if not passes_layer_threshold(name, args.layer_threshold):
+                continue
+            if param.ndim != 2:
+                print(f"Skipping non-2D target {name}: {tuple(param.shape)}")
                 continue
 
             save_path = cached_weight_path(cache_dir, name)
@@ -268,6 +427,22 @@ def list_targets(args) -> None:
         print(name)
 
 
+def list_patches(args) -> None:
+    cache_dir = resolve_cache_dir(
+        cache_dir=args.cache_dir,
+        model_name=args.model_name,
+        layer_threshold=args.layer_threshold,
+    )
+    metadata = read_metadata(cache_dir)
+    for name in read_targets(cache_dir):
+        target = get_target_metadata(metadata, name)
+        for patch_spec in iter_patch_specs(shape=target['shape'], group_size=args.group_size):
+            print(
+                f"{name}\t{patch_spec['patch_index']}\t"
+                f"{patch_spec['patch_row']}\t{patch_spec['patch_col']}"
+            )
+
+
 def quantize_target(args) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError('CUDA is required for cached weight-aware BQQ quantization.')
@@ -281,6 +456,7 @@ def quantize_target(args) -> Path:
     targets = set(read_targets(cache_dir))
     if args.target_name not in targets:
         raise ValueError(f'Target is not present in cache: {args.target_name}')
+    target_metadata = get_target_metadata(metadata, args.target_name)
 
     model_name = args.model_name or metadata['model_name']
     save_dir = args.save_dir
@@ -288,6 +464,51 @@ def quantize_target(args) -> Path:
         save_dir = default_compressed_data_dir(model_name, args.group_size, args.num_steps)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.patch_index is not None:
+        patch_spec = get_patch_spec(
+            shape=target_metadata['shape'],
+            group_size=args.group_size,
+            patch_index=args.patch_index,
+        )
+        patch_checkpoint = patch_output_path(
+            save_dir,
+            args.target_name,
+            patch_spec['patch_row'],
+            patch_spec['patch_col'],
+        )
+        if patch_checkpoint.exists() and not args.overwrite:
+            print(
+                'Skipping '
+                f"{args.target_name} patch {args.patch_index}: already quantized at {patch_checkpoint}"
+            )
+            return patch_checkpoint
+
+        weight_path = cached_weight_path(cache_dir, args.target_name)
+        if not weight_path.exists():
+            raise FileNotFoundError(f'Cached tensor does not exist: {weight_path}')
+
+        print(f'Loading cached weight: {weight_path}')
+        weight = torch.load(weight_path, map_location='cpu')
+        patch = extract_patch(weight, patch_spec)
+        print(
+            'Quantizing '
+            f"{args.target_name} patch {args.patch_index} "
+            f"(row={patch_spec['patch_row']}, col={patch_spec['patch_col']}): {tuple(patch.shape)}"
+        )
+        quantize_patch(
+            patch,
+            patch_checkpoint,
+            patch_row=patch_spec['patch_row'],
+            patch_col=patch_spec['patch_col'],
+            bit_width=args.bit_width,
+            rank_scale=args.rank_scale,
+            num_steps=args.num_steps,
+            seed=args.seed,
+            main_gpu_id=args.main_gpu_id,
+        )
+        print(f'Saved compressed patch: {patch_checkpoint}')
+        return patch_checkpoint
 
     tensor_checkpoint = save_dir / f'{args.target_name}.pth'
     if tensor_checkpoint.exists() and not args.overwrite:
@@ -327,6 +548,9 @@ def main():
         return
     if args.command == 'list-targets':
         list_targets(args)
+        return
+    if args.command == 'list-patches':
+        list_patches(args)
         return
     if args.command == 'quantize-target':
         quantize_target(args)

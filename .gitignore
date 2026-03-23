@@ -12,3 +12,8 @@ results/
 nn_compression/lm/bqq_compressed_data/
 nn_compression/lm/quantized_model_data/
 nn_compression/lm/results/
+nn_compression/lm/cache/
+nn_compression/cv/bqq/cache/
+nn_compression/cv/bqq/bqq_compressed_data/
+nn_compression/cv/bqq/quantized_bqq_model/
+nn_compression/cv/bqq/results/

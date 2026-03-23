@@ -158,22 +158,34 @@ fi
 echo "Preparing cache in $CACHE_DIR"
 "${PREPARE_CMD[@]}"
 
-mapfile -t TARGETS < <("$PYTHON_BIN" "$SCRIPT_DIR/weight_aware_quant_cached.py" list-targets --cache_dir "$CACHE_DIR")
+mapfile -t PATCH_JOBS < <(
+    "$PYTHON_BIN" \
+    "$SCRIPT_DIR/weight_aware_quant_cached.py" \
+    list-patches \
+    --cache_dir "$CACHE_DIR" \
+    --group_size "$GROUP_SIZE"
+)
 
-if [[ "${#TARGETS[@]}" -eq 0 ]]; then
-    echo "No cached targets were found." >&2
+if [[ "${#PATCH_JOBS[@]}" -eq 0 ]]; then
+    echo "No cached patch jobs were found." >&2
     exit 1
 fi
 
 declare -a PIDS=()
 declare -a PID_LABELS=()
+FAILED=0
 
-for index in "${!TARGETS[@]}"; do
+for index in "${!PATCH_JOBS[@]}"; do
     while [[ "$(jobs -pr | wc -l)" -ge "$MAX_JOBS" ]]; do
         sleep "$POLL_INTERVAL"
     done
 
-    target_name="${TARGETS[$index]}"
+    IFS=$'\t' read -r target_name patch_index patch_row patch_col <<< "${PATCH_JOBS[$index]}"
+    if [[ -z "$target_name" || -z "$patch_index" || -z "$patch_row" || -z "$patch_col" ]]; then
+        echo "Malformed patch job entry: ${PATCH_JOBS[$index]}" >&2
+        FAILED=1
+        continue
+    fi
     gpu_id="${GPU_ID_ARRAY[$((index % ${#GPU_ID_ARRAY[@]}))]}"
 
     QUANTIZE_CMD=(
@@ -187,6 +199,7 @@ for index in "${!TARGETS[@]}"; do
         --num_steps "$NUM_STEPS"
         --rank_scale "$RANK_SCALE"
         --seed "$SEED"
+        --patch_index "$patch_index"
         --workers_per_gpu "$WORKERS_PER_GPU"
         --main_gpu_id 0
     )
@@ -198,13 +211,12 @@ for index in "${!TARGETS[@]}"; do
         QUANTIZE_CMD+=(--overwrite)
     fi
 
-    echo "Launching $target_name on GPU $gpu_id"
+    echo "Launching $target_name patch $patch_index (row $patch_row, col $patch_col) on GPU $gpu_id"
     CUDA_VISIBLE_DEVICES="$gpu_id" "${QUANTIZE_CMD[@]}" &
     PIDS+=("$!")
-    PID_LABELS+=("$target_name on GPU $gpu_id")
+    PID_LABELS+=("$target_name patch $patch_index (row $patch_row, col $patch_col) on GPU $gpu_id")
 done
 
-FAILED=0
 for index in "${!PIDS[@]}"; do
     if wait "${PIDS[$index]}"; then
         echo "Finished ${PID_LABELS[$index]}"
