@@ -48,7 +48,9 @@ def parse_args():
         help='Load a model once and cache quantization target weights under ./cache',
     )
     prepare_parser.add_argument('--model_name', type=str, required=True)
-    prepare_parser.add_argument('--layer_threshold', type=int, default=4)
+    prepare_parser.add_argument('--layer_threshold', type=int, default=0)
+    prepare_parser.add_argument('--layer_max', type=int, default=None,
+                                help='Upper bound (inclusive) on layer index; None means no upper limit')
     prepare_parser.add_argument('--cache_dir', type=Path, default=None)
     prepare_parser.add_argument(
         '--refresh_cache',
@@ -61,7 +63,7 @@ def parse_args():
         help='Print cached target weight names, one per line',
     )
     list_parser.add_argument('--model_name', type=str, default=None)
-    list_parser.add_argument('--layer_threshold', type=int, default=4)
+    list_parser.add_argument('--layer_threshold', type=int, default=0)
     list_parser.add_argument('--cache_dir', type=Path, default=None)
 
     list_patches_parser = subparsers.add_parser(
@@ -69,7 +71,7 @@ def parse_args():
         help='Print cached patch jobs as tab-separated target_name, patch_index, patch_row, patch_col',
     )
     list_patches_parser.add_argument('--model_name', type=str, default=None)
-    list_patches_parser.add_argument('--layer_threshold', type=int, default=4)
+    list_patches_parser.add_argument('--layer_threshold', type=int, default=0)
     list_patches_parser.add_argument('--cache_dir', type=Path, default=None)
     list_patches_parser.add_argument('--group_size', type=int, default=128)
 
@@ -86,7 +88,7 @@ def parse_args():
     quantize_parser.add_argument('--workers_per_gpu', type=int, default=1024)
     quantize_parser.add_argument('--main_gpu_id', type=int, default=0)
     quantize_parser.add_argument('--seed', type=int, default=0)
-    quantize_parser.add_argument('--layer_threshold', type=int, default=4)
+    quantize_parser.add_argument('--layer_threshold', type=int, default=0)
     quantize_parser.add_argument('--cache_dir', type=Path, default=None)
     quantize_parser.add_argument('--save_dir', type=Path, default=None)
     quantize_parser.add_argument(
@@ -113,7 +115,14 @@ def passes_layer_threshold(name: str, layer_threshold: int) -> bool:
     return any(layer_id >= layer_threshold for layer_id in layer_ids)
 
 
-def default_cache_dir(model_name: str, layer_threshold: int) -> Path:
+def passes_layer_max(name: str, layer_max: int) -> bool:
+    layer_ids = [int(num) for num in re.findall(r'\d+', name)]
+    return any(layer_id <= layer_max for layer_id in layer_ids)
+
+
+def default_cache_dir(model_name: str, layer_threshold: int, layer_max: int | None = None) -> Path:
+    if layer_max is not None:
+        return DEFAULT_CACHE_ROOT / f'{model_basename(model_name)}-layer{layer_threshold}to{layer_max}'
     return DEFAULT_CACHE_ROOT / f'{model_basename(model_name)}-layer{layer_threshold}'
 
 
@@ -122,12 +131,13 @@ def resolve_cache_dir(
     cache_dir: Path | None,
     model_name: str | None,
     layer_threshold: int,
+    layer_max: int | None = None,
 ) -> Path:
     if cache_dir is not None:
         return cache_dir
     if model_name is None:
         raise ValueError('--cache_dir or --model_name must be specified')
-    return default_cache_dir(model_name, layer_threshold)
+    return default_cache_dir(model_name, layer_threshold, layer_max)
 
 
 def weights_dir(cache_dir: Path) -> Path:
@@ -349,10 +359,12 @@ def quantize_patch(
 
 
 def prepare_cache(args) -> Path:
+    layer_max = getattr(args, 'layer_max', None)
     cache_dir = resolve_cache_dir(
         cache_dir=args.cache_dir,
         model_name=args.model_name,
         layer_threshold=args.layer_threshold,
+        layer_max=layer_max,
     )
 
     if cache_is_complete(cache_dir) and not args.refresh_cache:
@@ -376,6 +388,8 @@ def prepare_cache(args) -> Path:
             if not is_quantization_target(name):
                 continue
             if not passes_layer_threshold(name, args.layer_threshold):
+                continue
+            if layer_max is not None and not passes_layer_max(name, layer_max):
                 continue
             if param.ndim != 2:
                 print(f"Skipping non-2D target {name}: {tuple(param.shape)}")
@@ -407,6 +421,7 @@ def prepare_cache(args) -> Path:
         'model_name': args.model_name,
         'model_basename': model_basename(args.model_name),
         'layer_threshold': args.layer_threshold,
+        'layer_max': layer_max,
         'target_count': len(cached_targets),
         'targets': cached_targets,
     }
