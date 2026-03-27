@@ -151,6 +151,93 @@ python weight_aware_quant_cached.py quantize-target \
   --num_steps 50000
 ```
 
+### LM workflow on TSUBAME (SGE array jobs)
+
+Files:
+
+- `lm/qsub_submit_qwen35.sh` — submits array jobs for Qwen3.5-2B/4B/9B
+- `lm/qsub_patch_array_job.sh` — SGE array job script (1 task = 1 target weight)
+
+#### Quickstart
+
+```bash
+cd nn_compression/lm
+bash qsub_submit_qwen35.sh -g <tsubame-group>
+```
+
+The script runs the following steps for each model automatically:
+
+1. `prepare-cache` — loads the model once and saves target weights under `lm/cache/`
+2. `list-targets` — enumerates all quantization targets
+3. `qsub` — submits an array job (1 SGE task per target weight)
+
+#### Key options
+
+```
+--bit_width   N        Quantization bits          (default: 2)
+--group_size  N        Patch group size            (default: 32)
+--num_steps   N        BFGS optimisation steps     (default: 10000)
+--walltime    HH:MM:SS Per-task GPU walltime       (default: 4:00:00)
+--workers_per_gpu N    Worker processes per GPU    (default: 1024)
+--gpu_resource STR     SGE GPU resource request    (default: gpu_1=1)
+--dry_run              Print commands without submitting
+```
+
+#### TSUBAME-specific notes
+
+**Group specification is required.**
+Without `-g <group>`, TSUBAME uses trial mode which limits walltime to 3 minutes.
+Always pass the group name:
+
+```bash
+qsub -g tga-artic ...
+# or set it in qsub_submit_qwen35.sh as needed
+```
+
+**Walltime applies per task, not per job array.**
+Each SGE task (= one target weight) has its own walltime budget.
+4 hours (`4:00:00`) may be too short for large weight matrices.
+**8 hours (`8:00:00`) is recommended** to avoid tasks being killed mid-run.
+
+**`workers_per_gpu` is capped by the number of CPU threads on the node.**
+Internally, the actual worker count is:
+```
+num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
+```
+TSUBAME4 compute nodes have 384 CPU threads, so setting `workers_per_gpu`
+above 384 has no effect when using a single GPU (`gpu_1=1`).
+**384 is the practical maximum for single-GPU jobs on TSUBAME4.**
+
+On TSUBAME4 H100 (96 GB) nodes with `group_size=32` (patch size = 32×32),
+each worker uses approximately 50–100 MB of GPU memory for its CUDA context.
+384 workers consume roughly 38 GB, which fits comfortably within the 96 GB budget.
+
+**Skip and resume behaviour.**
+Already-finished targets (where `{target_name}.pth` exists in the save directory)
+are skipped immediately at the start of the task.
+Partially-finished targets (where some `_rowX_colY.pth` patch files exist) also
+skip completed patches and reconstruct their tensors from the saved files,
+so resubmitting after a walltime kill wastes no work.
+
+#### Monitoring and resubmission
+
+```bash
+# Check job status
+qstat -u $USER
+
+# Count completed targets
+SAVEDIR=lm/bqq_compressed_data/Qwen3.5-9B-32gs-10000step
+ls "$SAVEDIR" | grep -v "_row" | wc -l   # completed targets
+wc -l < lm/qsub_jobs/Qwen3.5-9B-bit2-gs32/targets.txt  # total targets
+
+# Resubmit only the remaining targets (already-done ones are skipped automatically)
+qsub -g tga-artic -l gpu_1=1 -l h_rt=8:00:00 \
+  -t 1-217 -tc 100 -N bqq_Qwen3.5-9B \
+  -o lm/qsub_jobs/Qwen3.5-9B-bit2-gs32/logs/ \
+  -v "..." \
+  lm/qsub_patch_array_job.sh
+```
+
 ### CV workflow
 
 Files:

@@ -83,7 +83,7 @@ def parse_args():
     quantize_parser.add_argument('--group_size', type=int, default=128)
     quantize_parser.add_argument('--num_steps', type=int, default=50000)
     quantize_parser.add_argument('--rank_scale', type=float, default=1.0)
-    quantize_parser.add_argument('--workers_per_gpu', type=int, default=16)
+    quantize_parser.add_argument('--workers_per_gpu', type=int, default=1024)
     quantize_parser.add_argument('--main_gpu_id', type=int, default=0)
     quantize_parser.add_argument('--seed', type=int, default=0)
     quantize_parser.add_argument('--layer_threshold', type=int, default=4)

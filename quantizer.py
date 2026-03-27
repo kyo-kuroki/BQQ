@@ -1151,6 +1151,19 @@ class BinaryQuadraticQuantization2():
                 break
 
             i, j, patch = data['i'], data['j'], data['patch']
+
+            if save_name is not None:
+                save_path = f"{save_name}_row{i}_col{j}.pth"
+                if os.path.exists(save_path):
+                    cached = torch.load(save_path, map_location='cpu')
+                    reconstructed = torch.zeros_like(patch, dtype=torch.float32)
+                    for d in cached:
+                        y, z, a = d['mat1'], d['mat2'], d['coeff']
+                        reconstructed += a[0] * y @ z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
+                    result_list.append({'i': i, 'j': j, 'reconstructed': reconstructed})
+                    queue.task_done()
+                    continue
+
             device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
             patch = patch.to(device)
             original_x = patch.detach().clone()
