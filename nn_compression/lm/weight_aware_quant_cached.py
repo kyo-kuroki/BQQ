@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from datetime import datetime, timezone
 import json
 import math
+import multiprocessing as mp
 from pathlib import Path
 import re
 import shutil
@@ -102,6 +104,34 @@ def parse_args():
         action='store_true',
         help='Overwrite existing outputs if they already exist',
     )
+
+    extend_parser = subparsers.add_parser(
+        'extend-target',
+        help='Extend an existing N-bit quantization by optimizing additional residual bits',
+    )
+    extend_parser.add_argument('--target_name', type=str, required=True)
+    extend_parser.add_argument('--model_name', type=str, default=None)
+    extend_parser.add_argument(
+        '--source_dir', type=Path, required=True,
+        help='Directory containing the existing N-bit quantization patch files',
+    )
+    extend_parser.add_argument(
+        '--save_dir', type=Path, required=True,
+        help='Output directory for the extended quantization',
+    )
+    extend_parser.add_argument(
+        '--extra_bits', type=int, default=1,
+        help='Number of additional bits to optimise on top of the existing result (default: 1)',
+    )
+    extend_parser.add_argument('--group_size', type=int, default=32)
+    extend_parser.add_argument('--num_steps', type=int, default=10000)
+    extend_parser.add_argument('--rank_scale', type=float, default=1.0)
+    extend_parser.add_argument('--workers_per_gpu', type=int, default=1024)
+    extend_parser.add_argument('--main_gpu_id', type=int, default=0)
+    extend_parser.add_argument('--seed', type=int, default=0)
+    extend_parser.add_argument('--layer_threshold', type=int, default=0)
+    extend_parser.add_argument('--cache_dir', type=Path, default=None)
+    extend_parser.add_argument('--overwrite', action='store_true')
 
     return parser.parse_args()
 
@@ -555,6 +585,222 @@ def quantize_target(args) -> Path:
     return tensor_checkpoint
 
 
+def _reconstruct_from_patch_data(patch_data: list[dict], device: torch.device) -> torch.Tensor:
+    """BQQ分解データリストからパッチを再構成する。"""
+    y0 = patch_data[0]['mat1'].to(device)
+    z0 = patch_data[0]['mat2'].to(device)
+    result = torch.zeros(y0.shape[0], z0.shape[1], device=device, dtype=torch.float32)
+    for d in patch_data:
+        y = d['mat1'].to(device)
+        z = d['mat2'].to(device)
+        a = d['coeff'].to(device)
+        result = result + a[0] * y @ z
+        result = result + a[1] * y.sum(axis=1, keepdim=True)
+        result = result + a[2] * z.sum(axis=0, keepdim=True)
+        result = result + a[3]
+    return result
+
+
+def _extend_worker_task(
+    queue,
+    result_list,
+    source_save_prefix: str,
+    rank_scale: float,
+    seed: int,
+    zeta: float,
+    eta: float,
+    Tinit: float,
+    Tfin: float,
+    Nstep: int,
+    device_id: int,
+    extra_bits: int,
+    save_prefix: str | None,
+):
+    """extend_weight の並列ワーカー。既存分解の残差に extra_bits 分の BQQ を実行する。"""
+    torch.manual_seed(seed)
+    torch.cuda.set_device(device_id)
+    device = torch.device(f'cuda:{device_id}')
+
+    while not queue.empty():
+        try:
+            data = queue.get_nowait()
+        except Exception:
+            break
+
+        i, j, patch = data['i'], data['j'], data['patch']
+
+        # 出力済みならロードして返す
+        if save_prefix is not None:
+            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth')
+            if out_path.exists():
+                cached = torch.load(out_path, map_location='cpu')
+                reconstructed = _reconstruct_from_patch_data(cached, device)
+                result_list.append({'i': i, 'j': j, 'reconstructed': reconstructed.detach().cpu()})
+                queue.task_done()
+                continue
+
+        source_path = Path(f'{source_save_prefix}_row{i}_col{j}.pth')
+        source_data = torch.load(source_path, map_location='cpu')
+
+        patch = patch.to(device).float()
+        existing_reconst = _reconstruct_from_patch_data(source_data, device)
+        update_x = patch - existing_reconst
+
+        existing_bits = len(source_data)
+        new_decompositions = list(source_data)  # 既存エントリ（cpu tensor）をコピー
+
+        for bit_idx in range(extra_bits):
+            decomp = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
+            y, z, a = decomp.run_bqq_compile(
+                zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                Nstep=Nstep, device_id=device_id, seed=seed, output_type='torch',
+            )
+            reconst = a[0] * y @ z
+            reconst += a[1] * y.sum(axis=1, keepdim=True)
+            reconst += a[2] * z.sum(axis=0, keepdim=True)
+            reconst += a[3]
+            update_x = update_x - reconst
+            new_decompositions.append({
+                'patch_row': i,
+                'patch_col': j,
+                'coeff': a.cpu(),
+                'mat1': y.cpu(),
+                'mat2': z.cpu(),
+                'bit_idx': existing_bits + bit_idx,
+            })
+
+        if save_prefix is not None:
+            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth')
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(new_decompositions, out_path)
+
+        total_reconst = patch - update_x
+        result_list.append({'i': i, 'j': j, 'reconstructed': total_reconst.detach().cpu()})
+        queue.task_done()
+
+
+def extend_weight(
+    weight: torch.Tensor,
+    source_prefix: Path,
+    save_prefix: Path,
+    *,
+    extra_bits: int,
+    rank_scale: float,
+    group_size: int,
+    num_steps: int,
+    seed: int,
+    workers_per_gpu: int,
+    main_gpu_id: int,
+) -> torch.Tensor:
+    """既存 N-bit 分解の残差に extra_bits ビット分の BQQ を追加し、全ビット再構成を返す。"""
+    mp.set_start_method('spawn', force=True)
+
+    quantizer = BQQ2(weight, rank_scale=rank_scale)
+    divided_tensor = quantizer.patchify(weight.clone(), max_patch_size=group_size)
+    num_patches_h, num_patches_w, _, _ = divided_tensor.shape
+
+    manager = mp.Manager()
+    queue = manager.Queue()
+    result_list = manager.list()
+
+    for i in range(num_patches_h):
+        for j in range(num_patches_w):
+            queue.put({'i': i, 'j': j, 'patch': divided_tensor[i, j, :, :]})
+
+    num_gpus = torch.cuda.device_count()
+    num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
+
+    processes = []
+    for worker_id in range(num_workers):
+        device_id = (worker_id + main_gpu_id) % num_gpus
+        p = mp.Process(
+            target=_extend_worker_task,
+            args=(
+                queue, result_list,
+                str(source_prefix), rank_scale, seed,
+                4, 0.06, 0.2, 0.005, num_steps,
+                device_id, extra_bits, str(save_prefix),
+            ),
+        )
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+    for data in result_list:
+        i, j = data['i'], data['j']
+        divided_tensor[i, j, :, :] = data['reconstructed']
+
+    return quantizer.unpatchify(divided_tensor, weight.shape)
+
+
+def extend_target(args) -> Path:
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required for BQQ quantization.')
+
+    cache_dir = resolve_cache_dir(
+        cache_dir=args.cache_dir,
+        model_name=args.model_name,
+        layer_threshold=args.layer_threshold,
+    )
+    metadata = read_metadata(cache_dir)
+    targets = set(read_targets(cache_dir))
+    if args.target_name not in targets:
+        raise ValueError(f'Target is not present in cache: {args.target_name}')
+
+    source_dir = Path(args.source_dir)
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    tensor_checkpoint = save_dir / f'{args.target_name}.pth'
+    if tensor_checkpoint.exists() and not args.overwrite:
+        print(f'Skipping {args.target_name}: already at {tensor_checkpoint}')
+        return tensor_checkpoint
+
+    weight_path = cached_weight_path(cache_dir, args.target_name)
+    if not weight_path.exists():
+        raise FileNotFoundError(f'Cached tensor does not exist: {weight_path}')
+
+    # ソースのパッチファイルが存在するか確認（最初のパッチで代表チェック）
+    target_metadata = get_target_metadata(metadata, args.target_name)
+    first_patch = patch_output_path(source_dir, args.target_name, 0, 0)
+    if not first_patch.exists():
+        raise FileNotFoundError(
+            f'Source patch not found: {first_patch}\n'
+            f'Run quantize-target with the source bit_width first.'
+        )
+
+    print(f'Loading cached weight: {weight_path}')
+    weight = torch.load(weight_path, map_location='cpu')
+
+    source_prefix = source_dir / args.target_name
+    save_prefix = save_dir / args.target_name
+
+    source_bits = len(torch.load(first_patch, map_location='cpu'))
+    print(
+        f'Extending {args.target_name}: {tuple(weight.shape)} '
+        f'({source_bits}-bit → {source_bits + args.extra_bits}-bit)'
+    )
+
+    transformed = extend_weight(
+        weight,
+        source_prefix,
+        save_prefix,
+        extra_bits=args.extra_bits,
+        rank_scale=args.rank_scale,
+        group_size=args.group_size,
+        num_steps=args.num_steps,
+        seed=args.seed,
+        workers_per_gpu=args.workers_per_gpu,
+        main_gpu_id=args.main_gpu_id,
+    )
+
+    torch.save(transformed.cpu(), tensor_checkpoint)
+    print(f'Saved reconstructed tensor: {tensor_checkpoint}')
+    return tensor_checkpoint
+
+
 def main():
     args = parse_args()
 
@@ -569,6 +815,9 @@ def main():
         return
     if args.command == 'quantize-target':
         quantize_target(args)
+        return
+    if args.command == 'extend-target':
+        extend_target(args)
         return
 
     raise ValueError(f'Unsupported command: {args.command}')

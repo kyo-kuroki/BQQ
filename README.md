@@ -1,30 +1,40 @@
 # Binary Quadratic Quantization (BQQ)
 
-## 📂 Project Structure
+Binary Quadratic Quantization represents each weight matrix as a sum of **binary outer-product terms**:
 
-This repository contains two complementary modules that evaluate BQQ from different perspectives:
+$$W \approx \sum_{b=1}^{B} \bigl( a_b^{(0)}\, y_b z_b^\top + a_b^{(1)}\, y_b \mathbf{1}^\top + a_b^{(2)}\, \mathbf{1} z_b^\top + a_b^{(3)} \bigr)$$
 
-### **`matrix_compression/`**
+where $y_b, z_b \in \{0,1\}^n$ and the scalar coefficients $a_b$ are jointly optimised by simulated annealing.
+Each bit layer $b$ minimises the residual left by the previous layers, so **bit depth can be extended incrementally** without re-running earlier layers.
 
-Focuses on **generic matrix datasets**.
-It studies the trade-off between:
+## Repository structure
 
-* model (compressed) size, and
-* reconstruction error
+```
+BQQ/
+├── quantizer.py              # Core BQQ algorithms
+├── matrix_compression/       # Standalone matrix compression experiments
+└── nn_compression/           # Neural-network quantization
+    ├── lm/                   # Language model quantization (Qwen3.5, etc.)
+    └── cv/                   # Vision model quantization (DeiT, etc.)
+```
 
-This module is useful for understanding BQQ as a **matrix compression method**, independent of downstream neural networks.
+### `quantizer.py`
 
----
+| Class | Description |
+|-------|-------------|
+| `BinaryQuadraticQuantization` | Original multi-bit implementation; includes an activation-aware variant |
+| `BinaryQuadraticQuantization2` | Refactored class used by all current LM and CV workflows |
 
-### **`nn_compression/`**
+`BQQ2.bqq_large_matrix_multi_worker` tiles a weight matrix into patches and quantizes them in parallel via `multiprocessing`.
 
-Focuses on **neural network quantization**.
-It evaluates how BQQ affects:
+### `matrix_compression/`
 
-* model size,
-* task performance
+Studies BQQ as a pure matrix compression method, evaluating the compression–reconstruction-error trade-off on synthetic and real-valued data, independent of any downstream task.
 
-This module connects BQQ to practical deep-learning use cases.
+### `nn_compression/`
 
-See [`nn_compression/README.md`](nn_compression/README.md) for the workflow details,
-including the new cache-first parallel weight quantization scripts for both LM and CV.
+Applies BQQ to pretrained neural networks.
+See [`nn_compression/README.md`](nn_compression/README.md) for full workflow documentation.
+
+- **`lm/`** — Language model quantization with TSUBAME4 SGE array-job support.
+- **`cv/`** — Vision model quantization.
