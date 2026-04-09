@@ -153,13 +153,17 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=Non
             continue
 
         if isinstance(module, (nn.Linear)):
+            # パッチファイルは "xxx.weight_row0_col0.pth" なので
+            # patch_index のキーは "xxx.weight"（.weight 付き）
+            weight_key = f"{full_name}.weight"
             matrices = _load_layer_matrices(
-                full_name,
+                weight_key,
                 patch_index,
                 bit_width,
                 map_location=device if device is not None else module.weight.device,
             )
             if matrices is None:
+                print(f"  [WARN] No patches for {weight_key}, keeping original Linear")
                 continue
 
             A, Y, Z = matrices
@@ -191,7 +195,8 @@ def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix='', patch_ind
             continue
 
         if isinstance(module, (nn.Linear)):
-            matrices = _load_layer_matrices(full_name, patch_index, bit_width, map_location=module.weight.device)
+            weight_key = f"{full_name}.weight"
+            matrices = _load_layer_matrices(weight_key, patch_index, bit_width, map_location=module.weight.device)
             if matrices is None:
                 continue
 

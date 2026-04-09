@@ -4,14 +4,10 @@ import torch.nn as nn
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import random
 from tqdm import tqdm
 import pandas as pd
-from lm_eval import evaluator
-from lm_eval.evaluator import simple_evaluate
-from lm_eval.models.huggingface import HFLM
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import glob
 import argparse
 import os
@@ -92,18 +88,18 @@ def compute_ppl_from_testloader(model, testloader, device="cuda"):
 
 def evaluate_downstream_task(args, model):
     print("Evaluating downstream tasks ...")
+    from lm_eval.evaluator import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, use_fast=True)
-    lm = HFLM(pretrained=model,
-                tokenizer=tokenizer)
-
+    lm = HFLM(pretrained=model, tokenizer=tokenizer)
 
     results = simple_evaluate(
         lm,
         tasks=["arc_easy", "arc_challenge", "hellaswag", "winogrande", "piqa", "boolq"],
         device=args.device,
     )
-    
+
     print(results["results"])
     return results["results"]
   
@@ -116,6 +112,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=2048, help="sequence length for evaluation")
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
     parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
+    parser.add_argument("--eval_downstream", action="store_true", help="Also evaluate downstream tasks (requires lm_eval)")
     args = parser.parse_args()
 
 
@@ -140,25 +137,23 @@ def main():
     model_label = os.path.splitext(os.path.basename(args.model_path))[0] if args.model_path else args.model_name.replace("/", "_")
     print(f"{model_label} WikiText-2 Perplexity: {ppl:.4f}")
 
-    print("Evaluating Downstream Tasks...")
-    dstask_results = evaluate_downstream_task(args, model)
-
-    # ===== make results ======
-    # dstask_results は {task_name: {metric_name: value, ...}, ...} なのでフラット化
-    flat_results = {}
-    for task, metrics in dstask_results.items():
-        for metric_name, value in metrics.items():
-            flat_results[f"{task}_{metric_name}"] = value
-
-    # 1行の DataFrame にまとめる
     row = {"model": model_label, "PPL": ppl}
-    row.update(flat_results)
-    df = pd.DataFrame([row])  # リストで囲むと1行 DataFrame
 
-    # CSV 保存
+    if args.eval_downstream:
+        print("Evaluating Downstream Tasks...")
+        dstask_results = evaluate_downstream_task(args, model)
+        flat_results = {}
+        for task, metrics in dstask_results.items():
+            for metric_name, value in metrics.items():
+                flat_results[f"{task}_{metric_name}"] = value
+        row.update(flat_results)
+
+    df = pd.DataFrame([row])
     results_dir = default_results_dir()
     results_dir.mkdir(parents=True, exist_ok=True)
-    df.to_csv(results_dir / f"{model_label}.csv", index=False)
+    out_path = results_dir / f"{model_label}.csv"
+    df.to_csv(out_path, index=False)
+    print(f"Saved results to {out_path}")
 
 
 if __name__ == "__main__":
