@@ -20,7 +20,7 @@ BQQ/
     │   ├── make_bqq_model_from_compressed_data.py  # Reconstruct full model from patches
     │   ├── scale_refine_bqq.py          # Post-quantization scale refinement
     │   ├── evaluation.py                # PPL / downstream evaluation
-    │   ├── qsub_submit_qwen35.sh        # TSUBAME SGE job submission orchestrator
+    │   ├── qsub_submit_qwen35.sh        # SGE job submission orchestrator
     │   ├── qsub_patch_array_job.sh      # SGE array job: quantize-target
     │   └── qsub_extend_array_job.sh     # SGE array job: extend-target
     └── cv/                              # Vision model quantization
@@ -28,26 +28,27 @@ BQQ/
 
 ## Quick start (Language model quantization)
 
-以下は TSUBAME4 (SGE, H100) でのワークフローです。
-Apptainer イメージ (`pytorch_llm_vllm.sif`) が必要です。
+The following workflow is designed for an SGE cluster with GPUs and Apptainer.
 
-### Step 0: 環境変数
+### Step 0: Environment variables
+
+Set paths according to your environment:
 
 ```bash
-export BQQ_ROOT=/gs/bs/tga-artic/k-kuroki/BQQ
+export BQQ_ROOT=/path/to/BQQ
 export LM_DIR=$BQQ_ROOT/nn_compression/lm
-export HF_HOME=/gs/bs/tga-artic/k-kuroki/hf_cache
-export SIF_PATH=/gs/bs/tga-artic/tmp/tsubame-handson/containers/pytorch_llm_vllm.sif
+export HF_HOME=/path/to/hf_cache
+export SIF_PATH=/path/to/pytorch_llm_vllm.sif
 ```
 
-### Step 1: 2-bit 量子化 (一括投入)
+### Step 1: N-bit quantization (batch submission)
 
-`qsub_submit_qwen35.sh` がキャッシュ作成 → ターゲットリスト生成 → SGE アレイジョブ投入を一括で行います。
+`qsub_submit_qwen35.sh` automates the full pipeline: cache creation, target listing, and SGE array job submission.
 
 ```bash
 cd $LM_DIR
 
-# Qwen3.5-{2B, 4B, 9B} を 2-bit, group_size=32 で量子化
+# Quantize Qwen3.5-{2B, 4B, 9B} at 2-bit, group_size=32
 bash qsub_submit_qwen35.sh \
     --bit_width 2 \
     --group_size 32 \
@@ -56,31 +57,31 @@ bash qsub_submit_qwen35.sh \
     --workers_per_gpu 1024
 ```
 
-**仕組み**: 各モデルについて以下を実行します。
+**What it does** (for each model):
 
-1. `prepare-cache` — モデルをロードし、全 Linear 層の重みテンソルをディスクにキャッシュ
-2. `list-targets` — キャッシュから量子化対象の一覧を `targets.txt` に出力
-3. `qsub` — SGE アレイジョブ投入（1タスク = 1重み行列、GPU 1枚で384ワーカー並列）
+1. `prepare-cache` -- Load the model and cache all Linear weight tensors to disk
+2. `list-targets` -- Write all quantization target names to `targets.txt`
+3. `qsub` -- Submit an SGE array job (1 task = 1 weight matrix, each task runs 384 parallel workers on 1 GPU)
 
-**出力**:
-- パッチファイル: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}_row{i}_col{j}.pth`
-- 再構成テンソル: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}.pth`
+**Output**:
+- Patch files: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}_row{i}_col{j}.pth`
+- Reconstructed tensors: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}.pth`
 
-### Step 2: 3-bit への拡張 (extend-target)
+### Step 2: Extend to higher bit-depth (extend-target)
 
-2-bit の結果の残差を最適化して 3-bit に拡張します。2-bit 量子化の完了後に実行。
+Extend N-bit results to (N+k)-bit by optimising the residual. Run after the base quantization completes.
 
 ```bash
 MODEL=Qwen3.5-2B
 JOB_DIR=$LM_DIR/qsub_jobs/${MODEL}-bit3-gs32
 
-# targets.txt を 2-bit ジョブから流用
+# Reuse targets.txt from the 2-bit job
 mkdir -p $JOB_DIR/logs
 cp $LM_DIR/qsub_jobs/${MODEL}-bit2-gs32/targets.txt $JOB_DIR/targets.txt
 
 N_TARGETS=$(wc -l < $JOB_DIR/targets.txt)
 
-qsub -g tga-artic -t 1-${N_TARGETS}:1 \
+qsub -g <group> -t 1-${N_TARGETS}:1 \
     -l gpu_1=1 -l h_rt=8:00:00 -j y \
     -N "ext3b_${MODEL}" \
     -o "$JOB_DIR/logs/" \
@@ -95,14 +96,13 @@ qsub -g tga-artic -t 1-${N_TARGETS}:1 \
     $LM_DIR/qsub_extend_array_job.sh
 ```
 
-### Step 3: BQQ モデルの構築
+### Step 3: Build BQQ model
 
-パッチファイルから `BinaryQuadratic` モジュールに変換し、推論可能なモデルを構築します。
-初回実行時にパッチファイルの統合（`_consolidated/` へ保存）が行われます。
+Convert patch files into `BinaryQuadratic` modules and save a model that preserves the binary decomposition (Y, Z, A coefficients). On the first run, patch files are consolidated into per-target files under `_consolidated/` for fast loading.
 
 ```bash
-qsub -g tga-artic -l gpu_1=1 -l h_rt=4:00:00 -j y \
-    -N "mkbqq_2B" \
+qsub -g <group> -l gpu_1=1 -l h_rt=4:00:00 -j y \
+    -N "mkbqq_${MODEL}" \
     -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
     -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
     -v SCRIPT_DIR=$LM_DIR \
@@ -113,15 +113,15 @@ qsub -g tga-artic -l gpu_1=1 -l h_rt=4:00:00 -j y \
     $LM_DIR/qsub_jobs/make_bqq_model/make_bqq_job.sh
 ```
 
-**出力**: `quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step.pth`
+**Output**: `quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step.pth`
 
-### Step 4: スケール最適化 (Scale Refinement)
+### Step 4: Scale refinement
 
-BQQ モデルの二値パラメータ (Y, Z) を固定したまま、スケール係数 (a, b, c, d) をキャリブレーションデータで再最適化します。
+Refine the scale coefficients (a, b, c, d) of each `BinaryQuadratic` layer while keeping the binary parameters (Y, Z) fixed. Uses calibration data to minimise `||WX - W'X||^2`.
 
 ```bash
-qsub -g tga-artic -l gpu_1=1 -l h_rt=2:00:00 -j y \
-    -N "refine_2B" \
+qsub -g <group> -l gpu_1=1 -l h_rt=2:00:00 -j y \
+    -N "refine_${MODEL}" \
     -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
     -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
     -v SCRIPT_DIR=$LM_DIR \
@@ -131,11 +131,11 @@ qsub -g tga-artic -l gpu_1=1 -l h_rt=2:00:00 -j y \
     $LM_DIR/qsub_jobs/make_bqq_model/scale_refine_job.sh
 ```
 
-### Step 5: PPL 評価
+### Step 5: Perplexity evaluation
 
 ```bash
-qsub -g tga-artic -l gpu_1=1 -l h_rt=1:00:00 -j y \
-    -N "ppl_2B" \
+qsub -g <group> -l gpu_1=1 -l h_rt=1:00:00 -j y \
+    -N "ppl_${MODEL}" \
     -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
     -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
     -v SCRIPT_DIR=$LM_DIR \
@@ -145,38 +145,37 @@ qsub -g tga-artic -l gpu_1=1 -l h_rt=1:00:00 -j y \
     $LM_DIR/qsub_jobs/make_bqq_model/ppl_eval_job.sh
 ```
 
-**結果**: `results/{model_label}.csv` に PPL が保存されます。
+Results are saved to `results/{model_label}.csv`.
 
-## 進捗確認
+## Monitoring progress
 
 ```bash
-# 完了ターゲット数
+# Count completed targets
 SAVEDIR=$LM_DIR/bqq_compressed_data/Qwen3.5-2B-32gs-10000step
 ls "$SAVEDIR" | grep -v "_row" | wc -l
 
-# SGE ジョブ状況
+# Check SGE job status
 qstat -u $USER
 ```
 
-## スキップ・再開の挙動
+## Skip and resume behaviour
 
-- **ターゲット単位**: `{target_name}.pth` が存在すれば即スキップ
-- **パッチ単位**: `{target_name}_row{i}_col{j}.pth` が存在すれば再計算せず読み込んで復元
+- **Target level**: If `{target_name}.pth` exists, the target is skipped immediately.
+- **Patch level**: If `{target_name}_row{i}_col{j}.pth` exists, the patch is loaded from disk instead of recomputed.
 
-walltime kill 後の再投入で無駄な再計算なし。
+Jobs killed by walltime can be resubmitted without redundant computation.
 
-## TSUBAME 固有の注意点
+## SGE notes
 
-- `qsub` には必ず `-g tga-artic` を付ける（未指定だと walltime 3分のトライアルモード）
-- walltime はジョブ全体ではなく**タスク単位**
-- `workers_per_gpu` の実効上限: `min(mp.cpu_count(), workers_per_gpu)` = 384（ノードあたり384スレッド）
-- H100 96GB / ノード
+- Always specify your group with `-g <group>` (omitting it limits walltime to 3 minutes in trial mode).
+- Walltime (`h_rt`) is **per task**, not per array job.
+- Effective worker count is capped at `min(mp.cpu_count(), workers_per_gpu)`.
 
 ## `quantizer.py`
 
 | Class | Description |
 |-------|-------------|
-| `BinaryQuadraticQuantization` | Original multi-bit implementation; includes activation-aware variant |
+| `BinaryQuadraticQuantization` | Original multi-bit implementation; includes an activation-aware variant |
 | `BinaryQuadraticQuantization2` | Refactored class used by all current LM and CV workflows |
 
-`torch.compile` の mode はデフォルト `reduce-overhead`。`compile_mode="max-autotune"` を渡すと autotuning を有効化（コンパイルが遅くなるが最速カーネルを選択）。
+`torch.compile` defaults to `mode="reduce-overhead"`. Pass `compile_mode="max-autotune"` for autotuning (slower compilation but potentially faster kernels).
