@@ -35,24 +35,45 @@ def parse_args():
 
 
 def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_steps, device, output_dir=None):
+    """再構成済みターゲットファイル ({target_name}.pth) から直接 Linear 重みを差し替えて保存する。
+
+    パッチファイル (_row{i}_col{j}.pth) ではなく最終ファイルを使うため、
+    数百万パッチの torch.load を回避して高速。
+    """
     compressed_data_dir = Path(compressed_data_dir)
     output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
-    model = binary_quadratic_network.replace_linear_with_bqq(
-        model,
-        weights_dir=str(compressed_data_dir),
-        bit_width=bit_width,
-        device=device,
-    )
+
+    replaced = 0
+    skipped = 0
+    for name, module in model.named_modules():
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if 'head' in name:
+            print(f"Skipping {name} (head)")
+            skipped += 1
+            continue
+
+        target_file = compressed_data_dir / f"{name}.weight.pth"
+        if not target_file.exists():
+            print(f"  [WARN] No reconstructed file for {name}.weight, keeping original")
+            skipped += 1
+            continue
+
+        weight_reconstructed = torch.load(target_file, map_location=device, weights_only=True)
+        module.weight.data = weight_reconstructed.to(module.weight.dtype)
+        replaced += 1
+
+    print(f"Replaced {replaced} layers, skipped {skipped}")
 
     model_id = model_basename(model_name)
     output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs-{num_steps}step.pth"
     torch.save(model, output_path)
 
     for name, param in model.named_parameters():
-        print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
+        print(f"{name:40s} | shape: {tuple(param.shape)} | dtype: {param.dtype}")
 
     print(f"Saved quantized model to {output_path}")
     return output_path
