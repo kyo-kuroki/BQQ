@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from pathlib import Path
 import sys
@@ -41,11 +42,17 @@ def build_patch_index(weights_dir: str | Path) -> dict[str, list[Path]]:
         raise FileNotFoundError(f"Compressed data directory does not exist: {weights_path}")
 
     index: DefaultDict[str, list[Path]] = defaultdict(list)
-    for path in sorted(weights_path.glob("*.pth")):
-        if "_row" not in path.stem:
+    # os.scandir は glob("*.pth") + sorted() より大幅に高速（数百万ファイル対応）
+    for entry in os.scandir(weights_path):
+        if not entry.name.endswith(".pth") or "_row" not in entry.name:
             continue
-        layer_name = path.stem.rsplit("_row", 1)[0]
-        index[layer_name].append(path)
+        stem = entry.name[:-4]  # remove .pth
+        layer_name = stem.rsplit("_row", 1)[0]
+        index[layer_name].append(Path(entry.path))
+
+    # パッチの行・列順にソート
+    for key in index:
+        index[key].sort()
 
     return dict(index)
 
