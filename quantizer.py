@@ -95,7 +95,7 @@ class BinaryQuadraticQuantization():
         return reconstructed_tensor
 
 
-    def run_bqq_compile(self, x, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, device_id=0, seed=1):
+    def run_bqq_compile(self, x, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, device_id=0, seed=1, compile_mode="reduce-overhead"):
         torch.set_float32_matmul_precision('high')
         torch.manual_seed(seed)
 
@@ -163,8 +163,7 @@ class BinaryQuadraticQuantization():
 
         a = compute_a(y, z)
 
-        @torch.compile(mode="max-autotune", backend="inductor")
-        def loop_body(y, z, yb, zb, a, temp):
+        def _loop_body(y, z, yb, zb, a, temp):
             with torch.no_grad():
 
                 yf = y + zeta * (y - yb)
@@ -182,6 +181,8 @@ class BinaryQuadraticQuantization():
 
                 a = compute_a(torch.where(ya>0.5, 1.0, 0.0), torch.where(za>0.5, 1.0, 0.0))
             return ya, za, y, z, a
+
+        loop_body = torch.compile(_loop_body, mode=compile_mode)
 
         # gpuに移動
         temp = torch.tensor(temp, device=device)
@@ -203,7 +204,7 @@ class BinaryQuadraticQuantization():
 
         return y, z, maximum * a
     
-    def run_bqq_multibit(self, x, bit_width, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, damping=1e-2, device_id=0, seed=1):
+    def run_bqq_multibit(self, x, bit_width, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, damping=1e-2, device_id=0, seed=1, compile_mode="reduce-overhead"):
         torch.set_float32_matmul_precision('high')
         torch.manual_seed(seed)
 
@@ -252,7 +253,7 @@ class BinaryQuadraticQuantization():
 
         a = compute_a(y, z)
 
-        @torch.compile(mode="reduce-overhead")
+        @torch.compile(mode=compile_mode)
         def loop_body(y, z, yb, zb, a, temp):
             yf = (y + zeta * (y - yb))
             zf = (z + zeta * (z - zb))
@@ -296,7 +297,7 @@ class BinaryQuadraticQuantization():
 
         return y, z, maximum * a
     
-    def run_activation_aware_bqq_multibit(self, x, input, bit_width, group_size=32, rank_scale=1, top_percent=0.5, quant_bias=True, Nstep=50000, device_id=0, seed=1):
+    def run_activation_aware_bqq_multibit(self, x, input, bit_width, group_size=32, rank_scale=1, top_percent=0.5, quant_bias=True, Nstep=50000, device_id=0, seed=1, compile_mode="reduce-overhead"):
         torch.set_float32_matmul_precision('high')
         torch.manual_seed(seed)
 
@@ -461,7 +462,7 @@ class BinaryQuadraticQuantization():
 
         a = compute_a(y, z)
 
-        @torch.compile(mode="reduce-overhead")
+        @torch.compile(mode=compile_mode)
         def loop_body(y, z, a):
             gy = grad_y(x, y, z, a)
             gz = grad_z(x, y, z, a)
@@ -853,7 +854,7 @@ class BinaryQuadraticQuantization2():
 
         
 
-    def run_bqq_compile(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='torch'):
+    def run_bqq_compile(self, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, output_type='torch', compile_mode="reduce-overhead"):
         torch.set_float32_matmul_precision('medium')
 
         device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
@@ -918,8 +919,7 @@ class BinaryQuadraticQuantization2():
 
         a = compute_a(y, z)
 
-        @torch.compile(mode="max-autotune", backend="inductor")
-        def loop_body(y, z, yb, zb, a, temp):
+        def _loop_body(y, z, yb, zb, a, temp):
             with torch.no_grad():
 
                 yf = y + zeta * (y - yb)
@@ -937,6 +937,8 @@ class BinaryQuadraticQuantization2():
 
                 a = compute_a(ya, za)
             return ya, za, y, z, a
+
+        loop_body = torch.compile(_loop_body, mode=compile_mode)
 
         # gpuに移動
         temp = torch.tensor(temp, device=device)
@@ -1251,7 +1253,7 @@ class BinaryMatrixFactorization():
 
     
 
-    def run_binary_multi(self, x, rank_scale, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1):
+    def run_binary_multi(self, x, rank_scale, zeta, eta, Tinit, Tfin, Nstep, device_id=0, seed=1, compile_mode="reduce-overhead"):
         if x.ndim == 2:
             x = x.unsqueeze(0)
         torch.manual_seed(seed)
@@ -1281,7 +1283,7 @@ class BinaryMatrixFactorization():
         down = torch.tril(matrix, diagonal=-1)
         a = ((x * (y @ z)).sum(dim=(1, 2))) / ((y @ z).sum(dim=(1, 2)) + up.sum(dim=(1, 2)) + down.sum(dim=(1, 2)))
 
-        @torch.compile(mode="reduce-overhead")
+        @torch.compile(mode=compile_mode)
         def loop_body(y, z, yb, zb, a, temp):
             with torch.no_grad():
                 # 更新計算
