@@ -3,7 +3,7 @@
 #$ -cwd
 #$ -j y
 #$ -l cpu=8
-#$ -l h_rt=1:00:00
+#$ -l h_rt=4:00:00
 
 echo "=== make_bqq_model: ${MODEL_BASENAME} ==="
 echo "Host: $(hostname)  Date: $(date -Iseconds)"

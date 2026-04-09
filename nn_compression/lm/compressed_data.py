@@ -57,13 +57,51 @@ def build_patch_index(weights_dir: str | Path) -> dict[str, list[Path]]:
     return dict(index)
 
 
+def consolidated_path(weights_dir: Path, layer_name: str) -> Path:
+    """統合パッチファイルのパスを返す。"""
+    return weights_dir / "_consolidated" / f"{layer_name}.pth"
+
+
+def consolidate_all_patches(weights_dir: str | Path) -> None:
+    """全ターゲットのパッチファイルを統合して _consolidated/ に保存する。
+
+    既存の統合ファイルはスキップ。これにより replace_linear_with_bqq が
+    数百万回の torch.load → ターゲット数回に高速化される。
+    """
+    weights_dir = Path(weights_dir)
+    out_dir = weights_dir / "_consolidated"
+    out_dir.mkdir(exist_ok=True)
+
+    index = build_patch_index(weights_dir)
+    total = len(index)
+    for i, (layer_name, patch_paths) in enumerate(index.items()):
+        out_path = out_dir / f"{layer_name}.pth"
+        if out_path.exists():
+            continue
+        patch_list: list[dict] = []
+        for path in patch_paths:
+            patch_list.extend(torch.load(path, weights_only=False, map_location="cpu"))
+        torch.save(patch_list, out_path)
+        if (i + 1) % 20 == 0:
+            print(f"  Consolidated {i + 1}/{total} targets")
+    print(f"Consolidation done: {total} targets in {out_dir}")
+
+
 def load_layer_patches(
     layer_name: str,
     patch_index: dict[str, list[Path]],
     map_location: str | torch.device = "cpu",
 ) -> list[dict]:
+    # 統合ファイルがあればそこからロード（高速）
+    paths = patch_index.get(layer_name, [])
+    if paths:
+        cpath = consolidated_path(paths[0].parent, layer_name)
+        if cpath.exists():
+            return torch.load(cpath, weights_only=False, map_location=map_location)
+
+    # フォールバック: 個別パッチファイルからロード
     patch_list: list[dict] = []
-    for path in patch_index.get(layer_name, []):
+    for path in paths:
         patch_list.extend(torch.load(path, weights_only=False, map_location=map_location))
     return patch_list
 
