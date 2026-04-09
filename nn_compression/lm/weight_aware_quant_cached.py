@@ -601,82 +601,6 @@ def _reconstruct_from_patch_data(patch_data: list[dict], device: torch.device) -
     return result
 
 
-def _extend_worker_task(
-    queue,
-    result_list,
-    source_save_prefix: str,
-    rank_scale: float,
-    seed: int,
-    zeta: float,
-    eta: float,
-    Tinit: float,
-    Tfin: float,
-    Nstep: int,
-    device_id: int,
-    extra_bits: int,
-    save_prefix: str | None,
-):
-    """extend_weight の並列ワーカー。bqq_worker_task と同じパターン。"""
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device_id)
-    device = torch.device(f'cuda:{device_id}')
-
-    while not queue.empty():
-        try:
-            data = queue.get_nowait()
-        except Exception:
-            break
-
-        i, j, patch = data['i'], data['j'], data['patch']
-
-        # 出力済みならロードして返す
-        if save_prefix is not None:
-            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth')
-            if out_path.exists():
-                cached = torch.load(out_path, map_location='cpu')
-                reconstructed = _reconstruct_from_patch_data(cached, device)
-                result_list.append({'i': i, 'j': j, 'reconstructed': reconstructed.detach().cpu()})
-                continue
-
-        source_path = Path(f'{source_save_prefix}_row{i}_col{j}.pth')
-        source_data = torch.load(source_path, map_location='cpu')
-
-        patch = patch.to(device).float()
-        existing_reconst = _reconstruct_from_patch_data(source_data, device)
-        update_x = patch - existing_reconst
-
-        existing_bits = len(source_data)
-        new_decompositions = list(source_data)
-
-        for bit_idx in range(extra_bits):
-            decomp = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
-            y, z, a = decomp.run_bqq_compile(
-                zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
-                Nstep=Nstep, device_id=device_id, seed=seed, output_type='torch',
-            )
-            reconst = a[0] * y @ z
-            reconst += a[1] * y.sum(axis=1, keepdim=True)
-            reconst += a[2] * z.sum(axis=0, keepdim=True)
-            reconst += a[3]
-            update_x = update_x - reconst
-            new_decompositions.append({
-                'patch_row': i,
-                'patch_col': j,
-                'coeff': a.cpu(),
-                'mat1': y.cpu(),
-                'mat2': z.cpu(),
-                'bit_idx': existing_bits + bit_idx,
-            })
-
-        if save_prefix is not None:
-            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth')
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(new_decompositions, out_path)
-
-        total_reconst = patch - update_x
-        result_list.append({'i': i, 'j': j, 'reconstructed': total_reconst.detach().cpu()})
-
-
 def extend_weight(
     weight: torch.Tensor,
     source_prefix: Path,
@@ -692,48 +616,71 @@ def extend_weight(
 ) -> torch.Tensor:
     """既存 N-bit 分解の残差に extra_bits ビット分の BQQ を追加し、全ビット再構成を返す。
 
-    bqq_large_matrix_multi_worker と同じ並列パターン。
-    キューにはパッチテンソル(32×32)のみ入れ、ソースパッチは各ワーカーがディスクから読む。
+    シングルプロセス・シングルGPUで逐次処理。各パッチをチェックポイント保存するため
+    walltime kill 後の再起動でも完了済みパッチはスキップされる。
     """
-    mp.set_start_method('spawn', force=True)
+    torch.manual_seed(seed)
+    torch.cuda.set_device(main_gpu_id)
+    device = torch.device(f'cuda:{main_gpu_id}')
 
     quantizer = BQQ2(weight, rank_scale=rank_scale)
     divided_tensor = quantizer.patchify(weight.clone(), max_patch_size=group_size)
     num_patches_h, num_patches_w, _, _ = divided_tensor.shape
+    total_patches = num_patches_h * num_patches_w
 
-    manager = mp.Manager()
-    queue = manager.Queue()
-    result_list = manager.list()
-
+    done = 0
+    skipped = 0
     for i in range(num_patches_h):
         for j in range(num_patches_w):
-            queue.put({'i': i, 'j': j, 'patch': divided_tensor[i, j, :, :]})
+            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth') if save_prefix is not None else None
 
-    num_gpus = torch.cuda.device_count()
-    num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
+            # 出力済みならロードして結果を復元
+            if out_path is not None and out_path.exists():
+                cached = torch.load(out_path, map_location='cpu')
+                divided_tensor[i, j, :, :] = _reconstruct_from_patch_data(cached, device).cpu()
+                skipped += 1
+                continue
 
-    processes = []
-    for worker_id in range(num_workers):
-        device_id = (worker_id + main_gpu_id) % num_gpus
-        p = mp.Process(
-            target=_extend_worker_task,
-            args=(
-                queue, result_list,
-                str(source_prefix), rank_scale, seed,
-                4, 0.06, 0.2, 0.005, num_steps,
-                device_id, extra_bits, str(save_prefix),
-            ),
-        )
-        p.start()
-        processes.append(p)
+            source_path = Path(f'{source_prefix}_row{i}_col{j}.pth')
+            source_data = torch.load(source_path, map_location='cpu')
 
-    for p in processes:
-        p.join()
+            patch = divided_tensor[i, j, :, :].to(device).float()
+            existing_reconst = _reconstruct_from_patch_data(source_data, device)
+            update_x = patch - existing_reconst
 
-    for data in result_list:
-        i, j = data['i'], data['j']
-        divided_tensor[i, j, :, :] = data['reconstructed']
+            existing_bits = len(source_data)
+            new_decompositions = list(source_data)
 
+            for bit_idx in range(extra_bits):
+                decomp = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
+                y, z, a = decomp.run_bqq_compile(
+                    zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                    Nstep=num_steps, device_id=main_gpu_id, seed=seed, output_type='torch',
+                )
+                reconst = a[0] * y @ z
+                reconst += a[1] * y.sum(axis=1, keepdim=True)
+                reconst += a[2] * z.sum(axis=0, keepdim=True)
+                reconst += a[3]
+                update_x = update_x - reconst
+                new_decompositions.append({
+                    'patch_row': i,
+                    'patch_col': j,
+                    'coeff': a.cpu(),
+                    'mat1': y.cpu(),
+                    'mat2': z.cpu(),
+                    'bit_idx': existing_bits + bit_idx,
+                })
+
+            if out_path is not None:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(new_decompositions, out_path)
+
+            divided_tensor[i, j, :, :] = (patch - update_x).detach().cpu()
+            done += 1
+            if done % 100 == 0:
+                print(f'Progress: {done + skipped}/{total_patches} patches ({skipped} skipped)')
+
+    print(f'Extend done: {done} processed, {skipped} skipped, total {total_patches}')
     return quantizer.unpatchify(divided_tensor, weight.shape)
 
 
