@@ -41,10 +41,6 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
     output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # パッチファイルをターゲット単位に統合（初回のみ、以降はスキップ）
-    print("Consolidating patch files...")
-    consolidate_all_patches(compressed_data_dir)
-
     model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
     model = binary_quadratic_network.replace_linear_with_bqq(
         model,

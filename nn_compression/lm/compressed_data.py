@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -62,6 +63,67 @@ def consolidated_path(weights_dir: Path, layer_name: str) -> Path:
     return weights_dir / "_consolidated" / f"{layer_name}.pth"
 
 
+def get_max_divisor(num: int, max_value: int) -> int:
+    if max_value <= 0:
+        raise ValueError('group_size must be a positive integer')
+    limit = max(int(math.sqrt(num)), max_value)
+    for candidate in range(limit, 0, -1):
+        if num % candidate == 0 and candidate <= max_value:
+            return candidate
+    return 1
+
+
+def get_patch_layout(shape: list[int] | tuple[int, int], group_size: int) -> dict[str, int]:
+    if len(shape) != 2:
+        raise ValueError(f'Only 2D tensors are supported for patch layout, got shape={tuple(shape)}')
+    height, width = int(shape[0]), int(shape[1])
+    patch_height = get_max_divisor(height, group_size)
+    patch_width = get_max_divisor(width, group_size)
+    return {
+        'height': height,
+        'width': width,
+        'patch_height': patch_height,
+        'patch_width': patch_width,
+        'num_patch_rows': height // patch_height,
+        'num_patch_cols': width // patch_width,
+    }
+
+
+def consolidate_target_patches(
+    weights_dir: str | Path,
+    target_name: str,
+    *,
+    shape: tuple[int, int],
+    group_size: int,
+) -> Path:
+    """単一ターゲットのパッチファイルを統合して _consolidated/ に保存する。
+
+    パッチレイアウト (shape, group_size) から (i, j) を列挙し、対応する
+    _row{i}_col{j}.pth をロードして 1 ファイルにまとめる。
+    ディレクトリ全体のスキャンが不要なため、数百万ファイルあっても高速。
+    """
+    weights_dir = Path(weights_dir)
+    out_dir = weights_dir / "_consolidated"
+    out_dir.mkdir(exist_ok=True)
+    out_path = out_dir / f"{target_name}.pth"
+
+    if out_path.exists():
+        return out_path
+
+    layout = get_patch_layout(shape, group_size)
+    patch_list: list[dict] = []
+    for i in range(layout["num_patch_rows"]):
+        for j in range(layout["num_patch_cols"]):
+            path = weights_dir / f"{target_name}_row{i}_col{j}.pth"
+            if path.exists():
+                patch_list.extend(torch.load(path, weights_only=False, map_location="cpu"))
+
+    if patch_list:
+        torch.save(patch_list, out_path)
+
+    return out_path
+
+
 def consolidate_all_patches(weights_dir: str | Path) -> None:
     """全ターゲットのパッチファイルを統合して _consolidated/ に保存する。
 
@@ -87,13 +149,36 @@ def consolidate_all_patches(weights_dir: str | Path) -> None:
     print(f"Consolidation done: {total} targets in {out_dir}")
 
 
+def build_consolidated_index(weights_dir: str | Path) -> dict[str, Path]:
+    """_consolidated/ ディレクトリからターゲット名 → consolidated ファイルパスの辞書を構築する。"""
+    consolidated_dir = Path(weights_dir) / "_consolidated"
+    if not consolidated_dir.exists():
+        return {}
+    index: dict[str, Path] = {}
+    for entry in os.scandir(consolidated_dir):
+        if entry.name.endswith(".pth"):
+            layer_name = entry.name[:-4]  # remove .pth
+            index[layer_name] = Path(entry.path)
+    return index
+
+
 def load_layer_patches(
     layer_name: str,
-    patch_index: dict[str, list[Path]],
+    patch_index: dict[str, list[Path] | Path],
     map_location: str | torch.device = "cpu",
 ) -> list[dict]:
-    # 統合ファイルがあればそこからロード（高速）
-    paths = patch_index.get(layer_name, [])
+    entry = patch_index.get(layer_name)
+    if entry is None:
+        return []
+
+    # consolidated index の場合: 値が Path（単一ファイル）
+    if isinstance(entry, Path):
+        if entry.exists():
+            return torch.load(entry, weights_only=False, map_location=map_location)
+        return []
+
+    # 旧 patch index の場合: 値が list[Path]
+    paths = entry
     if paths:
         cpath = consolidated_path(paths[0].parent, layer_name)
         if cpath.exists():

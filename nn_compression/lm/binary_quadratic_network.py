@@ -4,9 +4,9 @@ from scipy.linalg import hadamard
 from tqdm import tqdm
 
 try:
-    from .compressed_data import build_patch_index, get_bqq_matrices, load_layer_patches
+    from .compressed_data import build_consolidated_index, build_patch_index, get_bqq_matrices, load_layer_patches
 except ImportError:
-    from compressed_data import build_patch_index, get_bqq_matrices, load_layer_patches
+    from compressed_data import build_consolidated_index, build_patch_index, get_bqq_matrices, load_layer_patches
 
 
 class BinaryQuadratic(nn.Module):
@@ -142,7 +142,7 @@ def _load_layer_matrices(layer_name, patch_index, bit_width, map_location):
 
 def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=None, show_tqdm=True, patch_index=None):
     if patch_index is None:
-        patch_index = build_patch_index(weights_dir)
+        patch_index = build_consolidated_index(weights_dir) or build_patch_index(weights_dir)
 
     iterator = tqdm(model.named_children()) if show_tqdm else model.named_children()
     for name, module in iterator:
@@ -185,7 +185,7 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=Non
 
 def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix='', patch_index=None):
     if patch_index is None:
-        patch_index = build_patch_index(weights_dir)
+        patch_index = build_consolidated_index(weights_dir) or build_patch_index(weights_dir)
 
     for name, module in model.named_children():
         full_name = f"{prefix}.{name}" if prefix else name
@@ -210,7 +210,7 @@ def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix='', patch_ind
 
 
 def replace_weight(model, weights_dir, bit_width):
-    patch_index = build_patch_index(weights_dir)
+    patch_index = build_consolidated_index(weights_dir) or build_patch_index(weights_dir)
 
     for name, param in model.named_parameters():
 

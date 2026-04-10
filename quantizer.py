@@ -1139,13 +1139,10 @@ class BinaryQuadraticQuantization2():
 
         return best_device
     
-    def bqq_worker_task(self, queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name=None):
+    def bqq_worker_task(self, queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width):
+        """各ワーカーが処理する行列分解タスク。結果はインメモリで返す。"""
         torch.manual_seed(seed)
         torch.cuda.set_device(device_id)
-        """ 各ワーカーが処理する行列分解タスク """
-        if save_name is None:
-            save = False
-        else: save = True
         while not queue.empty():
             try:
                 data = queue.get_nowait()
@@ -1154,18 +1151,6 @@ class BinaryQuadraticQuantization2():
 
             i, j, patch = data['i'], data['j'], data['patch']
 
-            if save_name is not None:
-                save_path = f"{save_name}_row{i}_col{j}.pth"
-                if os.path.exists(save_path):
-                    cached = torch.load(save_path, map_location='cpu')
-                    reconstructed = torch.zeros_like(patch, dtype=torch.float32)
-                    for d in cached:
-                        y, z, a = d['mat1'], d['mat2'], d['coeff']
-                        reconstructed += a[0] * y @ z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
-                    result_list.append({'i': i, 'j': j, 'reconstructed': reconstructed})
-                    queue.task_done()
-                    continue
-
             device = f"cuda:{device_id}" if torch.cuda.is_available() else "cpu"
             patch = patch.to(device)
             original_x = patch.detach().clone()
@@ -1173,26 +1158,31 @@ class BinaryQuadraticQuantization2():
 
             decomposed_patches = []
 
-
             for bit_idx in range(bit_width):
                 decomp_instance = BinaryQuadraticQuantization2(x=update_x.clone(), rank_scale=rank_scale_copy)
                 y, z, a = decomp_instance.run_bqq_compile(zeta, eta, Tinit, Tfin, Nstep, device_id, seed, output_type='torch')
                 reconst = a[0] * y@z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
                 update_x -= reconst
 
-                if save:
-                    data = {'patch_row': i, 'patch_col': j, 'coeff': a.cpu(), 'mat1': y.cpu(), 'mat2': z.cpu(), 'bit_idx': bit_idx}
-                    decomposed_patches.append(data)
+                decomposed_patches.append({
+                    'patch_row': i, 'patch_col': j,
+                    'coeff': a.cpu(), 'mat1': y.cpu(), 'mat2': z.cpu(),
+                    'bit_idx': bit_idx,
+                })
 
-            if save:
-                torch.save(decomposed_patches, f"{save_name}_row{i}_col{j}.pth")
-            result_list.append({'i': i, 'j': j, 'reconstructed': (original_x - update_x).clone().detach().cpu()})
+            result_list.append({
+                'i': i, 'j': j,
+                'reconstructed': (original_x - update_x).clone().detach().cpu(),
+                'decomposed': decomposed_patches,
+            })
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, save_name=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0):
         """
-        大きな行列をパッチに分割し、並列に行列分解を実行して復元
+        大きな行列をパッチに分割し、並列に行列分解を実行して復元。
+        結果は consolidated_path に1ファイルで保存する。
+        既存の consolidated_path があれば完了済みパッチをスキップして再開する。
         """
         mp.set_start_method("spawn", force=True)
         rank_scale_copy = copy.copy(self.rank_scale)
@@ -1200,34 +1190,68 @@ class BinaryQuadraticQuantization2():
         divided_tensor = self.patchify(torch.tensor(x_copy), max_patch_size=max_patch_size)
         num_patches_h, num_patches_w, _, _ = divided_tensor.shape
 
+        # 既存の consolidated ファイルから完了済みパッチを復元
+        all_decomposed = []
+        completed = set()
+        if consolidated_path and os.path.exists(consolidated_path):
+            all_decomposed = torch.load(consolidated_path, weights_only=False, map_location='cpu')
+            for p in all_decomposed:
+                completed.add((p['patch_row'], p['patch_col']))
+            # 完了済みパッチの再構成テンソルを復元
+            from collections import defaultdict
+            by_patch = defaultdict(list)
+            for p in all_decomposed:
+                by_patch[(p['patch_row'], p['patch_col'])].append(p)
+            for (i, j), patches in by_patch.items():
+                reconstructed = torch.zeros_like(divided_tensor[i, j], dtype=torch.float32)
+                for p in patches:
+                    a, y, z = p['coeff'], p['mat1'], p['mat2']
+                    reconstructed += a[0] * y @ z + a[1] * y.sum(axis=1).unsqueeze(1) + a[2] * z.sum(axis=0).unsqueeze(0) + a[3]
+                divided_tensor[i, j, :, :] = reconstructed
+            print(f'Resumed {len(completed)}/{num_patches_h * num_patches_w} patches from {consolidated_path}')
+
+        # 未完了パッチのみキューに投入
         manager = mp.Manager()
         queue = manager.Queue()
         result_list = manager.list()
 
+        pending = 0
         for i in range(num_patches_h):
             for j in range(num_patches_w):
+                if (i, j) in completed:
+                    continue
                 patch = divided_tensor[i, j, :, :]
                 queue.put({'i': i, 'j': j, 'patch': patch})
-        
-        num_gpus = torch.cuda.device_count()
-        num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
-        processes = []
-        for worker_id in range(num_workers):
-            device_id = (worker_id+main_gpu_id) % num_gpus
-            p = mp.Process(target=self.bqq_worker_task, args=(queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width, save_name))
-            p.start()
-            processes.append(p)
-        
-        for p in processes:
-            p.join()
-        
-        for data in result_list:
-            i, j = data['i'], data['j']
-            divided_tensor[i, j, :, :] = data['reconstructed']
-        
+                pending += 1
+
+        if pending > 0:
+            num_gpus = torch.cuda.device_count()
+            num_workers = min(mp.cpu_count(), num_gpus * workers_per_gpu)
+            print(f'Dispatching {pending} patches to {num_workers} workers')
+            processes = []
+            for worker_id in range(num_workers):
+                device_id = (worker_id+main_gpu_id) % num_gpus
+                p = mp.Process(target=self.bqq_worker_task, args=(queue, result_list, rank_scale_copy, seed, zeta, eta, Tinit, Tfin, Nstep, device_id, bit_width))
+                p.start()
+                processes.append(p)
+
+            for p in processes:
+                p.join()
+
+            for data in result_list:
+                i, j = data['i'], data['j']
+                divided_tensor[i, j, :, :] = data['reconstructed']
+                all_decomposed.extend(data['decomposed'])
+
+        # consolidated ファイルに一括保存
+        if consolidated_path and all_decomposed:
+            os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
+            torch.save(all_decomposed, consolidated_path)
+            print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+
         reconstructed_tensor = self.unpatchify(divided_tensor, x_copy.shape)
         self.x = copy.copy(x_copy)
-        
+
         return reconstructed_tensor
     
 

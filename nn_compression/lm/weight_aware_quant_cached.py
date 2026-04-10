@@ -15,14 +15,20 @@ from transformers import AutoModelForCausalLM
 
 try:
     from .compressed_data import (
+        consolidate_target_patches,
         default_compressed_data_dir,
         ensure_bqq_root_on_path,
+        get_max_divisor,
+        get_patch_layout,
         model_basename,
     )
 except ImportError:
     from compressed_data import (
+        consolidate_target_patches,
         default_compressed_data_dir,
         ensure_bqq_root_on_path,
+        get_max_divisor,
+        get_patch_layout,
         model_basename,
     )
 
@@ -221,39 +227,11 @@ def cache_is_complete(cache_dir: Path) -> bool:
     return all(cached_weight_path(cache_dir, name).exists() for name in targets)
 
 
-def get_max_divisor(num: int, max_value: int) -> int:
-    if max_value <= 0:
-        raise ValueError('group_size must be a positive integer')
-
-    limit = max(int(math.sqrt(num)), max_value)
-    for candidate in range(limit, 0, -1):
-        if num % candidate == 0 and candidate <= max_value:
-            return candidate
-    return 1
-
-
 def get_target_metadata(metadata: dict, target_name: str) -> dict:
     for target in metadata.get('targets', []):
         if target.get('name') == target_name:
             return target
     raise ValueError(f'Cache metadata does not contain target: {target_name}')
-
-
-def get_patch_layout(shape: list[int] | tuple[int, int], group_size: int) -> dict[str, int]:
-    if len(shape) != 2:
-        raise ValueError(f'Only 2D tensors are supported for patch layout, got shape={tuple(shape)}')
-
-    height, width = int(shape[0]), int(shape[1])
-    patch_height = get_max_divisor(height, group_size)
-    patch_width = get_max_divisor(width, group_size)
-    return {
-        'height': height,
-        'width': width,
-        'patch_height': patch_height,
-        'patch_width': patch_width,
-        'num_patch_rows': height // patch_height,
-        'num_patch_cols': width // patch_width,
-    }
 
 
 def get_patch_spec(
@@ -303,7 +281,7 @@ def extract_patch(weight: torch.Tensor, patch_spec: dict[str, int]) -> torch.Ten
 
 def quantize_weight(
     weight: torch.Tensor,
-    save_prefix: Path,
+    consolidated_path: Path,
     *,
     bit_width: int,
     rank_scale: float,
@@ -320,7 +298,7 @@ def quantize_weight(
     return quantizer.bqq_large_matrix_multi_worker(
         max_patch_size=group_size,
         bit_width=bit_width,
-        save_name=str(save_prefix),
+        consolidated_path=str(consolidated_path),
         zeta=4,
         eta=0.06,
         Tinit=0.2,
@@ -555,8 +533,10 @@ def quantize_target(args) -> Path:
         print(f'Saved compressed patch: {patch_checkpoint}')
         return patch_checkpoint
 
+    consolidated_dir = save_dir / '_consolidated'
+    consolidated_file = consolidated_dir / f'{args.target_name}.pth'
     tensor_checkpoint = save_dir / f'{args.target_name}.pth'
-    if tensor_checkpoint.exists() and not args.overwrite:
+    if tensor_checkpoint.exists() and consolidated_file.exists() and not args.overwrite:
         print(f'Skipping {args.target_name}: already quantized at {tensor_checkpoint}')
         return tensor_checkpoint
 
@@ -570,7 +550,7 @@ def quantize_target(args) -> Path:
     print(f'Quantizing {args.target_name}: {tuple(weight.shape)}')
     transformed = quantize_weight(
         weight,
-        save_dir / args.target_name,
+        consolidated_file,
         bit_width=args.bit_width,
         rank_scale=args.rank_scale,
         group_size=args.group_size,
@@ -582,6 +562,7 @@ def quantize_target(args) -> Path:
 
     torch.save(transformed.cpu(), tensor_checkpoint)
     print(f'Saved reconstructed tensor: {tensor_checkpoint}')
+
     return tensor_checkpoint
 
 
@@ -603,8 +584,8 @@ def _reconstruct_from_patch_data(patch_data: list[dict], device: torch.device) -
 
 def extend_weight(
     weight: torch.Tensor,
-    source_prefix: Path,
-    save_prefix: Path,
+    source_consolidated: Path,
+    save_consolidated: Path,
     *,
     extra_bits: int,
     rank_scale: float,
@@ -616,8 +597,8 @@ def extend_weight(
 ) -> torch.Tensor:
     """既存 N-bit 分解の残差に extra_bits ビット分の BQQ を追加し、全ビット再構成を返す。
 
-    シングルプロセス・シングルGPUで逐次処理。各パッチをチェックポイント保存するため
-    walltime kill 後の再起動でも完了済みパッチはスキップされる。
+    consolidated ファイルからソースを読み込み、拡張結果も consolidated ファイルに保存する。
+    再開時は save_consolidated の既存エントリから完了済みパッチをスキップ。
     """
     torch.manual_seed(seed)
     torch.cuda.set_device(main_gpu_id)
@@ -628,28 +609,48 @@ def extend_weight(
     num_patches_h, num_patches_w, _, _ = divided_tensor.shape
     total_patches = num_patches_h * num_patches_w
 
+    # ソースの consolidated ファイルを読み込み、パッチごとにグループ化
+    source_data = torch.load(source_consolidated, weights_only=False, map_location='cpu')
+    from collections import defaultdict
+    source_by_patch = defaultdict(list)
+    for p in source_data:
+        source_by_patch[(p['patch_row'], p['patch_col'])].append(p)
+    source_bits = max(p['bit_idx'] for p in source_data) + 1
+
+    # 保存先の consolidated ファイルが既にあれば再開用に読み込む
+    # ただし extend 前のデータ（source_bits 分のみ）の場合はスキップしない
+    target_bits = source_bits + extra_bits
+    all_decomposed = []
+    completed = set()
+    if save_consolidated.exists():
+        existing = torch.load(save_consolidated, weights_only=False, map_location='cpu')
+        existing_max_bit = max(p['bit_idx'] for p in existing) + 1 if existing else 0
+        if existing_max_bit >= target_bits:
+            # 既に extend 済みのデータ
+            all_decomposed = existing
+            for p in all_decomposed:
+                completed.add((p['patch_row'], p['patch_col']))
+
     done = 0
     skipped = 0
     for i in range(num_patches_h):
         for j in range(num_patches_w):
-            out_path = Path(f'{save_prefix}_row{i}_col{j}.pth') if save_prefix is not None else None
-
-            # 出力済みならロードして結果を復元
-            if out_path is not None and out_path.exists():
-                cached = torch.load(out_path, map_location='cpu')
-                divided_tensor[i, j, :, :] = _reconstruct_from_patch_data(cached, device).cpu()
+            if (i, j) in completed:
+                # 既に拡張済み: 再構成テンソルを復元
+                patches_for_ij = [p for p in all_decomposed if p['patch_row'] == i and p['patch_col'] == j]
+                divided_tensor[i, j, :, :] = _reconstruct_from_patch_data(patches_for_ij, device).cpu()
                 skipped += 1
                 continue
 
-            source_path = Path(f'{source_prefix}_row{i}_col{j}.pth')
-            source_data = torch.load(source_path, map_location='cpu')
+            source_patches = source_by_patch.get((i, j), [])
+            if not source_patches:
+                raise ValueError(f'Source patch not found: row={i}, col={j}')
 
             patch = divided_tensor[i, j, :, :].to(device).float()
-            existing_reconst = _reconstruct_from_patch_data(source_data, device)
+            existing_reconst = _reconstruct_from_patch_data(source_patches, device)
             update_x = patch - existing_reconst
 
-            existing_bits = len(source_data)
-            new_decompositions = list(source_data)
+            new_decompositions = list(source_patches)
 
             for bit_idx in range(extra_bits):
                 decomp = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
@@ -668,19 +669,23 @@ def extend_weight(
                     'coeff': a.cpu(),
                     'mat1': y.cpu(),
                     'mat2': z.cpu(),
-                    'bit_idx': existing_bits + bit_idx,
+                    'bit_idx': source_bits + bit_idx,
                 })
 
-            if out_path is not None:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(new_decompositions, out_path)
-
+            all_decomposed.extend(new_decompositions)
             divided_tensor[i, j, :, :] = (patch - update_x).detach().cpu()
             done += 1
             if done % 100 == 0:
                 print(f'Progress: {done + skipped}/{total_patches} patches ({skipped} skipped)')
+                # 中間保存（walltime kill 対策）
+                save_consolidated.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(all_decomposed, save_consolidated)
 
+    # 最終保存
+    save_consolidated.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(all_decomposed, save_consolidated)
     print(f'Extend done: {done} processed, {skipped} skipped, total {total_patches}')
+    print(f'Saved consolidated: {save_consolidated} ({len(all_decomposed)} entries)')
     return quantizer.unpatchify(divided_tensor, weight.shape)
 
 
@@ -702,8 +707,10 @@ def extend_target(args) -> Path:
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    consolidated_dir = save_dir / '_consolidated'
+    save_consolidated = consolidated_dir / f'{args.target_name}.pth'
     tensor_checkpoint = save_dir / f'{args.target_name}.pth'
-    if tensor_checkpoint.exists() and not args.overwrite:
+    if tensor_checkpoint.exists() and save_consolidated.exists() and not args.overwrite:
         print(f'Skipping {args.target_name}: already at {tensor_checkpoint}')
         return tensor_checkpoint
 
@@ -711,22 +718,20 @@ def extend_target(args) -> Path:
     if not weight_path.exists():
         raise FileNotFoundError(f'Cached tensor does not exist: {weight_path}')
 
-    # ソースのパッチファイルが存在するか確認（最初のパッチで代表チェック）
+    # ソースの consolidated ファイルを確認
     target_metadata = get_target_metadata(metadata, args.target_name)
-    first_patch = patch_output_path(source_dir, args.target_name, 0, 0)
-    if not first_patch.exists():
+    source_consolidated = source_dir / '_consolidated' / f'{args.target_name}.pth'
+    if not source_consolidated.exists():
         raise FileNotFoundError(
-            f'Source patch not found: {first_patch}\n'
+            f'Source consolidated file not found: {source_consolidated}\n'
             f'Run quantize-target with the source bit_width first.'
         )
 
     print(f'Loading cached weight: {weight_path}')
     weight = torch.load(weight_path, map_location='cpu')
 
-    source_prefix = source_dir / args.target_name
-    save_prefix = save_dir / args.target_name
-
-    source_bits = len(torch.load(first_patch, map_location='cpu'))
+    source_data = torch.load(source_consolidated, weights_only=False, map_location='cpu')
+    source_bits = max(p['bit_idx'] for p in source_data) + 1
     print(
         f'Extending {args.target_name}: {tuple(weight.shape)} '
         f'({source_bits}-bit → {source_bits + args.extra_bits}-bit)'
@@ -734,8 +739,8 @@ def extend_target(args) -> Path:
 
     transformed = extend_weight(
         weight,
-        source_prefix,
-        save_prefix,
+        source_consolidated,
+        save_consolidated,
         extra_bits=args.extra_bits,
         rank_scale=args.rank_scale,
         group_size=args.group_size,
@@ -747,6 +752,7 @@ def extend_target(args) -> Path:
 
     torch.save(transformed.cpu(), tensor_checkpoint)
     print(f'Saved reconstructed tensor: {tensor_checkpoint}')
+
     return tensor_checkpoint
 
 
