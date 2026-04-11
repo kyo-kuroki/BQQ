@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from quantizer import BinaryQuadraticQuantization2 as BQQ
+from quantizer import BinaryQuadraticQuantization as BQQ
 
 
 def MSE(matrix1, matrix2):

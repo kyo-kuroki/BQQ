@@ -175,7 +175,6 @@ Jobs killed by walltime can be resubmitted without redundant computation.
 
 | Class | Description |
 |-------|-------------|
-| `BinaryQuadraticQuantization` | Original multi-bit implementation; includes an activation-aware variant |
-| `BinaryQuadraticQuantization2` | Refactored class used by all current LM and CV workflows |
+| `BinaryQuadraticQuantization` | Main BQQ class for all LM and CV workflows. `binarize_scaling=True` for V1 mode (binarized scaling), `False` (default) for V2 mode (continuous scaling). |
 
 `torch.compile` defaults to `mode="reduce-overhead"`. Pass `compile_mode="max-autotune"` for autotuning (slower compilation but potentially faster kernels).

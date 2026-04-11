@@ -26,7 +26,7 @@ for path in (BQQ_ROOT, UTILS_DIR):
         sys.path.insert(0, path_str)
 
 # quantizerをインポート
-from quantizer import BinaryQuadraticQuantization2 as BQQ
+from quantizer import BinaryQuadraticQuantization as BQQ
 import queue
 from multiprocessing import Process, Queue, current_process
 import pandas as pd

@@ -20,7 +20,7 @@ for path in (BQQ_ROOT, UTILS_DIR):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from quantizer import BinaryQuadraticQuantization2 as BQQ2
+from quantizer import BinaryQuadraticQuantization as BQQ2
 from build_dataset import get_imagenet
 from build_model import get_model
 from make_bqq_model_from_compressed_data import save_bqq_model
@@ -53,7 +53,7 @@ def custom_weight_transform(weight: torch.Tensor, args, save_path) -> torch.Tens
     return BQQ2(weight, rank_scale=args.rank_scale).bqq_large_matrix_multi_worker(
         max_patch_size=args.group_size,
         bit_width=args.bit_width,
-        save_name=save_path,
+        consolidated_path=save_path,
         zeta=args.zeta,
         eta=args.eta,
         Tinit=args.Tinit,

@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from quantizer import (
     BinaryQuadraticQuantization as BQQ,
-    BinaryQuadraticQuantization2 as BQQ2,
+    BinaryQuadraticQuantization as BQQ2,
     BinaryCodingQuantization as BCQ,
     UniformQuantization as UQ,
     VectorQuantization as VQ,

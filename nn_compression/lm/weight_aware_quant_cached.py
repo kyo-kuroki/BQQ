@@ -35,7 +35,7 @@ except ImportError:
 
 ensure_bqq_root_on_path()
 
-from quantizer import BinaryQuadraticQuantization2 as BQQ2
+from quantizer import BinaryQuadraticQuantization as BQQ2
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent

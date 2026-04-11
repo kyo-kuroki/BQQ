@@ -24,7 +24,7 @@ for path in (BQQ_ROOT, UTILS_DIR):
         sys.path.insert(0, path_str)
 
 
-from quantizer import BinaryQuadraticQuantization2 as BQQ2
+from quantizer import BinaryQuadraticQuantization as BQQ2
 from build_dataset import get_imagenet
 from build_model import get_model
 from make_bqq_model_from_compressed_data import save_bqq_model
@@ -296,7 +296,7 @@ def quantize_weight(
     return BQQ2(weight, rank_scale=rank_scale).bqq_large_matrix_multi_worker(
         max_patch_size=group_size,
         bit_width=bit_width,
-        save_name=str(save_prefix),
+        consolidated_path=str(save_prefix),
         zeta=zeta,
         eta=eta,
         Tinit=Tinit,

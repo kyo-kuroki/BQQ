@@ -18,7 +18,7 @@ except ImportError:
 
 ensure_bqq_root_on_path()
 
-from quantizer import BinaryQuadraticQuantization2 as BQQ2
+from quantizer import BinaryQuadraticQuantization as BQQ2
 
 
 def parse_args():
@@ -65,7 +65,7 @@ def quantize_weight(
     return quantizer.bqq_large_matrix_multi_worker(
         max_patch_size=group_size,
         bit_width=bit_width,
-        save_name=str(save_prefix),
+        consolidated_path=str(save_prefix),
         zeta=4,
         eta=0.06,
         Tinit=0.2,
