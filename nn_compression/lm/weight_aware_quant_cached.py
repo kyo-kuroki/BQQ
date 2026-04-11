@@ -617,16 +617,18 @@ def extend_weight(
         source_by_patch[(p['patch_row'], p['patch_col'])].append(p)
     source_bits = max(p['bit_idx'] for p in source_data) + 1
 
-    # 保存先の consolidated ファイルが既にあれば再開用に読み込む
-    # ただし extend 前のデータ（source_bits 分のみ）の場合はスキップしない
+    # source データを全て all_decomposed に先読みする。
+    # 中間保存時に未処理パッチの source データが失われないようにするため。
     target_bits = source_bits + extra_bits
-    all_decomposed = []
+    all_decomposed = list(source_data)
     completed = set()
+
+    # 保存先の consolidated ファイルが既にあれば再開用に読み込む
     if save_consolidated.exists():
         existing = torch.load(save_consolidated, weights_only=False, map_location='cpu')
         existing_max_bit = max(p['bit_idx'] for p in existing) + 1 if existing else 0
         if existing_max_bit >= target_bits:
-            # 既に extend 済みのデータ
+            # 既に extend 済みのデータがある → そちらを使う
             all_decomposed = existing
             for p in all_decomposed:
                 completed.add((p['patch_row'], p['patch_col']))
@@ -650,8 +652,6 @@ def extend_weight(
             existing_reconst = _reconstruct_from_patch_data(source_patches, device)
             update_x = patch - existing_reconst
 
-            new_decompositions = list(source_patches)
-
             for bit_idx in range(extra_bits):
                 decomp = BQQ2(x=update_x.clone(), rank_scale=rank_scale)
                 y, z, a = decomp.run_bqq_compile(
@@ -663,7 +663,7 @@ def extend_weight(
                 reconst += a[2] * z.sum(axis=0, keepdim=True)
                 reconst += a[3]
                 update_x = update_x - reconst
-                new_decompositions.append({
+                all_decomposed.append({
                     'patch_row': i,
                     'patch_col': j,
                     'coeff': a.cpu(),
@@ -672,7 +672,6 @@ def extend_weight(
                     'bit_idx': source_bits + bit_idx,
                 })
 
-            all_decomposed.extend(new_decompositions)
             divided_tensor[i, j, :, :] = (patch - update_x).detach().cpu()
             done += 1
             if done % 100 == 0:
