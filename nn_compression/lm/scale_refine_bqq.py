@@ -16,7 +16,7 @@ Newton step gives the exact global minimum (one-shot linear solve per patch).
 
 Usage
 -----
-Prepare a BQQ model (e.g. via make_bqq_model_from_compressed_data.py), then:
+Prepare a BQQ model (e.g. via build_bqq_model.py), then:
 
     python scale_refine_bqq.py \\
         --model_name  Qwen/Qwen3.5-4B \\
@@ -46,11 +46,11 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
-    from .binary_quadratic_network import BinaryQuadratic, replace_linear_with_bqq
+    from .build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
     from .compressed_data import default_compressed_data_dir, model_basename
     from .datautils import get_loaders
 except ImportError:
-    from binary_quadratic_network import BinaryQuadratic, replace_linear_with_bqq
+    from build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
     from compressed_data import default_compressed_data_dir, model_basename
     from datautils import get_loaders
 

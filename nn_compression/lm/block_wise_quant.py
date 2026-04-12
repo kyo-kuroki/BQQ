@@ -33,7 +33,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-from binary_quadratic_network import BinaryQuadratic
+from build_bqq_model import BinaryQuadratic
 from compressed_data import get_bqq_matrices
 from datautils import get_loaders
 from model_loader import load_causal_lm

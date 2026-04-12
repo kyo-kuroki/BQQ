@@ -34,7 +34,7 @@ APPTAINER_CMD=(
 # Step 1: Build BQQ model
 echo "--- Building model ---"
 "${APPTAINER_CMD[@]}" \
-    python make_bqq_model_from_compressed_data.py \
+    python build_bqq_model.py \
         --model_name          "${MODEL_NAME}" \
         --bit_widths          "${BIT_WIDTH}" \
         --group_size          "${GROUP_SIZE}" \

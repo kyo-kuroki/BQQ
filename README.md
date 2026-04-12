@@ -16,8 +16,7 @@ BQQ/
 └── nn_compression/
     ├── lm/                              # Language model quantization
     │   ├── weight_aware_quant_cached.py # Main entry point (prepare-cache / quantize-target / extend-target)
-    │   ├── binary_quadratic_network.py  # BinaryQuadratic nn.Module definition
-    │   ├── make_bqq_model_from_compressed_data.py  # Reconstruct full model from patches
+    │   ├── build_bqq_model.py  # Replace Linear→BinaryQuadratic, build model from patches or blocks
     │   ├── scale_refine_bqq.py          # Post-quantization scale refinement
     │   ├── evaluation.py                # PPL / downstream evaluation
     │   ├── qsub_submit_qwen35.sh        # SGE job submission orchestrator

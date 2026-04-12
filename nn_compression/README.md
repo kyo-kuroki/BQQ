@@ -15,8 +15,7 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 | `lm/qsub_patch_array_job.sh` | SGE array job body for `quantize-target` (1 task = 1 weight tensor) |
 | `lm/qsub_extend_array_job.sh` | SGE array job body for `extend-target` (1 task = 1 weight tensor) |
 | `lm/block_wise_quant.py` | Block-wise quantization with block output error optimization |
-| `lm/binary_quadratic_network.py` | BQQ Linear layer definition |
-| `lm/make_bqq_model_from_compressed_data.py` | Reconstruct a full model from patch files or block files |
+| `lm/build_bqq_model.py` | Replace Linear→BinaryQuadratic, build model from patches or blocks |
 | `lm/scale_refine_bqq.py` | Hessian-based scale factor refinement (post-quantization) |
 | `lm/fine_tuning.py` | Fine-tuning / KL distillation on a quantized model |
 | `lm/evaluation.py` | Perplexity and task evaluation |
@@ -125,7 +124,7 @@ wait
 **Assemble full model from blocks:**
 
 ```bash
-python make_bqq_model_from_compressed_data.py \
+python build_bqq_model.py \
     --model_name Qwen/Qwen3-2B \
     --block_dir blockwise_output/Qwen3-2B
 ```

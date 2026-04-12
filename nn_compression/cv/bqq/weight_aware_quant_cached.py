@@ -27,7 +27,7 @@ for path in (BQQ_ROOT, UTILS_DIR):
 from quantizer import BinaryQuadraticQuantization as BQQ2
 from build_dataset import get_imagenet
 from build_model import get_model
-from make_bqq_model_from_compressed_data import save_bqq_model
+from build_bqq_model import save_bqq_model
 from utils import test_model_accuracy
 
 
