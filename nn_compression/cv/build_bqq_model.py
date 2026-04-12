@@ -25,14 +25,9 @@ import torch.nn as nn
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CV_DIR = SCRIPT_DIR.parent
-UTILS_DIR = CV_DIR / "utils"
 
-for path in (str(CV_DIR.parent.parent), str(UTILS_DIR)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from bqq_modules import (  # noqa: F401
     BinaryQuadratic,
     BQQLinear,

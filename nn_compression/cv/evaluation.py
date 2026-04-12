@@ -3,14 +3,8 @@ from pathlib import Path
 import sys
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CV_DIR = SCRIPT_DIR.parent
-BQQ_ROOT = CV_DIR.parent.parent
-UTILS_DIR = CV_DIR / "utils"
 
-for path in (BQQ_ROOT, UTILS_DIR):
     path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
 
 from build_dataset import get_imagenet
 import os

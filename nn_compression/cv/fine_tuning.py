@@ -32,12 +32,7 @@ import torch.optim as optim
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CV_DIR = SCRIPT_DIR.parent
-UTILS_DIR = CV_DIR / "utils"
 
-for path in (str(CV_DIR.parent.parent), str(UTILS_DIR)):
-    if path not in sys.path:
-        sys.path.insert(0, path)
 
 from build_dataset import get_imagenet
 from build_model import get_model

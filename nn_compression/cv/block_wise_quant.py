@@ -26,12 +26,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'utils'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+from bqq_modules import BinaryQuadratic, get_matrices
+
 from build_model import get_model
 from build_dataset import get_imagenet, calibsample_from_trainloader
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
-from bqq_modules import BinaryQuadratic, get_matrices
 
 
 # ---------------------------------------------------------------------------
