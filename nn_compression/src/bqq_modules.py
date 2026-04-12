@@ -1,0 +1,376 @@
+"""
+BQQ (Binary Quadratic Quantization) module definitions.
+
+Shared between LM and CV workflows.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Function
+from scipy.linalg import hadamard
+
+
+# ---------------------------------------------------------------------------
+# Core BQQ modules (shared)
+# ---------------------------------------------------------------------------
+
+class BinaryQuadratic(nn.Module):
+    """BQQ layer using {0,1} binary representation."""
+
+    def __init__(self, Y, Z, A, bias=None):
+        super().__init__()
+        self.bit_width, self.row_width, self.col_width, self.y_row, self.inter_dimension = Y.shape
+        _, _, _, _, self.z_col = Z.shape
+
+        self.register_buffer("Y", (Y > 0.5))
+        self.register_buffer("Z", (Z > 0.5))
+        self.a = nn.Parameter(A[..., 0].unsqueeze(-1).unsqueeze(-1).clone())
+        self.b = nn.Parameter(A[..., 1].unsqueeze(-1).unsqueeze(-1).clone())
+        self.c = nn.Parameter(A[..., 2].unsqueeze(-1).unsqueeze(-1).clone())
+        self.d = nn.Parameter(A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0))
+        self.bias = nn.Parameter(bias) if bias is not None else None
+
+    def forward(self, X):
+        dtype = X.dtype
+        device = self.Y.device
+        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
+        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
+        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
+        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
+        W = W.sum(dim=0) + self.d.type(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
+        if self.bias is None:
+            return X.to(device) @ W.T
+        else:
+            return X.to(device) @ W.T + self.bias.type(dtype).to(device)
+
+    def get_weight(self, dtype=torch.float32):
+        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
+        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
+        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
+        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
+        W = W.sum(dim=0) + self.d.type(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
+        return W
+
+
+class HadamardBinaryQuadratic(nn.Module):
+    """BQQ layer with Hadamard transform applied to the weight matrix."""
+
+    def __init__(self, Y, Z, A, bias=None):
+        super().__init__()
+        self.bit_width, self.row_width, self.col_width, self.y_row, self.inter_dimension = Y.shape
+        _, _, _, _, self.z_col = Z.shape
+
+        self.register_buffer("Y", (Y > 0.5))
+        self.register_buffer("Z", (Z > 0.5))
+        self.a = nn.Parameter(A[..., 0].unsqueeze(-1).unsqueeze(-1).clone())
+        self.b = nn.Parameter(A[..., 1].unsqueeze(-1).unsqueeze(-1).clone())
+        self.c = nn.Parameter(A[..., 2].unsqueeze(-1).unsqueeze(-1).clone())
+        self.d = nn.Parameter(A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0))
+        self.bias = nn.Parameter(bias) if bias is not None else None
+
+    def forward(self, X):
+        dtype = X.dtype
+        device = self.Y.device
+        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
+        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
+        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
+        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
+        W = W.sum(dim=0) + self.d.type(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
+        if self.bias is None:
+            return X.to(device) @ torch.from_numpy(hadamard(W.shape[1])).float().to(device) @ W.T
+        else:
+            return X.to(device) @ torch.from_numpy(hadamard(W.shape[1])).float().to(device) @ W.T + self.bias.type(dtype).to(device)
+
+    def get_weight(self, dtype=torch.float32):
+        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
+        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
+        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
+        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
+        W = W.sum(dim=0) + self.d.type(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
+        return W
+
+
+# ---------------------------------------------------------------------------
+# Merge utilities (shared)
+# ---------------------------------------------------------------------------
+
+def merge_binary_quadratic(diff_layer: BinaryQuadratic, quant_layer: BinaryQuadratic) -> BinaryQuadratic:
+    merged_Y = torch.cat([quant_layer.Y, diff_layer.Y], dim=0)
+    merged_Z = torch.cat([quant_layer.Z, diff_layer.Z], dim=0)
+    merged_a = torch.cat([quant_layer.a, diff_layer.a], dim=0)
+    merged_b = torch.cat([quant_layer.b, diff_layer.b], dim=0)
+    merged_c = torch.cat([quant_layer.c, diff_layer.c], dim=0)
+    merged_d = quant_layer.d + diff_layer.d
+    merged_bias = quant_layer.bias
+
+    return BinaryQuadratic(merged_Y, merged_Z, torch.cat([
+        merged_a.squeeze(-1).squeeze(-1).unsqueeze(-1),
+        merged_b.squeeze(-1).squeeze(-1).unsqueeze(-1),
+        merged_c.squeeze(-1).squeeze(-1).unsqueeze(-1),
+        merged_d.unsqueeze(-1),
+    ], dim=-1), bias=merged_bias)
+
+
+def merge_binaryquadratic_recursive(model_q: nn.Module, model_d: nn.Module, prefix=''):
+    for (name_q, module_q), (name_d, module_d) in zip(model_q.named_children(), model_d.named_children()):
+        assert name_q == name_d, f"Module name mismatch: {name_q} != {name_d}"
+        full_name = f"{prefix}.{name_q}" if prefix else name_q
+
+        if isinstance(module_q, BinaryQuadratic) and isinstance(module_d, BinaryQuadratic):
+            merged = merge_binary_quadratic(module_d, module_q)
+            setattr(model_q, name_q, merged)
+            print(f"Merged BinaryQuadratic at {full_name}")
+        else:
+            merge_binaryquadratic_recursive(module_q, module_d, prefix=full_name)
+
+    return model_q
+
+
+# ---------------------------------------------------------------------------
+# Patch → tensor conversion (shared)
+# ---------------------------------------------------------------------------
+
+def get_matrices(patch_list, bit_width):
+    """Convert a flat list of patch dicts into (A, Y, Z) tensors."""
+    row_width = max(patch['patch_row'] for patch in patch_list) + 1
+    col_width = max(patch['patch_col'] for patch in patch_list) + 1
+    m, l = patch_list[0]['mat1'].shape
+    _, n = patch_list[0]['mat2'].shape
+    coeff_dtype = patch_list[0]['coeff'].dtype
+    matrix_dtype = patch_list[0]['mat1'].dtype
+
+    A = torch.zeros((bit_width, row_width, col_width, 4), dtype=coeff_dtype)
+    Y = torch.zeros((bit_width, row_width, col_width, m, l), dtype=matrix_dtype)
+    Z = torch.zeros((bit_width, row_width, col_width, l, n), dtype=matrix_dtype)
+
+    for patch in patch_list:
+        i, j = patch['patch_row'], patch['patch_col']
+        a, y, z, k = patch['coeff'], patch['mat1'], patch['mat2'], patch['bit_idx']
+        if k >= bit_width:
+            continue
+        A[k, i, j] = a
+        Y[k, i, j] = y
+        Z[k, i, j] = z
+
+    return A, Y, Z
+
+
+# ---------------------------------------------------------------------------
+# CV-specific: {-1, +1} representation and trainable layers
+# ---------------------------------------------------------------------------
+
+def transform_A(A, l):
+    """Transform scaling coefficients from {0,1} to {-1,1} binary representation."""
+    A0, A1, A2, A3 = A[..., 0], A[..., 1], A[..., 2], A[..., 3]
+    new0 = A0 / 4
+    new1 = A1 / 2 + A0 / 4
+    new2 = A2 / 2 + A0 / 4
+    new3 = (A0 / 4 + A1 / 2 + A2 / 2) * l + A3
+    return torch.stack([new0, new1, new2, new3], dim=-1)
+
+
+class SymQuantSTE(Function):
+    """Symmetric quantization with straight-through estimator."""
+
+    @staticmethod
+    def forward(ctx, input, scale, num_bits):
+        if num_bits == 1:
+            s = scale.abs()
+            output = s * torch.sgn(input)
+        else:
+            s = scale.abs().clamp_min(1e-8)
+            qmax = 2 ** (num_bits - 1) - 1
+            q = torch.clamp(torch.round(input / s), -qmax, qmax)
+            output = q * s
+        ctx.save_for_backward(input, s)
+        ctx.num_bits = num_bits
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, s = ctx.saved_tensors
+        num_bits = ctx.num_bits
+        if num_bits == 1:
+            mask = (input.abs() <= s).to(grad_output.dtype)
+        else:
+            qmax = 2 ** (num_bits - 1) - 1
+            mask = (input.abs() <= qmax * s).to(grad_output.dtype)
+        grad_input = grad_output * mask
+        return grad_input, None, None
+
+
+class BQQLinear(nn.Module):
+    """
+    Trainable BQQ linear layer using {-1,+1} representation.
+    Y_fp, Z_fp are real-valued parameters; 1-bit quantization is applied in forward via SymQuantSTE.
+    """
+
+    def __init__(self, Y, Z, A, bias=None, act_bits=None, quant_bias=True):
+        super().__init__()
+        self.Y_fp = nn.Parameter(Y.clone().float())
+        self.Z_fp = nn.Parameter(Z.clone().float())
+        self.quant_bias = quant_bias
+        self.A = nn.Parameter(A.clone().float())
+        self.bias = nn.Parameter(bias.clone().float()) if bias is not None else None
+        self.act_bits = act_bits
+        if act_bits is not None:
+            self.act_scale = nn.Parameter(torch.tensor(1e-3))
+
+        p, j, k, m, l = Y.shape
+        _, _, _, _, n = Z.shape
+        self.p, self.j, self.k, self.m, self.l, self.n = p, j, k, m, l, n
+        self.in_features = k * n
+        self.out_features = j * m
+
+    def forward(self, input):
+        orig_dtype = input.dtype
+        device = self.Y_fp.device
+        X = input.to(device=device, dtype=torch.float32)
+
+        if self.act_bits is not None:
+            X = SymQuantSTE.apply(X, self.act_scale, self.act_bits)
+
+        Y_fp = self.Y_fp.to(device=device, dtype=torch.float32)
+        Z_fp = self.Z_fp.to(device=device, dtype=torch.float32)
+        Y_scale = Y_fp.abs().mean(dim=(-2, -1), keepdim=True)
+        Z_scale = Z_fp.abs().mean(dim=(-2, -1), keepdim=True)
+        Y_q = SymQuantSTE.apply(Y_fp, Y_scale, 1)
+        Z_q = SymQuantSTE.apply(Z_fp, Z_scale, 1)
+
+        p, j, k, m, l = Y_q.shape
+        n = Z_q.shape[-1]
+
+        orig_shape = X.shape[:-1]
+        X_2d = X.reshape(-1, self.in_features)
+        B = X_2d.shape[0]
+        X_kn = X_2d.view(B, k, n)
+
+        T = torch.einsum("bkn,pjkln->bpjkl", X_kn, Z_q)
+        core = torch.einsum("pjkml,bpjkl->bpjkm", Y_q, T)
+
+        if self.quant_bias:
+            A = self.A.to(device=device, dtype=torch.float32)
+            a = A[..., 0].unsqueeze(0).unsqueeze(-1)
+            out1 = (core * a).sum(dim=(1, 3))
+
+            Y_sum = Y_q.sum(dim=-1)
+            b = A[..., 1]
+            B_coef = (b.unsqueeze(-1) * Y_sum).sum(dim=0)
+            Sx = X_kn.sum(dim=-1)
+            out2 = torch.einsum("bk,jkm->bjm", Sx, B_coef)
+
+            Zs = Z_q.sum(dim=-2)
+            Tz = torch.einsum("bkn,pjkn->bpjk", X_kn, Zs)
+            c = A[..., 2]
+            out3 = (Tz * c.unsqueeze(0)).sum(dim=(1, 3)).unsqueeze(-1).expand(-1, -1, m)
+
+            d = A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0)
+            D_coef = d[..., 0, 0]
+            out4 = torch.einsum("bk,jk->bj", Sx, D_coef).unsqueeze(-1).expand(-1, -1, m)
+
+            out_bjm = out1 + out2 + out3 + out4
+        else:
+            a = self.A.to(device=device, dtype=torch.float32).unsqueeze(0).unsqueeze(-1)
+            out_bjm = (core * a).sum(dim=(1, 3))
+
+        out_2d = out_bjm.reshape(B, self.out_features)
+        if self.bias is not None:
+            out_2d = out_2d + self.bias.to(out_2d.device, dtype=torch.float32)
+        out = out_2d.view(*orig_shape, self.out_features)
+        return out.to(dtype=input.dtype)
+
+
+class BQQLinearInference(nn.Module):
+    """Inference-optimized BQQ linear layer (no gradients, int8 signs + fp16 scales)."""
+
+    def __init__(self, Y_sign, Z_sign, Y_scale, Z_scale, A, bias=None,
+                 act_bits=None, quant_bias=True):
+        super().__init__()
+        self.Y_sign = nn.Parameter(Y_sign, requires_grad=False)
+        self.Z_sign = nn.Parameter(Z_sign, requires_grad=False)
+        self.Y_scale = nn.Parameter(Y_scale, requires_grad=False)
+        self.Z_scale = nn.Parameter(Z_scale, requires_grad=False)
+        self.quant_bias = quant_bias
+        self.A = nn.Parameter(A, requires_grad=False)
+        self.bias = nn.Parameter(bias, requires_grad=False) if bias is not None else None
+        self.act_bits = act_bits
+
+        p, j, k, m, l = Y_sign.shape
+        _, _, _, _, n = Z_sign.shape
+        self.p, self.j, self.k, self.m, self.l, self.n = p, j, k, m, l, n
+        self.in_features = k * n
+        self.out_features = j * m
+
+    @classmethod
+    def from_trained(cls, layer: BQQLinear, sign_dtype=torch.int8, scale_dtype=torch.float16):
+        device = layer.Y_fp.device
+        with torch.no_grad():
+            Y_fp = layer.Y_fp.detach().to(torch.float16)
+            Z_fp = layer.Z_fp.detach().to(torch.float16)
+            Y_scale = Y_fp.abs().mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8).to(scale_dtype)
+            Z_scale = Z_fp.abs().mean(dim=(-2, -1), keepdim=True).clamp_min(1e-8).to(scale_dtype)
+            Y_sign = torch.sign(Y_fp).to(sign_dtype)
+            Z_sign = torch.sign(Z_fp).to(sign_dtype)
+            A = layer.A.detach().to(scale_dtype).clone()
+            bias = layer.bias.detach().to(scale_dtype).clone() if layer.bias is not None else None
+            return cls(
+                Y_sign=Y_sign.to(device), Z_sign=Z_sign.to(device),
+                Y_scale=Y_scale.to(device), Z_scale=Z_scale.to(device),
+                A=A.to(device), bias=bias.to(device) if bias is not None else None,
+                act_bits=layer.act_bits, quant_bias=layer.quant_bias,
+            )
+
+    def forward(self, input):
+        orig_dtype = input.dtype
+        device = self.Y_sign.device
+        X = input.to(device=device, dtype=torch.float16)
+
+        Y_q = self.Y_sign.to(dtype=torch.float16) * self.Y_scale.to(dtype=torch.float16)
+        Z_q = self.Z_sign.to(dtype=torch.float16) * self.Z_scale.to(dtype=torch.float16)
+
+        p, j, k, m, l = Y_q.shape
+        n = Z_q.shape[-1]
+
+        orig_shape = X.shape[:-1]
+        X_2d = X.reshape(-1, self.in_features)
+        B = X_2d.shape[0]
+        X_kn = X_2d.view(B, k, n)
+
+        T = torch.einsum("bkn,pjkln->bpjkl", X_kn, Z_q)
+        core = torch.einsum("pjkml,bpjkl->bpjkm", Y_q, T)
+
+        if self.quant_bias:
+            A = self.A.to(dtype=torch.float16, device=device)
+            a = A[..., 0].unsqueeze(0).unsqueeze(-1)
+            out1 = (core * a).sum(dim=(1, 3))
+
+            Y_sum = Y_q.sum(dim=-1)
+            b = A[..., 1]
+            B_coef = (b.unsqueeze(-1) * Y_sum).sum(dim=0)
+            Sx = X_kn.sum(dim=-1)
+            out2 = torch.einsum("bk,jkm->bjm", Sx, B_coef)
+
+            Zs = Z_q.sum(dim=-2)
+            Tz = torch.einsum("bkn,pjkn->bpjk", X_kn, Zs)
+            c = A[..., 2]
+            out3 = (Tz * c.unsqueeze(0)).sum(dim=(1, 3)).unsqueeze(-1).expand(-1, -1, m)
+
+            d = A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0)
+            D_coef = d[..., 0, 0]
+            out4 = torch.einsum("bk,jk->bj", Sx, D_coef).unsqueeze(-1).expand(-1, -1, m)
+
+            out_bjm = out1 + out2 + out3 + out4
+        else:
+            a = self.A.to(dtype=torch.float16, device=device).unsqueeze(0).unsqueeze(-1)
+            out_bjm = (core * a).sum(dim=(1, 3))
+
+        out_2d = out_bjm.reshape(B, self.out_features)
+        if self.bias is not None:
+            out_2d = out_2d + self.bias.to(out_2d.device, dtype=torch.float16)
+        out = out_2d.view(*orig_shape, self.out_features)
+        return out.to(dtype=orig_dtype)
