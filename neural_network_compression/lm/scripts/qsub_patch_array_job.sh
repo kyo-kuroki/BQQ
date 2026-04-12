@@ -11,7 +11,7 @@
 #   CACHE_DIR         - directory with cached weight tensors (from prepare-cache)
 #   SAVE_DIR          - output directory for quantized weights
 #   SIF_PATH          - path to the Apptainer .sif image
-#   LM_SCRIPT_DIR     - absolute path to nn_compression/lm/
+#   LM_SCRIPT_DIR     - absolute path to neural_network_compression/lm/
 #   BIT_WIDTH         - quantization bit width (default: 2)
 #   GROUP_SIZE        - patch group size (default: 32)
 #   NUM_STEPS         - BFGS optimisation steps (default: 10000)

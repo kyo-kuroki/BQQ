@@ -1,4 +1,4 @@
-# nn_compression
+# neural_network_compression
 
 Tools for applying BQQ to pretrained neural networks.
 Supports weight-aware quantization, incremental bit-depth extension, model reconstruction, evaluation, and optional fine-tuning.
@@ -29,7 +29,7 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 Load the model once and save quantization-target weights to disk.
 
 ```bash
-cd nn_compression/lm
+cd neural_network_compression/lm
 
 python weight_aware_quant_cached.py prepare-cache \
     --model_name Qwen/Qwen3.5-2B \
@@ -83,7 +83,7 @@ Existing output files are skipped automatically, so interrupted jobs can be safe
 Block-wise quantization optimizes all continuous parameters in a transformer block (BQQ scale factors + unquantized Linear weights + LayerNorm) to minimize the block output error against the pretrained model. Each block is independent and can be processed in parallel.
 
 ```bash
-cd nn_compression/lm
+cd neural_network_compression/lm
 
 # Quantize a single block
 python block_wise_quant.py \
@@ -151,7 +151,7 @@ python weight_aware_quant_cached.py list-patches \
 `qsub_submit_qwen35.sh` automates all three steps (prepare-cache, list-targets, qsub) for Qwen3.5-2B/4B/9B.
 
 ```bash
-cd nn_compression/lm
+cd neural_network_compression/lm
 bash qsub_submit_qwen35.sh \
     --bit_width 2 \
     --walltime  8:00:00 \
@@ -176,7 +176,7 @@ Use `qsub_extend_array_job.sh` to submit residual-optimisation jobs.
 Pass env vars via `qsub -v`:
 
 ```bash
-SCRIPT_DIR=/path/to/nn_compression/lm
+SCRIPT_DIR=/path/to/neural_network_compression/lm
 MODEL=Qwen3.5-2B
 
 qsub -g tga-artic \
@@ -204,7 +204,7 @@ Resubmitting is always safe: targets with an existing `{target_name}.pth` are sk
 Refines the BQQ scale factors (a, b, c, d) per patch using Hessian-based optimization (closed-form ridge regression). Binary parameters Y, Z remain fixed. This is fast and does not require gradient-based optimization.
 
 ```bash
-cd nn_compression/lm
+cd neural_network_compression/lm
 
 # From a saved BQQ model
 python scale_refine_bqq.py \
@@ -243,7 +243,7 @@ Fine-tune a quantized model with three loss modes:
 | **KL only** | `--teacher_model_name ... --ce_alpha 0` | `kl_alpha * KL` |
 
 ```bash
-cd nn_compression/lm
+cd neural_network_compression/lm
 
 # Standard SFT
 python fine_tuning.py \
@@ -285,7 +285,7 @@ Output: `{output_dir}/trained_model.pth`
 ## CV workflow
 
 ```bash
-cd nn_compression/cv/bqq
+cd neural_network_compression/cv/bqq
 
 # Cache
 python weight_aware_quant_cached.py prepare-cache --model_name deit-s
@@ -307,7 +307,7 @@ python weight_aware_quant_cached.py prepare-cache --model_name deit-s
 ## Output directory layout
 
 ```
-nn_compression/lm/
+neural_network_compression/lm/
 ├── cache/<model>-layer<N>/
 │   ├── metadata.json
 │   ├── targets.txt

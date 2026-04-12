@@ -14,7 +14,7 @@
 #   SOURCE_DIR        - directory containing the existing N-bit patch files
 #   SAVE_DIR          - output directory for the extended quantization
 #   SIF_PATH          - path to the Apptainer .sif image
-#   LM_SCRIPT_DIR     - absolute path to nn_compression/lm/
+#   LM_SCRIPT_DIR     - absolute path to neural_network_compression/lm/
 #   EXTRA_BITS        - number of additional bits to optimise (default: 1)
 #   GROUP_SIZE        - patch group size (default: 32)
 #   NUM_STEPS         - BFGS optimisation steps (default: 10000)

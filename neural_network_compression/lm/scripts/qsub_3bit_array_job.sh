@@ -14,7 +14,7 @@
 #   CACHE_DIR          - directory with cached weight tensors
 #   SAVE_DIR           - directory for quantized patches (both source and output)
 #   SIF_PATH           - path to the Apptainer .sif image
-#   LM_SCRIPT_DIR      - absolute path to nn_compression/lm/
+#   LM_SCRIPT_DIR      - absolute path to neural_network_compression/lm/
 #   GROUP_SIZE, NUM_STEPS, RANK_SCALE, SEED, WORKERS_PER_GPU (optional, have defaults)
 
 set -euo pipefail

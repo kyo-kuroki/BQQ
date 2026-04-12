@@ -13,7 +13,7 @@ Each bit layer $b$ minimises the residual left by the previous layers, so **bit 
 BQQ/
 ├── quantizer.py                         # Core BQQ algorithms
 ├── matrix_compression/                  # Standalone matrix compression experiments
-└── nn_compression/
+└── neural_network_compression/
     ├── lm/                              # Language model quantization
     │   ├── weight_aware_quant_cached.py # Main entry point (prepare-cache / quantize-target / extend-target)
     │   ├── build_bqq_model.py  # Replace Linear→BinaryQuadratic, build model from patches or blocks
@@ -35,7 +35,7 @@ Set paths according to your environment:
 
 ```bash
 export BQQ_ROOT=/path/to/BQQ
-export LM_DIR=$BQQ_ROOT/nn_compression/lm
+export LM_DIR=$BQQ_ROOT/neural_network_compression/lm
 export HF_HOME=/path/to/hf_cache
 export SIF_PATH=/path/to/pytorch_llm_vllm.sif
 ```
