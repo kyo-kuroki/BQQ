@@ -4,8 +4,9 @@ NUM_GPUS=4
 declare -a PIDS
 GPU_INDEX=0
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LM_DIR="$(dirname "$SCRIPT_DIR")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
-MODEL_ROOT="${MODEL_ROOT:-$SCRIPT_DIR/quantized_model_data}"
+MODEL_ROOT="${MODEL_ROOT:-$LM_DIR/quantized_model_data}"
 
 
 # ======== for bqq models =======
@@ -43,7 +44,7 @@ for i in "${!MODEL_PATHS[@]}"; do
     echo "Running Model: $MODEL_NAME | Path: $MODEL_PATH | Device: $DEVICE"
     echo "=============================="
 
-    CUDA_VISIBLE_DEVICES=$GPU_INDEX "$PYTHON_BIN" "$SCRIPT_DIR/evaluation.py" --model_path "$MODEL_PATH" --model_name "$MODEL_NAME" &
+    CUDA_VISIBLE_DEVICES=$GPU_INDEX "$PYTHON_BIN" "$LM_DIR/evaluation.py" --model_path "$MODEL_PATH" --model_name "$MODEL_NAME" &
 
     PIDS+=($!)
 

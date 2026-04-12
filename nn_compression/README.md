@@ -11,9 +11,9 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 |------|-------------|
 | `lm/weight_aware_quant_cached.py` | Cache-first weight quantization for LMs (main entry point) |
 | `lm/weight_aware_quant.py` | Original (non-cached) weight-aware quantization |
-| `lm/qsub_submit_qwen35.sh` | Submit N-bit quantization array jobs on TSUBAME (Qwen3.5-2B/4B/9B) |
-| `lm/qsub_patch_array_job.sh` | SGE array job body for `quantize-target` (1 task = 1 weight tensor) |
-| `lm/qsub_extend_array_job.sh` | SGE array job body for `extend-target` (1 task = 1 weight tensor) |
+| `lm/scripts/qsub_submit_qwen35.sh` | Submit N-bit quantization array jobs on TSUBAME (Qwen3.5-2B/4B/9B) |
+| `lm/scripts/qsub_patch_array_job.sh` | SGE array job body for `quantize-target` (1 task = 1 weight tensor) |
+| `lm/scripts/qsub_extend_array_job.sh` | SGE array job body for `extend-target` (1 task = 1 weight tensor) |
 | `lm/block_wise_quant.py` | Block-wise quantization with block output error optimization |
 | `lm/build_bqq_model.py` | Replace Linear→BinaryQuadratic, build model from patches or blocks |
 | `lm/scale_refine_bqq.py` | Hessian-based scale factor refinement (post-quantization) |

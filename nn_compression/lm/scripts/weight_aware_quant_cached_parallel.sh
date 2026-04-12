@@ -3,6 +3,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LM_DIR="$(dirname "$SCRIPT_DIR")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 MODEL_NAME="Qwen/Qwen2.5-1.5B"
@@ -144,7 +145,7 @@ fi
 
 PREPARE_CMD=(
     "$PYTHON_BIN"
-    "$SCRIPT_DIR/weight_aware_quant_cached.py"
+    "$LM_DIR/weight_aware_quant_cached.py"
     prepare-cache
     --model_name "$MODEL_NAME"
     --layer_threshold "$LAYER_THRESHOLD"
@@ -160,7 +161,7 @@ echo "Preparing cache in $CACHE_DIR"
 
 mapfile -t PATCH_JOBS < <(
     "$PYTHON_BIN" \
-    "$SCRIPT_DIR/weight_aware_quant_cached.py" \
+    "$LM_DIR/weight_aware_quant_cached.py" \
     list-patches \
     --cache_dir "$CACHE_DIR" \
     --group_size "$GROUP_SIZE"
@@ -190,7 +191,7 @@ for index in "${!PATCH_JOBS[@]}"; do
 
     QUANTIZE_CMD=(
         "$PYTHON_BIN"
-        "$SCRIPT_DIR/weight_aware_quant_cached.py"
+        "$LM_DIR/weight_aware_quant_cached.py"
         quantize-target
         --cache_dir "$CACHE_DIR"
         --target_name "$target_name"

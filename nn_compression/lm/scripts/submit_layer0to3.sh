@@ -8,9 +8,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LM_DIR="$(dirname "$SCRIPT_DIR")"
 SIF_PATH="/gs/bs/tga-artic/tmp/tsubame-handson/containers/pytorch_llm_vllm.sif"
 JOB_SCRIPT="${SCRIPT_DIR}/qsub_patch_array_job.sh"
-BQQ_ROOT="$(dirname "$(dirname "${SCRIPT_DIR}")")"
+BQQ_ROOT="$(dirname "$(dirname "${LM_DIR}")")"
 HF_HOME="/gs/bs/tga-artic/k-kuroki/hf_cache"
 
 BIT_WIDTH=2
@@ -43,7 +44,7 @@ run_in_container() {
         --bind "${HF_HOME}:${HF_HOME}" \
         --env  "HF_HOME=${HF_HOME}" \
         --env  "OPENBLAS_NUM_THREADS=1" \
-        --pwd  "${SCRIPT_DIR}" \
+        --pwd  "${LM_DIR}" \
         "${SIF_PATH}" \
         "$@"
 }
@@ -54,9 +55,9 @@ declare -a SUBMITTED_JOBS=()
 
 for MODEL_NAME in "${MODELS[@]}"; do
     MODEL_BASENAME="${MODEL_NAME##*/}"
-    CACHE_DIR="${SCRIPT_DIR}/cache/${MODEL_BASENAME}-layer0to3"
-    SAVE_DIR="${SCRIPT_DIR}/bqq_compressed_data/${MODEL_BASENAME}-${GROUP_SIZE}gs-${NUM_STEPS}step"
-    JOB_DIR="${SCRIPT_DIR}/qsub_jobs/${MODEL_BASENAME}-bit${BIT_WIDTH}-gs${GROUP_SIZE}-layer0to3"
+    CACHE_DIR="${LM_DIR}/cache/${MODEL_BASENAME}-layer0to3"
+    SAVE_DIR="${LM_DIR}/bqq_compressed_data/${MODEL_BASENAME}-${GROUP_SIZE}gs-${NUM_STEPS}step"
+    JOB_DIR="${LM_DIR}/qsub_jobs/${MODEL_BASENAME}-bit${BIT_WIDTH}-gs${GROUP_SIZE}-layer0to3"
     TARGETS_LIST_FILE="${JOB_DIR}/targets.txt"
     LOG_DIR="${JOB_DIR}/logs"
 
@@ -105,7 +106,7 @@ for MODEL_NAME in "${MODELS[@]}"; do
     QSUB_VARS+=",CACHE_DIR=${CACHE_DIR}"
     QSUB_VARS+=",SAVE_DIR=${SAVE_DIR}"
     QSUB_VARS+=",SIF_PATH=${SIF_PATH}"
-    QSUB_VARS+=",LM_SCRIPT_DIR=${SCRIPT_DIR}"
+    QSUB_VARS+=",LM_SCRIPT_DIR=${LM_DIR}"
     QSUB_VARS+=",BIT_WIDTH=${BIT_WIDTH}"
     QSUB_VARS+=",GROUP_SIZE=${GROUP_SIZE}"
     QSUB_VARS+=",NUM_STEPS=${NUM_STEPS}"

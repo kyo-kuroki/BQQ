@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BQQ_ROOT="$(dirname "$(dirname "$SCRIPT_DIR")")"
+LM_DIR="$(dirname "$SCRIPT_DIR")"
+BQQ_ROOT="$(dirname "$(dirname "$LM_DIR")")"
 SIF_PATH="/gs/bs/tga-artic/tmp/tsubame-handson/containers/pytorch_llm_vllm.sif"
 
 submit_job() {
@@ -32,25 +33,25 @@ submit_job() {
         -v CACHE_DIR="$CACHE_DIR" \
         -v SAVE_DIR="$SAVE_DIR" \
         -v SIF_PATH="$SIF_PATH" \
-        -v LM_SCRIPT_DIR="$SCRIPT_DIR" \
+        -v LM_SCRIPT_DIR="$LM_DIR" \
         "$SCRIPT_DIR/qsub_batch_3bit_job.sh"
 }
 
 # --- Qwen3.5-4B ---
 submit_job "4B" \
-    "$SCRIPT_DIR/cache/Qwen3.5-4B-layer4" \
-    "$SCRIPT_DIR/bqq_compressed_data/Qwen3.5-4B-32gs-10000step" \
-    "$SCRIPT_DIR/qsub_jobs/Qwen3.5-4B-bit3-gs32/remaining_targets.txt" \
+    "$LM_DIR/cache/Qwen3.5-4B-layer4" \
+    "$LM_DIR/bqq_compressed_data/Qwen3.5-4B-32gs-10000step" \
+    "$LM_DIR/qsub_jobs/Qwen3.5-4B-bit3-gs32/remaining_targets.txt" \
     "bqq3b_4B" \
-    "$SCRIPT_DIR/qsub_jobs/Qwen3.5-4B-bit3-gs32/logs"
+    "$LM_DIR/qsub_jobs/Qwen3.5-4B-bit3-gs32/logs"
 
 # --- Qwen3.5-9B ---
 submit_job "9B" \
-    "$SCRIPT_DIR/cache/Qwen3.5-9B-layer0" \
-    "$SCRIPT_DIR/bqq_compressed_data/Qwen3.5-9B-32gs-10000step" \
-    "$SCRIPT_DIR/qsub_jobs/Qwen3.5-9B-bit3-gs32/remaining_targets.txt" \
+    "$LM_DIR/cache/Qwen3.5-9B-layer0" \
+    "$LM_DIR/bqq_compressed_data/Qwen3.5-9B-32gs-10000step" \
+    "$LM_DIR/qsub_jobs/Qwen3.5-9B-bit3-gs32/remaining_targets.txt" \
     "bqq3b_9B" \
-    "$SCRIPT_DIR/qsub_jobs/Qwen3.5-9B-bit3-gs32/logs"
+    "$LM_DIR/qsub_jobs/Qwen3.5-9B-bit3-gs32/logs"
 
 echo ""
 echo "All jobs submitted."
