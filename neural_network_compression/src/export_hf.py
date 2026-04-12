@@ -152,21 +152,34 @@ BQQModelForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 '''
 
 
-def export_for_hf(bqq_model, base_model_name, output_dir, save_tokenizer=True):
+def default_hf_output_dir(base_model_name, bqq_layers):
+    """Generate default output path: bqq/{ModelName}-{N}bit"""
+    model_basename = base_model_name.rstrip("/").split("/")[-1]
+    if bqq_layers:
+        bit_width = next(iter(bqq_layers.values()))['bit_width']
+    else:
+        bit_width = 0
+    return Path("bqq") / f"{model_basename}-{bit_width}bit"
+
+
+def export_for_hf(bqq_model, base_model_name, output_dir=None, save_tokenizer=True):
     """
     Export a BQQ model to HuggingFace-compatible directory.
 
     Args:
         bqq_model: Model with BinaryQuadratic modules (from build_bqq_model or block_wise_quant)
         base_model_name: Original HuggingFace model name (e.g. "Qwen/Qwen3-2B")
-        output_dir: Directory to save the exported model
+        output_dir: Directory to save. If None, defaults to bqq/{ModelName}-{N}bit
         save_tokenizer: Whether to copy tokenizer files from base model
     """
+    bqq_layers_meta = _collect_bqq_metadata(bqq_model)
+    if output_dir is None:
+        output_dir = default_hf_output_dir(base_model_name, bqq_layers_meta)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Collect BQQ layer metadata
-    bqq_layers = _collect_bqq_metadata(bqq_model)
+    # 1. BQQ layer metadata (already collected for default path)
+    bqq_layers = bqq_layers_meta
     print(f"Found {len(bqq_layers)} BinaryQuadratic layers")
 
     # 2. Build config

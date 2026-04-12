@@ -192,7 +192,7 @@ def assemble_from_blocks(model_name, block_dir, output_dir=None):
 # Export to HuggingFace format
 # ---------------------------------------------------------------------------
 
-def export_hf(bqq_model_path, model_name, output_dir):
+def export_hf(bqq_model_path, model_name, output_dir=None):
     """Export a BQQ .pth model to HuggingFace format (trust_remote_code)."""
     from export_hf import export_for_hf
 
@@ -231,8 +231,8 @@ def main():
                        help="Base HuggingFace model name (e.g. Qwen/Qwen3-2B)")
     p_hf.add_argument("--bqq_model", type=Path, required=True,
                        help="Path to BQQ .pth model file")
-    p_hf.add_argument("--output_dir", type=Path, required=True,
-                       help="Output directory for HuggingFace model")
+    p_hf.add_argument("--output_dir", type=Path, default=None,
+                       help="Output directory (default: bqq/{ModelName}-{N}bit)")
 
     args = parser.parse_args()
 
