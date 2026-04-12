@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
-from scipy.linalg import hadamard
 
 
 # ---------------------------------------------------------------------------
@@ -44,46 +43,6 @@ class BinaryQuadratic(nn.Module):
             return X.to(device) @ W.T
         else:
             return X.to(device) @ W.T + self.bias.type(dtype).to(device)
-
-    def get_weight(self, dtype=torch.float32):
-        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
-        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
-        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
-        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
-        W = W.sum(dim=0) + self.d.type(dtype)
-        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
-        return W
-
-
-class HadamardBinaryQuadratic(nn.Module):
-    """BQQ layer with Hadamard transform applied to the weight matrix."""
-
-    def __init__(self, Y, Z, A, bias=None):
-        super().__init__()
-        self.bit_width, self.row_width, self.col_width, self.y_row, self.inter_dimension = Y.shape
-        _, _, _, _, self.z_col = Z.shape
-
-        self.register_buffer("Y", (Y > 0.5))
-        self.register_buffer("Z", (Z > 0.5))
-        self.a = nn.Parameter(A[..., 0].unsqueeze(-1).unsqueeze(-1).clone())
-        self.b = nn.Parameter(A[..., 1].unsqueeze(-1).unsqueeze(-1).clone())
-        self.c = nn.Parameter(A[..., 2].unsqueeze(-1).unsqueeze(-1).clone())
-        self.d = nn.Parameter(A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0))
-        self.bias = nn.Parameter(bias) if bias is not None else None
-
-    def forward(self, X):
-        dtype = X.dtype
-        device = self.Y.device
-        W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))
-        Y_sum = self.Y.sum(dim=-1, keepdim=True).type(dtype)
-        Z_sum = self.Z.sum(dim=-2, keepdim=True).type(dtype)
-        W = self.a.type(dtype) * W_core + self.b.type(dtype) * Y_sum + self.c.type(dtype) * Z_sum
-        W = W.sum(dim=0) + self.d.type(dtype)
-        W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
-        if self.bias is None:
-            return X.to(device) @ torch.from_numpy(hadamard(W.shape[1])).float().to(device) @ W.T
-        else:
-            return X.to(device) @ torch.from_numpy(hadamard(W.shape[1])).float().to(device) @ W.T + self.bias.type(dtype).to(device)
 
     def get_weight(self, dtype=torch.float32):
         W_core = torch.matmul(self.Y.type(dtype), self.Z.type(dtype))

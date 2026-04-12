@@ -17,7 +17,6 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from bqq_modules import (  # noqa: F401
     BinaryQuadratic,
-    HadamardBinaryQuadratic,
     get_matrices,
     merge_binary_quadratic,
     merge_binaryquadratic_recursive,
@@ -69,30 +68,6 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=Non
     return model
 
 
-def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix='', patch_index=None):
-    if patch_index is None:
-        patch_index = build_consolidated_index(weights_dir) or build_patch_index(weights_dir)
-
-    for name, module in model.named_children():
-        full_name = f"{prefix}.{name}" if prefix else name
-
-        if 'head' in full_name:
-            print(f"Skipping {full_name}")
-            continue
-
-        if isinstance(module, nn.Linear):
-            weight_key = f"{full_name}.weight"
-            matrices = _load_layer_matrices(weight_key, patch_index, bit_width, map_location=module.weight.device)
-            if matrices is None:
-                continue
-
-            A, Y, Z = matrices
-            bqq = HadamardBinaryQuadratic(Y, Z, A, bias=module.bias)
-            setattr(model, name, bqq)
-        else:
-            replace_linear_with_hbqq(module, weights_dir, bit_width, prefix=full_name, patch_index=patch_index)
-
-    return model
 
 
 def replace_weight(model, weights_dir, bit_width):

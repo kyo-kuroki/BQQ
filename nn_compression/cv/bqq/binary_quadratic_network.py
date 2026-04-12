@@ -13,7 +13,6 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 from bqq_modules import (  # noqa: F401
     BinaryQuadratic,
-    HadamardBinaryQuadratic,
     BQQLinear,
     BQQLinearInference,
     SymQuantSTE,
@@ -60,39 +59,3 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='', device=Non
     return model
 
 
-def replace_linear_with_hbqq(model, weights_dir, bit_width, prefix=''):
-    """Replace Linear layers with HadamardBinaryQuadratic."""
-    for name, module in model.named_children():
-        full_name = f"{prefix}.{name}" if prefix else name
-
-        if 'head' in full_name:
-            print(f"Skipping {full_name}")
-            continue
-
-        if isinstance(module, nn.Linear):
-            weight_list = _load_patches_from_dir(weights_dir, full_name, device=module.weight.device)
-            A, Y, Z = get_matrices(weight_list, bit_width=bit_width)
-            bqq = HadamardBinaryQuadratic(Y, Z, A, bias=module.bias)
-            setattr(model, name, bqq)
-        else:
-            replace_linear_with_hbqq(module, weights_dir, bit_width, prefix=full_name)
-
-    return model
-
-
-def replace_weight(model, weights_dir, bit_width):
-    for name, param in model.named_parameters():
-        if 'head' in name:
-            print(f"Skipping {name}")
-            continue
-
-        if 'norm' not in name and 'bias' in name:
-            print(f"Replacing {name}")
-            print('weight shape:', param.shape)
-
-            weight_list = _load_patches_from_dir(weights_dir, name, device=param.device)
-            A, Y, Z = get_matrices(weight_list, bit_width=bit_width)
-            bqq = BinaryQuadratic(Y, Z, A, bias=None)
-            param.data.copy_(bqq.get_weight())
-
-    return model
