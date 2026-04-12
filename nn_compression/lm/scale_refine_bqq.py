@@ -202,13 +202,30 @@ def refine_patch(
     Phi = torch.stack(G_cols, dim=1)
     rhs = R_S.reshape(-1, 1)
 
-    # One-shot least-squares solve  (Newton step = exact solution for quadratic)
-    try:
-        sol = torch.linalg.lstsq(Phi, rhs, rcond=None).solution  # (n_params, 1)
-    except Exception:
-        return False
+    # Solve via Tikhonov regularization (ridge regression):
+    #   theta = (Phi^T Phi + lambda I)^{-1} Phi^T rhs
+    # This always produces a finite, bounded solution even when Phi is
+    # rank-deficient.  Start with a small lambda and increase adaptively
+    # until the solution is numerically stable.
+    PtP = Phi.T @ Phi          # (n_params, n_params)
+    Ptr = Phi.T @ rhs          # (n_params, 1)
+    mean_diag = PtP.diagonal().mean().item()
 
-    theta = sol.squeeze(1)  # (n_params,)
+    theta = None
+    for reg_scale in [1e-6, 1e-4, 1e-2, 1e-1]:
+        try:
+            lam = reg_scale * mean_diag
+            A = PtP + lam * torch.eye(PtP.shape[0], device=device, dtype=dtype)
+            sol = torch.linalg.solve(A, Ptr)  # (n_params, 1)
+            t = sol.squeeze(1)
+            if t.isfinite().all():
+                theta = t
+                break
+        except Exception:
+            continue
+
+    if theta is None:
+        return False
 
     # Write refined parameters back in-place
     with torch.no_grad():
