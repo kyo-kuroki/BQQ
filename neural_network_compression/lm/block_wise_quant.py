@@ -158,6 +158,9 @@ def run_block_forward(block, inp, device):
             kwargs[k] = v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype)
         else:
             kwargs[k] = v
+    # Prevent KV cache / SSM state from persisting across forward calls,
+    # which causes "backward through the graph a second time" errors.
+    kwargs['use_cache'] = False
     output = block(hidden_states, **kwargs)
     return output[0] if isinstance(output, tuple) else output
 
@@ -255,7 +258,9 @@ def quantize_block(
     print(f'  Cached {len(inputs_cache)} samples')
 
     # Deep-copy target block and free the full model
-    block = copy.deepcopy(model.model.layers[block_idx])
+    # Convert to float32 to avoid dtype mismatch when mixing
+    # BinaryQuadratic (float32) with remaining bfloat16 Linears
+    block = copy.deepcopy(model.model.layers[block_idx]).float()
     del model
     torch.cuda.empty_cache()
 
