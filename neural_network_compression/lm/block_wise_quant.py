@@ -201,6 +201,9 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
     Optimize all trainable parameters in block to minimize
     ||block(cached_input) - pretrained_output||^2.
 
+    Keeps the best parameter state (lowest epoch MSE) and restores it
+    at the end, so gradient explosions at later epochs are harmless.
+
     Trainable params include:
       - BinaryQuadratic: a, b, c, d (scale factors), bias
       - Unquantized Linear: weight, bias
@@ -216,6 +219,9 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
           f'lr={lr}, epochs={epochs}, max_grad_norm={max_grad_norm}')
 
     optimizer = torch.optim.AdamW(params, lr=lr)
+
+    best_mse = float('inf')
+    best_state = None
 
     for epoch in range(epochs):
         total_loss = 0.0
@@ -233,7 +239,17 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
             total_loss += loss.item()
 
         avg = total_loss / len(inputs_cache)
-        print(f'    Epoch {epoch + 1}/{epochs}: MSE={avg:.6f}')
+        if avg < best_mse:
+            best_mse = avg
+            best_state = {k: v.cpu().clone() for k, v in block.state_dict().items()}
+        print(f'    Epoch {epoch + 1}/{epochs}: MSE={avg:.6f}'
+              f'{" *" if avg <= best_mse else ""}')
+
+    # Restore best parameters
+    if best_state is not None:
+        block.load_state_dict(best_state)
+        block.to(device)
+        print(f'    Restored best epoch (MSE={best_mse:.6f})')
 
 
 # ---------------------------------------------------------------------------
