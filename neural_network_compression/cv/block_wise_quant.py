@@ -147,14 +147,14 @@ def compute_block_mse(block, inputs_cache, targets_cache, device):
 
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
-                          epochs, lr, device):
+                          epochs, lr, device, max_grad_norm=1.0):
     """Optimize all trainable params to minimize block output MSE."""
     block.to(device).eval()
 
     params = [p for p in block.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
     print(f'    Optimizing {len(params)} param groups ({n_params:,} elements), '
-          f'lr={lr}, epochs={epochs}')
+          f'lr={lr}, epochs={epochs}, max_grad_norm={max_grad_norm}')
 
     optimizer = torch.optim.AdamW(params, lr=lr)
 
@@ -168,6 +168,7 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
                 loss = ((output - target.to(device)) ** 2).mean()
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 optimizer.step()
             total_loss += loss.item()
 
@@ -191,6 +192,7 @@ def quantize_block(
     seed,
     epochs,
     lr,
+    max_grad_norm=1.0,
     device,
     save_dir,
 ):
@@ -239,7 +241,7 @@ def quantize_block(
 
         optimize_block_params(
             block, inputs_cache, targets_cache,
-            epochs=epochs, lr=lr, device=dev,
+            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
         )
 
         mse_after = compute_block_mse(block, inputs_cache, targets_cache, dev)
@@ -282,6 +284,8 @@ def main():
                         help='Number of calibration images')
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='Max gradient norm for clipping (0 to disable)')
 
     parser.add_argument('--data_path', type=str, default=None,
                         help='Path to ImageNet. Falls back to IMAGENET_DIR env var.')
@@ -307,6 +311,7 @@ def main():
         seed=args.seed,
         epochs=args.epochs,
         lr=args.lr,
+        max_grad_norm=args.max_grad_norm,
         device=args.device,
         save_dir=args.save_dir,
     )

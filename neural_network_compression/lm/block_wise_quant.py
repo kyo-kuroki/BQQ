@@ -43,6 +43,28 @@ from model_loader import load_causal_lm
 # Block I/O caching
 # ---------------------------------------------------------------------------
 
+def _detach_to_cpu(v):
+    """Recursively detach and move tensors to CPU (handles tuples/lists)."""
+    if isinstance(v, torch.Tensor):
+        return v.detach().cpu()
+    elif isinstance(v, tuple):
+        return tuple(_detach_to_cpu(x) for x in v)
+    elif isinstance(v, list):
+        return [_detach_to_cpu(x) for x in v]
+    return v
+
+
+def _to_device_dtype(v, device, dtype):
+    """Recursively move tensors to device/dtype (handles tuples/lists)."""
+    if isinstance(v, torch.Tensor):
+        return v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype)
+    elif isinstance(v, tuple):
+        return tuple(_to_device_dtype(x, device, dtype) for x in v)
+    elif isinstance(v, list):
+        return [_to_device_dtype(x, device, dtype) for x in v]
+    return v
+
+
 @torch.no_grad()
 def cache_block_io(model, block_idx, dataloader, device):
     """
@@ -63,7 +85,7 @@ def cache_block_io(model, block_idx, dataloader, device):
     def capture_input(module, args, kwargs):
         cached = {'hidden_states': args[0].detach().cpu()}
         for k, v in kwargs.items():
-            cached[k] = v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            cached[k] = _detach_to_cpu(v)
         inputs_cache.append(cached)
 
     def capture_output(module, args, kwargs, output):
@@ -154,13 +176,10 @@ def run_block_forward(block, inp, device):
     for k, v in inp.items():
         if k == 'hidden_states':
             continue
-        if isinstance(v, torch.Tensor):
-            kwargs[k] = v.to(device=device, dtype=dtype if v.is_floating_point() else v.dtype)
-        else:
-            kwargs[k] = v
-    # Prevent KV cache / SSM state from persisting across forward calls,
-    # which causes "backward through the graph a second time" errors.
+        kwargs[k] = _to_device_dtype(v, device, dtype)
+    # Prevent KV cache / SSM state from persisting across forward calls.
     kwargs['use_cache'] = False
+    kwargs.pop('past_key_values', None)
     output = block(hidden_states, **kwargs)
     return output[0] if isinstance(output, tuple) else output
 
@@ -177,7 +196,7 @@ def compute_block_mse(block, inputs_cache, targets_cache, device):
 
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
-                          epochs, lr, device):
+                          epochs, lr, device, max_grad_norm=1.0):
     """
     Optimize all trainable parameters in block to minimize
     ||block(cached_input) - pretrained_output||^2.
@@ -194,7 +213,7 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
     params = [p for p in block.parameters() if p.requires_grad]
     n_params = sum(p.numel() for p in params)
     print(f'    Optimizing {len(params)} param groups ({n_params:,} elements), '
-          f'lr={lr}, epochs={epochs}')
+          f'lr={lr}, epochs={epochs}, max_grad_norm={max_grad_norm}')
 
     optimizer = torch.optim.AdamW(params, lr=lr)
 
@@ -208,6 +227,7 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
 
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 optimizer.step()
 
             total_loss += loss.item()
@@ -232,6 +252,7 @@ def quantize_block(
     seed,
     epochs,
     lr,
+    max_grad_norm=1.0,
     device,
     save_dir,
 ):
@@ -300,7 +321,7 @@ def quantize_block(
         # c. Optimize continuous params
         optimize_block_params(
             block, inputs_cache, targets_cache,
-            epochs=epochs, lr=lr, device=dev,
+            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
         )
 
         mse_after = compute_block_mse(block, inputs_cache, targets_cache, dev)
@@ -351,6 +372,8 @@ def main():
     # Optimization
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--max_grad_norm', type=float, default=1.0,
+                        help='Max gradient norm for clipping (0 to disable)')
 
     # Device / output
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -381,6 +404,7 @@ def main():
         seed=args.seed,
         epochs=args.epochs,
         lr=args.lr,
+        max_grad_norm=args.max_grad_norm,
         device=args.device,
         save_dir=args.save_dir,
     )

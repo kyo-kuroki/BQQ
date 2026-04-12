@@ -20,6 +20,12 @@ except ImportError:
     from compressed_data import BQQ_ROOT, default_results_dir
     from datautils import get_wikitext2_testloader
 
+# Ensure bqq_modules is importable (needed for torch.load of BQQ models)
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+if _src_dir not in sys.path:
+    sys.path.insert(0, _src_dir)
+import bqq_modules  # noqa: F401
+
 
 WORKSPACE_ROOT = BQQ_ROOT.parent
 

@@ -177,6 +177,11 @@ def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None,
 
     print(f"Replaced {replaced}/{num_layers} blocks")
 
+    # Unify dtype to bfloat16 — blockwise blocks are saved in float32
+    # (for training precision) but BinaryQuadratic.forward() casts to
+    # input dtype, so bfloat16 works for inference and saves memory.
+    model = model.bfloat16()
+
     model_id = model_basename(model_name)
     suffix = "-blockwise"
     if bit_width is not None and group_size is not None:
