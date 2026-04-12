@@ -3,21 +3,21 @@ __pycache__/
 *.pyc
 *.pt
 *.pth
-bqq_compressed_data/
-bqq_acc/
-quantized_bqq_model/
-bcq/
-uq/
-results/
-/lm/
+
+# LM data/output directories
 neural_network_compression/lm/bqq_compressed_data/
 neural_network_compression/lm/quantized_model_data/
+neural_network_compression/lm/blockwise_output/
 neural_network_compression/lm/results/
 neural_network_compression/lm/cache/
+neural_network_compression/lm/fine_tuned_models/
 neural_network_compression/lm/qsub_jobs/*/logs/
 neural_network_compression/lm/qsub_jobs/*/patches.tsv
 neural_network_compression/lm/qsub_jobs/*-layer*to*/
-neural_network_compression/cv/bqq/cache/
-neural_network_compression/cv/bqq/bqq_compressed_data/
-neural_network_compression/cv/bqq/quantized_bqq_model/
-neural_network_compression/cv/bqq/results/
+
+# CV data/output directories
+neural_network_compression/cv/bqq_compressed_data/
+neural_network_compression/cv/quantized_bqq_model/
+neural_network_compression/cv/blockwise_output/
+neural_network_compression/cv/results/
+neural_network_compression/cv/cache/
