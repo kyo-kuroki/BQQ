@@ -189,25 +189,63 @@ def assemble_from_blocks(model_name, block_dir, output_dir=None):
 
 
 # ---------------------------------------------------------------------------
+# Export to HuggingFace format
+# ---------------------------------------------------------------------------
+
+def export_hf(bqq_model_path, model_name, output_dir):
+    """Export a BQQ .pth model to HuggingFace format (trust_remote_code)."""
+    from export_hf import export_for_hf
+
+    print(f"Loading BQQ model from {bqq_model_path}")
+    bqq_model = torch.load(bqq_model_path, map_location="cpu", weights_only=False)
+    export_for_hf(bqq_model, model_name, output_dir)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Build a BQQ language model from patches or blocks")
-    parser.add_argument("--model_name", type=str, required=True)
-    parser.add_argument("--bit_widths", type=int, nargs="+", default=[2, 3, 4])
-    parser.add_argument("--group_size", type=int, default=128)
-    parser.add_argument("--num_steps", type=int, default=50000)
-    parser.add_argument("--compressed_data_dir", type=Path, default=None)
-    parser.add_argument("--output_dir", type=Path, default=None)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--block_dir", type=Path, default=None,
-                        help="Directory containing block_*.pth files (block-wise assembly mode)")
+    sub = parser.add_subparsers(dest="command")
+
+    # --- build (default, backward-compat) ---
+    p_build = sub.add_parser("build", help="Build BQQ model from compressed patches")
+    p_build.add_argument("--model_name", type=str, required=True)
+    p_build.add_argument("--bit_widths", type=int, nargs="+", default=[2, 3, 4])
+    p_build.add_argument("--group_size", type=int, default=128)
+    p_build.add_argument("--num_steps", type=int, default=50000)
+    p_build.add_argument("--compressed_data_dir", type=Path, default=None)
+    p_build.add_argument("--output_dir", type=Path, default=None)
+    p_build.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+
+    # --- assemble ---
+    p_asm = sub.add_parser("assemble", help="Assemble model from block_*.pth files")
+    p_asm.add_argument("--model_name", type=str, required=True)
+    p_asm.add_argument("--block_dir", type=Path, required=True)
+    p_asm.add_argument("--output_dir", type=Path, default=None)
+
+    # --- export-hf ---
+    p_hf = sub.add_parser("export-hf", help="Export BQQ model to HuggingFace format")
+    p_hf.add_argument("--model_name", type=str, required=True,
+                       help="Base HuggingFace model name (e.g. Qwen/Qwen3-2B)")
+    p_hf.add_argument("--bqq_model", type=Path, required=True,
+                       help="Path to BQQ .pth model file")
+    p_hf.add_argument("--output_dir", type=Path, required=True,
+                       help="Output directory for HuggingFace model")
+
     args = parser.parse_args()
 
-    if args.block_dir is not None:
+    if args.command == "assemble":
         assemble_from_blocks(model_name=args.model_name, block_dir=args.block_dir, output_dir=args.output_dir)
-    else:
+
+    elif args.command == "export-hf":
+        export_hf(args.bqq_model, args.model_name, args.output_dir)
+
+    else:  # build (default)
+        if not hasattr(args, 'model_name') or args.model_name is None:
+            parser.print_help()
+            return
         compressed_data_dir = args.compressed_data_dir
         if compressed_data_dir is None:
             compressed_data_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
