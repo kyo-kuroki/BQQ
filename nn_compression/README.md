@@ -194,27 +194,6 @@ EXTRA_BITS=1,GROUP_SIZE=32,NUM_STEPS=10000,WORKERS_PER_GPU=384" \
     qsub_extend_array_job.sh
 ```
 
-### TSUBAME-specific notes
-
-**Always specify `-g tga-artic`.** Without it, TSUBAME runs in trial mode (walltime capped at 3 minutes).
-
-**Walltime is per task, not per array.** Each SGE task covers one weight tensor.
-8 hours (`8:00:00`) is recommended; 4 hours may be too short for large matrices.
-
-**`workers_per_gpu` effective ceiling is 384.** TSUBAME4 nodes have 384 CPU threads; values above 384 have no effect with `gpu_1=1`.
-
-### Monitoring and resubmission
-
-```bash
-# Job status
-qstat -u $USER
-
-# Completion count (excludes patch files)
-SAVEDIR=bqq_compressed_data/Qwen3.5-9B-32gs-10000step
-ls "$SAVEDIR" | grep -v "_row" | wc -l
-wc -l < qsub_jobs/Qwen3.5-9B-bit2-gs32/targets.txt
-```
-
 Resubmitting is always safe: targets with an existing `{target_name}.pth` are skipped immediately, and targets with partial `_rowX_colY.pth` patch files resume from where they left off.
 
 ---
