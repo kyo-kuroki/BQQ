@@ -1,112 +1,152 @@
-import torch
-from pathlib import Path
-import sys
+"""
+Fine-tune a quantized BQQ vision model.
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-CV_DIR = SCRIPT_DIR.parent
-BQQ_ROOT = CV_DIR.parent.parent
-UTILS_DIR = CV_DIR / "utils"
+Modes:
+  - CE only (default): standard classification cross-entropy loss
+  - CE + KL distillation (--teacher_model_name): adds KL divergence loss
+    against a teacher model's logits
+  - KL only (--teacher_model_name + --ce_alpha 0): pure distillation
 
-for path in (BQQ_ROOT, UTILS_DIR):
-    path_str = str(path)
-    if path_str not in sys.path:
-        sys.path.insert(0, path_str)
+Usage:
+  # CE only
+  python fine_tuning.py --model_name deit-s --model_path model.pth
 
-from build_dataset import get_imagenet
+  # CE + KL distillation
+  python fine_tuning.py --model_name deit-s --model_path model.pth \
+    --teacher_model_name deit-s --kl_alpha 1.0 --kl_temperature 2.0
+
+  # KL only
+  python fine_tuning.py --model_name deit-s --model_path model.pth \
+    --teacher_model_name deit-s --ce_alpha 0 --kl_alpha 1.0
+"""
+
+import argparse
 import os
-from utils import test_model_accuracy
+import sys
+from pathlib import Path
+
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+CV_DIR = SCRIPT_DIR.parent
+UTILS_DIR = CV_DIR / "utils"
+
+for path in (str(CV_DIR.parent.parent), str(UTILS_DIR)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+from build_dataset import get_imagenet
+from build_model import get_model
+from utils import test_model_accuracy
+
+
 def fine_tuning(args):
-    # ---------------------------
-    # 1. Load model
-    # ---------------------------
+    # --- 1. Load quantized model ---
     if args.model_path is not None:
         model = torch.load(args.model_path, map_location=args.device, weights_only=False)
     else:
-        if args.fine_tuned_model:
-            model_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq-finetuned.pth"
-        else:
-            model_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq.pth"
-
+        model_path = SCRIPT_DIR / "quantized_bqq_model" / \
+            f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.Nstep}step-bqq.pth"
         model = torch.load(model_path, map_location=args.device, weights_only=False)
     model.to(args.device)
     model.train()
 
-    # ---------------------------
-    # 2. Datasets
-    # ---------------------------
-    trainloader, testloader = get_imagenet(args.model_name, calib_batchsize=args.batch_size, num_workers=args.num_workers, data_path=args.data_path, seed=0)
+    # --- 2. Teacher model (optional) ---
+    teacher = None
+    if args.teacher_model_name is not None:
+        print(f"Loading teacher model: {args.teacher_model_name}")
+        teacher = get_model(args.teacher_model_name)
+        teacher.to(args.device).eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
 
-    # ---------------------------
-    # 3. Loss & Optimizer
-    # （量子化後の微調整なので、LR は小さめに）
-    # ---------------------------
+    # --- 3. Datasets ---
+    trainloader, testloader = get_imagenet(
+        args.model_name, calib_batchsize=args.batch_size,
+        num_workers=args.num_workers, data_path=args.data_path, seed=0,
+    )
+
+    # --- 4. Loss & Optimizer ---
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr or 1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr)
 
-    # ---------------------------
-    # 4. Train Loop
-    # ---------------------------
-    for epoch in range(args.epochs or 3):
-        loop = tqdm(trainloader, desc=f'Epoch {epoch+1}/{args.epochs}')
-        running_loss = 0
+    # --- 5. Train Loop ---
+    for epoch in range(args.epochs):
+        loop = tqdm(trainloader, desc=f'Epoch {epoch + 1}/{args.epochs}')
+        running_loss = 0.0
 
         for images, labels in loop:
             images, labels = images.to(args.device), labels.to(args.device)
 
             optimizer.zero_grad()
             outputs = model(images)
-            loss = criterion(outputs, labels)
+            if not isinstance(outputs, torch.Tensor):
+                outputs = outputs.logits
+
+            # CE loss
+            loss = args.ce_alpha * criterion(outputs, labels)
+
+            # KL distillation loss
+            if teacher is not None:
+                with torch.no_grad():
+                    teacher_outputs = teacher(images)
+                    if not isinstance(teacher_outputs, torch.Tensor):
+                        teacher_outputs = teacher_outputs.logits
+
+                T = args.kl_temperature
+                student_logp = F.log_softmax(outputs / T, dim=-1)
+                teacher_p = F.softmax(teacher_outputs / T, dim=-1)
+                kl_loss = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (T * T)
+                loss = loss + args.kl_alpha * kl_loss
+
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
-        print(f"Epoch {epoch+1} Loss: {running_loss / len(trainloader):.4f}")
+        avg_loss = running_loss / len(trainloader)
+        print(f"Epoch {epoch + 1} Loss: {avg_loss:.4f}")
 
-    # ---------------------------
-    # 5. Save fine-tuned model
-    # ---------------------------
+    # --- 6. Save ---
     if args.model_path is not None:
-        save_path = os.path.splitext(args.model_path)[0] + f'-{args.epochs}epochs-fine_tuned.pth'
+        save_path = os.path.splitext(args.model_path)[0] + f'-{args.epochs}epochs-finetuned.pth'
     else:
-        save_path = SCRIPT_DIR / "quantized_bqq_model" / f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.epochs}epochs-finetuned.pth"
+        save_path = SCRIPT_DIR / "quantized_bqq_model" / \
+            f"{args.model_name}-{args.bit_width}bit-{args.group_size}gs-{args.epochs}epochs-finetuned.pth"
     torch.save(model, save_path)
-
     print(f"Fine-tuned model saved to: {save_path}")
 
     return model
 
 
-# 実行
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Arguments for evaluation")
-    parser.add_argument("--model_name", type=str, required=True,
-                        help="Model name passed to evaluation")
-    parser.add_argument("--bit_width", type=int, default=4,
-                        help="Bit width for quantization")
-    parser.add_argument("--group_size", type=int, default=32,
-                        help="Group size for quantization")
-    parser.add_argument("--Nstep", type=int, default=50000,
-                        help="Number of steps for quantization")
+    parser = argparse.ArgumentParser(description="Fine-tune a quantized BQQ vision model")
+    parser.add_argument("--model_name", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default=None)
+    parser.add_argument("--bit_width", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=32)
+    parser.add_argument("--Nstep", type=int, default=50000)
     parser.add_argument("--device", type=str, default='cuda:0')
-    parser.add_argument("--epochs", type=int, default=3,
-                        help="Number of fine-tuning epochs")
-    parser.add_argument("--lr", type=float, default=None,
-                        help="Learning rate for fine-tuning")  
-    parser.add_argument("--batch_size", type=int, default=64,
-                        help="Batch size for fine-tuning")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of workers for data loading")
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--data_path", type=str, default=None,
-                        help="Path to ImageNet. If omitted, use IMAGENET_DIR or IMAGENET_ROOT.")
-    parser.add_argument("--fine_tuned_model", action='store_true',
-                        help="Whether to load an already fine-tuned model")
-    parser.add_argument("--model_path", type=str, default=None,)
+                        help="Path to ImageNet")
+    # Distillation
+    parser.add_argument("--teacher_model_name", type=str, default=None,
+                        help="Teacher model for KL distillation (omit for CE only)")
+    parser.add_argument("--ce_alpha", type=float, default=1.0,
+                        help="Weight for CE loss (0 = KL only)")
+    parser.add_argument("--kl_alpha", type=float, default=1.0,
+                        help="Weight for KL distillation loss")
+    parser.add_argument("--kl_temperature", type=float, default=2.0,
+                        help="Temperature for KL distillation")
+
     args = parser.parse_args()
-    model = fine_tuning(args)
+    fine_tuning(args)
