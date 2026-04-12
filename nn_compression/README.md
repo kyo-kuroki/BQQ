@@ -14,10 +14,12 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 | `lm/qsub_submit_qwen35.sh` | Submit N-bit quantization array jobs on TSUBAME (Qwen3.5-2B/4B/9B) |
 | `lm/qsub_patch_array_job.sh` | SGE array job body for `quantize-target` (1 task = 1 weight tensor) |
 | `lm/qsub_extend_array_job.sh` | SGE array job body for `extend-target` (1 task = 1 weight tensor) |
+| `lm/block_wise_quant.py` | Block-wise quantization with block output error optimization |
 | `lm/binary_quadratic_network.py` | BQQ Linear layer definition |
-| `lm/make_bqq_model_from_compressed_data.py` | Reconstruct a full model from saved BQQ patch files |
+| `lm/make_bqq_model_from_compressed_data.py` | Reconstruct a full model from patch files or block files |
+| `lm/scale_refine_bqq.py` | Hessian-based scale factor refinement (post-quantization) |
+| `lm/fine_tuning.py` | Fine-tuning / KL distillation on a quantized model |
 | `lm/evaluation.py` | Perplexity and task evaluation |
-| `lm/fine_tuning.py` | Fine-tuning on a quantized model |
 
 ---
 
@@ -76,6 +78,59 @@ python weight_aware_quant_cached.py extend-target \
 
 The saved patch files in `--save_dir` contain all N + k bit-layer entries, so the format is identical to a native (N+k)-bit run.
 Existing output files are skipped automatically, so interrupted jobs can be safely resubmitted.
+
+### Step 2b — block-wise quantization (alternative)
+
+Block-wise quantization optimizes all continuous parameters in a transformer block (BQQ scale factors + unquantized Linear weights + LayerNorm) to minimize the block output error against the pretrained model. Each block is independent and can be processed in parallel.
+
+```bash
+cd nn_compression/lm
+
+# Quantize a single block
+python block_wise_quant.py \
+    --model_name Qwen/Qwen3-2B \
+    --block_idx 0 \
+    --bit_width 2 \
+    --group_size 32 \
+    --num_steps 20000 \
+    --dataset c4 \
+    --nsamples 128 \
+    --seqlen 2048 \
+    --epochs 10 \
+    --lr 1e-5 \
+    --device cuda:0 \
+    --save_dir blockwise_output/Qwen3-2B
+```
+
+Output: `blockwise_output/Qwen3-2B/block_0.pth` (full module with optimized parameters).
+
+For each Linear weight in the block, the pipeline:
+1. BQQ quantizes the weight → replaces Linear with BinaryQuadratic (Y, Z fixed as buffers)
+2. Optimizes **all** continuous params in the block (BQQ a,b,c,d + remaining unquantized weights + norms) via AdamW to minimize `||block(input) - pretrained_output||²`
+3. Moves to the next weight
+
+As quantization progresses, the number of free parameters decreases (large Linear weights are replaced by small a,b,c,d scale factors).
+
+**Parallel execution** across blocks:
+
+```bash
+for i in $(seq 0 23); do
+    python block_wise_quant.py --model_name Qwen/Qwen3-2B \
+        --block_idx $i --save_dir blockwise_output/Qwen3-2B \
+        --device cuda:$((i % 4)) &
+done
+wait
+```
+
+**Assemble full model from blocks:**
+
+```bash
+python make_bqq_model_from_compressed_data.py \
+    --model_name Qwen/Qwen3-2B \
+    --block_dir blockwise_output/Qwen3-2B
+```
+
+Blocks that are missing will be kept as pretrained (partial quantization is supported).
 
 ### Other commands
 
@@ -161,6 +216,91 @@ wc -l < qsub_jobs/Qwen3.5-9B-bit2-gs32/targets.txt
 ```
 
 Resubmitting is always safe: targets with an existing `{target_name}.pth` are skipped immediately, and targets with partial `_rowX_colY.pth` patch files resume from where they left off.
+
+---
+
+## Post-quantization refinement (optional)
+
+### Scale refinement
+
+Refines the BQQ scale factors (a, b, c, d) per patch using Hessian-based optimization (closed-form ridge regression). Binary parameters Y, Z remain fixed. This is fast and does not require gradient-based optimization.
+
+```bash
+cd nn_compression/lm
+
+# From a saved BQQ model
+python scale_refine_bqq.py \
+    --model_name Qwen/Qwen3-2B \
+    --bqq_model quantized_model.pth \
+    --output refined_model.pth \
+    --dataset wikitext2 \
+    --nsamples 128 \
+    --seqlen 2048 \
+    --damping 1e-6
+
+# Or rebuild from compressed patch data
+python scale_refine_bqq.py \
+    --model_name Qwen/Qwen3-2B \
+    --compressed_data bqq_compressed_data/Qwen3-2B-32gs-10000step \
+    --bit_width 2 \
+    --output refined_model.pth
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bqq_model` | — | Path to saved BQQ model (mutually exclusive with `--compressed_data`) |
+| `--compressed_data` | — | Path to BQQ patch files directory |
+| `--damping` | 1e-6 | Relative diagonal damping for Cholesky stability |
+| `--dataset` | wikitext2 | Calibration dataset (`wikitext2`, `ptb`, `c4`) |
+| `--nsamples` | 128 | Number of calibration sequences |
+
+### Fine-tuning / KL distillation
+
+Fine-tune a quantized model with three loss modes:
+
+| Mode | Command | Loss |
+|------|---------|------|
+| **SFT only** | (default) | Cross-entropy |
+| **SFT + KL** | `--teacher_model_name ...` | `ce_alpha * CE + kl_alpha * KL` |
+| **KL only** | `--teacher_model_name ... --ce_alpha 0` | `kl_alpha * KL` |
+
+```bash
+cd nn_compression/lm
+
+# Standard SFT
+python fine_tuning.py \
+    --model_name Qwen/Qwen3-2B \
+    --model_path quantized_model.pth \
+    --num_train_epochs 3 \
+    --learning_rate 2e-5
+
+# SFT + KL distillation (pretrained as teacher)
+python fine_tuning.py \
+    --model_name Qwen/Qwen3-2B \
+    --model_path quantized_model.pth \
+    --teacher_model_name Qwen/Qwen3-2B \
+    --kl_alpha 1.0 \
+    --kl_temperature 2.0
+
+# KL distillation only (no CE)
+python fine_tuning.py \
+    --model_name Qwen/Qwen3-2B \
+    --model_path quantized_model.pth \
+    --teacher_model_name Qwen/Qwen3-2B \
+    --ce_alpha 0 \
+    --kl_alpha 1.0
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--teacher_model_name` | None | Teacher model for KL distillation (omit for SFT only) |
+| `--ce_alpha` | 1.0 | Weight for cross-entropy loss (0 = KL only) |
+| `--kl_alpha` | 1.0 | Weight for KL divergence loss |
+| `--kl_temperature` | 2.0 | Temperature for softmax in KL divergence |
+| `--max_seq_length` | 512 | Maximum sequence length |
+| `--gradient_accumulation_steps` | 4 | Gradient accumulation steps |
+
+Output: `{output_dir}/trained_model.pth`
 
 ---
 
