@@ -196,9 +196,19 @@ def train(
 
     _model = torch.load(model_path, weights_only=False, map_location="cpu")
     _model.load_state_dict(state_dict)
-    torch.save(_model, f"{output_dir}/trained_model.pth")
 
-    print(f"Training complete! Saved model to {output_dir}/trained_model.pth")
+    # Derive output name from input: {stem}-finetuned.pth or {stem}-distilled.pth
+    input_stem = Path(model_path).stem
+    if teacher_model_name is not None and ce_alpha == 0:
+        suffix = "distilled"
+    elif teacher_model_name is not None:
+        suffix = "finetuned"  # CE+KL, still call it finetuned
+    else:
+        suffix = "finetuned"
+    output_path = Path(output_dir) / f"{input_stem}-{suffix}.pth"
+    torch.save(_model, output_path)
+
+    print(f"Training complete! Saved model to {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +244,7 @@ def main():
     if model_path is None:
         model_id = model_basename(args.model_name)
         model_path = default_quantized_model_dir(args.model_name) / \
-            f"{model_id}-{args.bit_width}bit-{args.group_size}gs-{args.num_steps}step.pth"
+            f"{model_id}-{args.bit_width}bit-{args.group_size}gs.pth"
 
     output_dir = args.output_dir
     if output_dir is None:

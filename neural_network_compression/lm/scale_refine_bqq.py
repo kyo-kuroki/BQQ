@@ -402,8 +402,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--group_size", type=int, default=32)
     p.add_argument("--num_steps", type=int, default=10000)
 
-    p.add_argument("--output", type=Path, required=True,
-                   help="Output path for the refined model (.pth)")
+    p.add_argument("--output", type=Path, default=None,
+                   help="Output path (default: input name + '-refined.pth')")
 
     p.add_argument("--dataset", type=str, default="wikitext2",
                    choices=["wikitext2", "ptb", "c4"],
@@ -460,9 +460,18 @@ def main() -> None:
     )
 
     # --- Save ---
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Saving refined model to {args.output}")
-    torch.save(bqq_model, args.output)
+    output = args.output
+    if output is None:
+        # Derive from input: foo.pth -> foo-refined.pth
+        if args.bqq_model is not None:
+            stem = args.bqq_model.stem
+            output = args.bqq_model.parent / f"{stem}-refined.pth"
+        else:
+            model_id = args.model_name.rstrip("/").split("/")[-1]
+            output = Path(f"{model_id}-{args.bit_width}bit-{args.group_size}gs-refined.pth")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Saving refined model to {output}")
+    torch.save(bqq_model, output)
     print("Done.")
 
 

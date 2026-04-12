@@ -139,7 +139,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
     model = replace_linear_with_bqq(model, weights_dir=str(compressed_data_dir), bit_width=bit_width, device=device)
 
     model_id = model_basename(model_name)
-    output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs-{num_steps}step.pth"
+    output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs.pth"
     torch.save(model, output_path)
 
     for name, param in model.named_parameters():
@@ -153,7 +153,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
 # Assemble full model from block-wise files
 # ---------------------------------------------------------------------------
 
-def assemble_from_blocks(model_name, block_dir, output_dir=None):
+def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None, output_dir=None):
     """Assemble full model from block_*.pth files (block_wise_quant output)."""
     block_dir = Path(block_dir)
     output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
@@ -178,7 +178,10 @@ def assemble_from_blocks(model_name, block_dir, output_dir=None):
     print(f"Replaced {replaced}/{num_layers} blocks")
 
     model_id = model_basename(model_name)
-    output_path = output_dir / f"{model_id}-blockwise-{replaced}of{num_layers}.pth"
+    suffix = "-blockwise"
+    if bit_width is not None and group_size is not None:
+        suffix = f"-{bit_width}bit-{group_size}gs-blockwise"
+    output_path = output_dir / f"{model_id}{suffix}.pth"
     torch.save(model, output_path)
 
     for name, param in model.named_parameters():
@@ -223,6 +226,8 @@ def main():
     p_asm = sub.add_parser("assemble", help="Assemble model from block_*.pth files")
     p_asm.add_argument("--model_name", type=str, required=True)
     p_asm.add_argument("--block_dir", type=Path, required=True)
+    p_asm.add_argument("--bit_width", type=int, default=None)
+    p_asm.add_argument("--group_size", type=int, default=None)
     p_asm.add_argument("--output_dir", type=Path, default=None)
 
     # --- export-hf ---
@@ -237,7 +242,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "assemble":
-        assemble_from_blocks(model_name=args.model_name, block_dir=args.block_dir, output_dir=args.output_dir)
+        assemble_from_blocks(model_name=args.model_name, block_dir=args.block_dir,
+                             bit_width=args.bit_width, group_size=args.group_size,
+                             output_dir=args.output_dir)
 
     elif args.command == "export-hf":
         export_hf(args.bqq_model, args.model_name, args.output_dir)
