@@ -15,10 +15,10 @@ import sys
 
 try:
     from .compressed_data import BQQ_ROOT, default_results_dir
-    from .datautils import get_wikitext2_testloader
+    from .datautils import get_wikitext2_testloader, get_c4_testloader
 except ImportError:
     from compressed_data import BQQ_ROOT, default_results_dir
-    from datautils import get_wikitext2_testloader
+    from datautils import get_wikitext2_testloader, get_c4_testloader
 
 # Ensure bqq_modules is importable (needed for torch.load of BQQ models)
 _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
@@ -119,6 +119,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
     parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
     parser.add_argument("--eval_downstream", action="store_true", help="Also evaluate downstream tasks (requires lm_eval)")
+    parser.add_argument("--eval_c4", action="store_true", help="Also evaluate C4 PPL")
     args = parser.parse_args()
 
 
@@ -143,7 +144,14 @@ def main():
     model_label = os.path.splitext(os.path.basename(args.model_path))[0] if args.model_path else args.model_name.replace("/", "_")
     print(f"{model_label} WikiText-2 Perplexity: {ppl:.4f}")
 
-    row = {"model": model_label, "PPL": ppl}
+    row = {"model": model_label, "wikitext2_ppl": ppl}
+
+    if args.eval_c4:
+        print("Evaluating C4 PPL...")
+        c4_loader = get_c4_testloader(nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1)
+        c4_ppl = compute_ppl_from_testloader(model, c4_loader, device=args.device)
+        print(f"{model_label} C4 Perplexity: {c4_ppl:.4f}")
+        row["c4_ppl"] = c4_ppl
 
     if args.eval_downstream:
         print("Evaluating Downstream Tasks...")
