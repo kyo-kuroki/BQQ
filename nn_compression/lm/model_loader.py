@@ -18,7 +18,7 @@ def load_causal_lm(model_name: str):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
 
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto")
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto")
     model.seqlen = getattr(model, "seqlen", 2048)
     return model
 
