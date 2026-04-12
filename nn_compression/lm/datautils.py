@@ -1,403 +1,294 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from datasets import load_dataset
 from transformers import AutoTokenizer
 import random
 from tqdm import tqdm
 
+_PTB_PARQUET_FILES = {
+    "train": "https://huggingface.co/datasets/FALcon6/ptb_text_only/resolve/main/penn_treebank/train/0000.parquet",
+    "test": "https://huggingface.co/datasets/FALcon6/ptb_text_only/resolve/main/penn_treebank/test/0000.parquet",
+    "validation": "https://huggingface.co/datasets/FALcon6/ptb_text_only/resolve/main/penn_treebank/validation/0000.parquet",
+}
+
+
+def _load_ptb_split(split):
+    try:
+        return load_dataset("ptb_text_only", "penn_treebank", split=split)
+    except RuntimeError as exc:
+        if "Dataset scripts are no longer supported" not in str(exc):
+            raise
+        return load_dataset("parquet", data_files={split: _PTB_PARQUET_FILES[split]}, split=split)
 
 
 
 
-def get_wikitext2_trainloader(nsamples, seed, seqlen, model, tokenizer=None, batch_size=1, shuffle=True):
-    from datasets import load_dataset
-    from transformers import AutoTokenizer
-    from torch.utils.data import DataLoader, TensorDataset
-    import torch
-    import random
 
-    # データ読み込み
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
 
-    # トークナイザ読み込み
+def get_wikitext2_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+    traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
-    # テキストをトークナイズ
-    trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
-    input_ids = trainenc.input_ids
-    total_len = input_ids.shape[1]
-    num_chunks = total_len // seqlen
+    ids_list = []
+    for t in traindata["text"]:
+        if not t:
+            continue
+        out = tokenizer(t + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
-    # サンプリングロジック
+    if len(ids_list) == 0:
+        raise ValueError("Empty WikiText-2 train split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
     if nsamples is None or nsamples >= num_chunks:
-        indices = range(num_chunks)
+        indices = list(range(num_chunks))
     else:
         random.seed(seed)
         indices = random.sample(range(num_chunks), nsamples)
 
-    # チャンク分割してテンソル結合
-    inps, tars = [], []
-    for i in indices:
-        start = i * seqlen
-        end = start + seqlen
-        inp = input_ids[:, start:end]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        inps.append(inp)
-        tars.append(tar)
-
-    inps = torch.cat(inps, dim=0)
-    tars = torch.cat(tars, dim=0)
-
-    # TensorDataset + DataLoader
+    inps = input_ids[indices]
+    tars = inps.clone()
+    tars[:, :-1] = -100
     dataset = TensorDataset(inps, tars)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
-
-    return loader
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-from datasets import load_dataset
-from transformers import AutoTokenizer
 
-def get_wikitext2_testloader(nsamples, seed, seqlen, model, tokenizer=None, batch_size=1):
-    """
-    WikiText-2 test split から、max_length以内の分割済みトークン列をDataLoaderで返す。
-    """
-    # データセット読み込み
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
 
-    # トークナイザ
+def get_wikitext2_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1):
+    testdata = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+
     if tokenizer is None:
         print("Loading tokenizer...", model)
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
-    # テキストを結合してトークナイズ
-    print("Tokenizing test data...")
-    encodings = tokenizer("\n\n".join(testdata['text']), return_tensors='pt', add_special_tokens=False)
+    print("Tokenizing test data (streaming, no overlength warning)...")
 
-    input_ids = encodings.input_ids[0]
+    # 1) 行ごとにtokenizeしてinput_idsを足していく（巨大な1回tokenizeを避ける）
+    ids_list = []
+    for t in testdata["text"]:
+        if not t:
+            continue
+        out = tokenizer(t + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
-    # シーケンス長ごとに分割
-    num_chunks = len(input_ids) // seqlen
-    input_ids = input_ids[:num_chunks * seqlen]  # 端数を切り捨て
+    if len(ids_list) == 0:
+        raise ValueError("Empty test split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)  # 1D (T,)
+
+    # 2) seqlenごとに分割
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
     input_ids = input_ids.view(num_chunks, seqlen)
 
-    # nsamples分をランダムに抽出 (Noneの場合は全てのテストデータを使用)
+    # 3) nsamplesだけ抽出
     if nsamples is not None and nsamples < num_chunks:
-        torch.manual_seed(seed)
-        indices = torch.randperm(num_chunks)[:nsamples]
+        g = torch.Generator()
+        g.manual_seed(seed)
+        indices = torch.randperm(num_chunks, generator=g)[:nsamples]
         input_ids = input_ids[indices]
 
-    # DataLoader作成
-    dataset = TensorDataset(input_ids, input_ids)  # 入力=出力（次トークン予測）
+    dataset = TensorDataset(input_ids, input_ids)
     test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-
     return test_loader
 
 
-
-
-@torch.no_grad()
-def compute_ppl_from_testloader(model, testloader, device="cuda"):
-    print("Evaluating ...")
-    model.eval()
-    model.to(device)
-
-    loss_fct = nn.CrossEntropyLoss(ignore_index=-100, reduction="sum")
-    total_loss = 0.0
-    total_tokens = 0
-
-    for inp, tar in tqdm(testloader, desc="Computing PPL"):
-        inp, tar = inp.to(device), tar.to(device)
-        outputs = model(inp)
-        logits = outputs.logits
-
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = tar[:, 1:].contiguous()
-
-        loss = loss_fct(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1)
-        )
-
-        valid_tokens = (shift_labels != -100).sum().item()
-        total_loss += loss.item()
-        total_tokens += valid_tokens
-
-    ppl = torch.exp(torch.tensor(total_loss / total_tokens))
-    print(f"Perplexity: {ppl.item():.4f}")
-    return ppl.item()
-
-
-@torch.no_grad()
-def compute_ppl_from_testenc(model, testenc, seqlen, device="cuda"):
-    print('Evaluating ...')
-    testenc = testenc.input_ids
-    nsamples = testenc.numel() // seqlen
-    
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-    
-    model = model.to(device)
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((nsamples, seqlen, model.config.hidden_size), dtype=dtype, device=device)
-    cache = {'i': 0, 'attention_mask': None}
-
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
-        def forward(self, inp, **kwargs):
-            inps[cache['i']] = inp
-            cache['i'] += 1
-            cache['attention_mask'] = kwargs['attention_mask']
-            cache['position_ids'] = kwargs['position_ids']
-            raise ValueError
-        def __getattr__(self, name):
-            # module に存在する属性は module から取ってくる
-            if name == "module":
-                return super().__getattr__(name)
-            return getattr(self.module, name)
-    
-    layers[0] = Catcher(layers[0])
-    for i in range(nsamples):
-        # batch = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)].to(device)
-        batch = testenc[:, (i * seqlen):((i + 1) * seqlen)].to(device)
-        try:
-            model(batch)
-        except ValueError:
-            pass
-    layers[0] = layers[0].module
-    
-    outs = torch.zeros_like(inps)
-    attention_mask = cache['attention_mask']
-    position_ids = cache['position_ids']
-    
-    for i in range(len(layers)):
-        layer = layers[i].to(device)
-        for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
-        layers[i] = layer.cpu()
-        inps, outs = outs, inps
-    
-    model.to(device)
-    testenc = testenc.to(device)
-    nlls = []
-    for i in range(nsamples):
-        hidden_states = inps[i].unsqueeze(0)
-        if model.model.norm is not None:
-            hidden_states = model.model.norm(hidden_states)
-        lm_logits = model.lm_head(hidden_states)
-        shift_logits = lm_logits[:, :-1, :].contiguous()
-        shift_labels = testenc[:, (i * model.seqlen):((i + 1) * model.seqlen)][:, 1:]
-        loss_fct = nn.CrossEntropyLoss()
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-        neg_log_likelihood = loss.float() * model.seqlen
-        nlls.append(neg_log_likelihood)
-    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
-    print('perplexity:', ppl.item())
-    model.config.use_cache = use_cache
-
-    return ppl.item()
-
-
-def set_seed(seed):
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
-
-
-def get_wikitext2(nsamples, seed, seqlen, model, tokenizer=None):
-    from datasets import load_dataset
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+def get_ptb_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+    traindata = _load_ptb_split("train")
 
     if tokenizer is None:
-        from transformers import AutoTokenizer 
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-    trainenc = tokenizer("\n\n".join(traindata['text']), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
 
-    import random
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
+    ids_list = []
+    for s in traindata["sentence"]:
+        if not s or not str(s).strip():
+            continue
+        out = tokenizer(str(s).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
-def get_ptb(nsamples, seed, seqlen, model, tokenizer=None):
-    from datasets import load_dataset
-    traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
-    valdata = load_dataset('ptb_text_only', 'penn_treebank', split='validation')
+    if len(ids_list) == 0:
+        raise ValueError("Empty PTB train split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
+    if nsamples is None or nsamples >= num_chunks:
+        indices = list(range(num_chunks))
+    else:
+        random.seed(seed)
+        indices = random.sample(range(num_chunks), nsamples)
+
+    inps = input_ids[indices]
+    tars = inps.clone()
+    tars[:, :-1] = -100
+    dataset = TensorDataset(inps, tars)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def get_ptb_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1):
+    testdata = _load_ptb_split("test")
 
     if tokenizer is None:
-        from transformers import AutoTokenizer 
+        print("Loading tokenizer...", model)
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-    trainenc = tokenizer("\n\n".join(traindata['sentence']), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(valdata['sentence']), return_tensors='pt')
 
-    import random
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
+    ids_list = []
+    for s in testdata["sentence"]:
+        if not s or not str(s).strip():
+            continue
+        out = tokenizer(str(s).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
-def get_c4(nsamples, seed, seqlen, model, tokenizer=None):
-    from datasets import load_dataset
-    # traindata = load_dataset(
-    #     'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    # )
-    # valdata = load_dataset(
-    #     'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-    # )
+    if len(ids_list) == 0:
+        raise ValueError("Empty PTB test split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
+    if nsamples is not None and nsamples < num_chunks:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        indices = torch.randperm(num_chunks, generator=g)[:nsamples]
+        input_ids = input_ids[indices]
+
+    dataset = TensorDataset(input_ids, input_ids)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+
+def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+    traindata = load_dataset(
+        "allenai/c4",
+        data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+        split="train",
+    )
+
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
+
+    # 1件ずつトークナイズして結合（一括 join を避ける）
+    ids_list = []
+    for t in traindata["text"]:
+        if not t or not str(t).strip():
+            continue
+        out = tokenizer(str(t).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
+
+    if len(ids_list) == 0:
+        raise ValueError("Empty C4 train split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
+    if nsamples is None or nsamples >= num_chunks:
+        indices = list(range(num_chunks))
+    else:
+        random.seed(seed)
+        indices = random.sample(range(num_chunks), nsamples)
+
+    inps = input_ids[indices]
+    tars = inps.clone()
+    tars[:, :-1] = -100
+    dataset = TensorDataset(inps, tars)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def get_c4_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1):
     valdata = load_dataset(
-        'allenai/c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
+        "allenai/c4",
+        data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+        split="validation",
     )
-    traindata = load_dataset(
-        'allenai/c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    )
-
-    # valdata = load_dataset("allenai/c4", "en", split="validation[:1%]")
-
 
     if tokenizer is None:
-        from transformers import AutoTokenizer 
+        print("Loading tokenizer...", model)
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
-    import random
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-            if trainenc.input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
+    ids_list = []
+    for t in valdata["text"]:
+        if not t or not str(t).strip():
+            continue
+        out = tokenizer(str(t).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
-    import random
-    random.seed(0)
-    valenc = []
-    for _ in range(256):
-        while True:
-            i = random.randint(0, len(valdata) - 1)
-            tmp = tokenizer(valdata[i]['text'], return_tensors='pt')
-            if tmp.input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, tmp.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        valenc.append(tmp.input_ids[:, i:j])
-    valenc = torch.hstack(valenc)
-    class TokenizerWrapper:
-        def __init__(self, input_ids):
-            self.input_ids = input_ids
-    valenc = TokenizerWrapper(valenc)
+    if len(ids_list) == 0:
+        raise ValueError("Empty C4 validation split after filtering.")
 
-    return trainloader, valenc 
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
 
-def get_ptb_new(nsamples, seed, seqlen, model, tokenizer=None):
-    from datasets import load_dataset
-    traindata = load_dataset('ptb_text_only', 'penn_treebank', split='train')
-    testdata = load_dataset('ptb_text_only', 'penn_treebank', split='test')
+    if nsamples is not None and nsamples < num_chunks:
+        g = torch.Generator()
+        g.manual_seed(seed)
+        indices = torch.randperm(num_chunks, generator=g)[:nsamples]
+        input_ids = input_ids[indices]
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
-    trainenc = tokenizer(" ".join(traindata['sentence']), return_tensors='pt')
-    testenc = tokenizer(" ".join(testdata['sentence']), return_tensors='pt')
-
-    import random
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
-
-def get_c4_new(nsamples, seed, seqlen, model, tokenizer=None):
-    from datasets import load_dataset
-    # traindata = load_dataset(
-    #     'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    # )
-    # valdata = load_dataset(
-    #     'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-    # )
-
-    traindata = load_dataset(
-        'allenai/c4', 'en', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-    )
-    # valdata = load_dataset(
-    #     'allenai/c4', 'en', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-    # )
-    valdata = load_dataset("allenai/c4", "en", split="validation[:1%]")
+    dataset = TensorDataset(input_ids, input_ids)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
-    import random
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
-            if trainenc.input_ids.shape[1] >= seqlen:
-                break
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
 
-    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
-    valenc = valenc.input_ids[:, :(256 * seqlen)]
-
-    class TokenizerWrapper:
-        def __init__(self, input_ids):
-            self.input_ids = input_ids
-    valenc = TokenizerWrapper(valenc)
-
-    return trainloader, valenc
 
 
 def get_loaders(
-    name, nsamples=128, seed=0, seqlen=2048, model='', tokenizer=None
+    name,
+    nsamples=128,
+    seed=0,
+    seqlen=2048,
+    model="",
+    tokenizer=None,
+    batch_size=1,
 ):
-    if 'wikitext2' in name:
-        return get_wikitext2(nsamples, seed, seqlen, model, tokenizer)
-    if 'ptb' in name:
-        if 'new' in name:
-            return get_ptb_new(nsamples, seed, seqlen, model, tokenizer)
-        return get_ptb(nsamples, seed, seqlen, model)
-    if 'c4' in name:
-        if 'new' in name:
-            return get_c4_new(nsamples, seed, seqlen, model, tokenizer)
-
-        return get_c4(nsamples, seed, seqlen, model)
+    """
+    Return (train_loader, test_loader) as DataLoaders for the given dataset name.
+    name: 'wikitext2', 'ptb', or 'c4' (substring match).
+    """
+    if "wikitext2" in name:
+        train_loader = get_wikitext2_trainloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+        )
+        test_loader = get_wikitext2_testloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size,
+        )
+        return train_loader, test_loader
+    if "ptb" in name:
+        train_loader = get_ptb_trainloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+        )
+        test_loader = get_ptb_testloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size,
+        )
+        return train_loader, test_loader
+    if "c4" in name:
+        train_loader = get_c4_trainloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+        )
+        test_loader = get_c4_testloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size,
+        )
+        return train_loader, test_loader
+    raise ValueError(f"Unknown dataset name: {name!r}. Use 'wikitext2', 'ptb', or 'c4'.")
