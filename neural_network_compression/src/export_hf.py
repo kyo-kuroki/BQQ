@@ -153,13 +153,13 @@ BQQModelForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
 
 def default_hf_output_dir(base_model_name, bqq_layers):
-    """Generate default output path: bqq/{ModelName}-{N}bit"""
+    """Generate default output path: hf_models/{ModelName}-{N}bit-bqq"""
     model_basename = base_model_name.rstrip("/").split("/")[-1]
     if bqq_layers:
         bit_width = next(iter(bqq_layers.values()))['bit_width']
     else:
         bit_width = 0
-    return Path("bqq") / f"{model_basename}-{bit_width}bit"
+    return Path("hf_models") / f"{model_basename}-{bit_width}bit-bqq"
 
 
 def export_for_hf(bqq_model, base_model_name, output_dir=None, save_tokenizer=True):
