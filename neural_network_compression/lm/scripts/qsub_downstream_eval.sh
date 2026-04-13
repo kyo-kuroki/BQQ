@@ -5,10 +5,10 @@
 #$ -l gpu_1=1
 #$ -l h_rt=8:00:00
 
-# Full evaluation: WikiText-2 PPL, C4 PPL, downstream tasks.
+# Downstream task evaluation: arc_easy, arc_challenge, hellaswag, winogrande, piqa, boolq.
 # Required env vars (passed via qsub -v):
 #   MODEL_NAME  - e.g. Qwen/Qwen3.5-2B
-#   MODEL_PATH  - path to assembled .pth file
+#   MODEL_PATH  - path to assembled .pth file (omit for FP16 baseline)
 
 set -euo pipefail
 
@@ -18,7 +18,7 @@ LM_DIR="/gs/bs/tga-artic/k-kuroki/BQQ/neural_network_compression/lm"
 BQQ_ROOT="/gs/bs/tga-artic/k-kuroki/BQQ"
 
 echo "========================================"
-echo "Full eval: ${MODEL_PATH:-FP16_baseline}"
+echo "Downstream eval: ${MODEL_PATH:-FP16_baseline}"
 echo "Host: $(hostname)"
 echo "Date: $(date --iso-8601=seconds)"
 echo "========================================"
@@ -26,6 +26,11 @@ echo "========================================"
 MODEL_PATH_ARGS=()
 if [[ -n "${MODEL_PATH:-}" ]]; then
     MODEL_PATH_ARGS=(--model_path "${MODEL_PATH}")
+fi
+
+DOWNSTREAM_TASKS_ARGS=()
+if [[ -n "${DOWNSTREAM_TASKS:-}" ]]; then
+    DOWNSTREAM_TASKS_ARGS=(--downstream_tasks "${DOWNSTREAM_TASKS}")
 fi
 
 apptainer exec --nv \
@@ -41,7 +46,7 @@ apptainer exec --nv \
         --model_name "${MODEL_NAME}" \
         --device cuda:0 \
         --seq_len 2048 \
-        --eval_c4 \
-        --eval_downstream
+        --eval_downstream \
+        "${DOWNSTREAM_TASKS_ARGS[@]}"
 
 echo "Done: $(date --iso-8601=seconds)"

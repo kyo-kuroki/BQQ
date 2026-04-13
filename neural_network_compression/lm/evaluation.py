@@ -91,24 +91,94 @@ def compute_ppl_from_testloader(model, testloader, device="cuda"):
     return ppl.item()
 
 
+# Task configs: 0-shot commonsense + few-shot reasoning/knowledge
+DEFAULT_DOWNSTREAM_TASK_CONFIGS = (
+    {"name": "arc_easy",      "task": "arc_easy",               "num_fewshot": 0},
+    {"name": "arc_challenge", "task": "arc_challenge",           "num_fewshot": 0},
+    {"name": "hellaswag",     "task": "hellaswag",               "num_fewshot": 0},
+    {"name": "winogrande",    "task": "winogrande",              "num_fewshot": 0},
+    {"name": "piqa",          "task": "piqa",                    "num_fewshot": 0},
+    {"name": "boolq",         "task": "boolq",                   "num_fewshot": 0},
+    {"name": "race",          "task": "race",                    "num_fewshot": 5},
+    {"name": "mmlu",          "task": "mmlu",                    "num_fewshot": 5},
+    {"name": "mmlu_pro",      "task": "mmlu_pro",                "num_fewshot": 5},
+    {"name": "gsm8k",         "task": "gsm8k",                   "num_fewshot": 8},
+    {"name": "mgsm",          "task": "mgsm_direct_en",          "num_fewshot": 8},
+    {"name": "math",          "task": "leaderboard_math_hard",   "num_fewshot": 4},
+)
 
-def evaluate_downstream_task(args, model):
+
+def get_default_downstream_task_configs() -> list[dict[str, object]]:
+    return [dict(task_config) for task_config in DEFAULT_DOWNSTREAM_TASK_CONFIGS]
+
+
+def evaluate_downstream_task(
+    args,
+    model,
+    *,
+    task_configs: list[dict[str, object]] | None = None,
+    lm_cls=None,
+    lm_kwargs: dict | None = None,
+    simple_evaluate_kwargs: dict | None = None,
+    continue_on_error: bool = True,
+):
     print("Evaluating downstream tasks ...")
     from lm_eval.evaluator import simple_evaluate
     from lm_eval.models.huggingface import HFLM
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True, use_fast=True)
-    lm = HFLM(pretrained=model, tokenizer=tokenizer)
-
-    results = simple_evaluate(
-        lm,
-        tasks=["arc_easy", "arc_challenge", "hellaswag", "winogrande", "piqa", "boolq"],
-        device=args.device,
+    tokenizer_name_or_path = (
+        getattr(args, "tokenizer_name_or_path", None)
+        or getattr(args, "model_name_or_path", None)
+        or getattr(args, "model_name", None)
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path, trust_remote_code=True, use_fast=True
     )
 
-    print(results["results"])
-    return results["results"]
-  
+    lm_cls = HFLM if lm_cls is None else lm_cls
+    lm_kwargs = dict(lm_kwargs or {})
+    lm_kwargs.setdefault("batch_size", getattr(args, "batch_size", 1))
+    lm = lm_cls(pretrained=model, tokenizer=tokenizer, **lm_kwargs)
+
+    merged_results: dict = {}
+    errors: dict[str, str] = {}
+    task_configs = task_configs or get_default_downstream_task_configs()
+    simple_kwargs = dict(simple_evaluate_kwargs or {})
+    simple_kwargs.setdefault("bootstrap_iters", 0)
+    simple_kwargs.setdefault("log_samples", False)
+
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        simple_kwargs.setdefault("limit", limit)
+
+    for task_config in task_configs:
+        logical_name = str(task_config.get("name", task_config["task"]))
+        task_name = str(task_config["task"])
+        num_fewshot = int(task_config.get("num_fewshot", 0))
+        print(f"[downstream] task={task_name} ({num_fewshot}-shot)")
+        try:
+            res = simple_evaluate(
+                lm,
+                tasks=[task_name],
+                num_fewshot=num_fewshot,
+                **simple_kwargs,
+            )
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            errors[logical_name] = str(exc)
+            print(f"[downstream][ERROR] task={task_name}: {exc}")
+            continue
+
+        merged_results.update(res.get("results", {}))
+        merged_results.update(res.get("groups", {}))
+
+    if errors:
+        merged_results["__errors__"] = errors
+
+    print(merged_results)
+    return merged_results
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -119,59 +189,75 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
     parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
     parser.add_argument("--eval_downstream", action="store_true", help="Also evaluate downstream tasks (requires lm_eval)")
-    parser.add_argument("--eval_c4", action="store_true", help="Also evaluate C4 PPL")
+    parser.add_argument("--downstream_tasks", type=str, default=None,
+                        help="Comma-separated subset of task names to run (default: all DEFAULT_DOWNSTREAM_TASK_CONFIGS)")
+    parser.add_argument("--eval_c4", action="store_true", help="Also evaluate C4 PPL (full validation set)")
     args = parser.parse_args()
 
-
-    # evaluate_downstream_task(args, args.model_name, args.model_path)
-
     print("Loading model:", args.model_name)
-    
+
     if args.model_path is None:
-        model = AutoModelForCausalLM.from_pretrained(args.model_name, device_map="auto", attn_implementation="flash_attention_2")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name, device_map="auto", attn_implementation="flash_attention_2"
+        )
     else:
         try:
             model = torch.load(args.model_path, weights_only=False)
         except Exception:
             model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 
-    print("Evaluating PPL...")
-
     model.eval()
-    test_loader = get_wikitext2_testloader(nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1)
+    model_label = (
+        os.path.splitext(os.path.basename(args.model_path))[0]
+        if args.model_path
+        else args.model_name.replace("/", "_")
+    )
 
+    test_loader = get_wikitext2_testloader(
+        nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1
+    )
     ppl = compute_ppl_from_testloader(model, test_loader, device=args.device)
-    model_label = os.path.splitext(os.path.basename(args.model_path))[0] if args.model_path else args.model_name.replace("/", "_")
     print(f"{model_label} WikiText-2 Perplexity: {ppl:.4f}")
-
     row = {"model": model_label, "wikitext2_ppl": ppl}
 
     if args.eval_c4:
         print("Evaluating C4 PPL...")
-        c4_loader = get_c4_testloader(nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1)
+        c4_loader = get_c4_testloader(
+            nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1
+        )
         c4_ppl = compute_ppl_from_testloader(model, c4_loader, device=args.device)
         print(f"{model_label} C4 Perplexity: {c4_ppl:.4f}")
         row["c4_ppl"] = c4_ppl
 
     if args.eval_downstream:
         print("Evaluating Downstream Tasks...")
-        dstask_results = evaluate_downstream_task(args, model)
+        task_configs = None
+        if args.downstream_tasks:
+            names = {t.strip() for t in args.downstream_tasks.split(",")}
+            task_configs = [c for c in get_default_downstream_task_configs() if c["name"] in names]
+            print(f"  Running subset: {[c['name'] for c in task_configs]}")
+        dstask_results = evaluate_downstream_task(args, model, task_configs=task_configs)
         flat_results = {}
         for task, metrics in dstask_results.items():
+            if task == "__errors__":
+                continue
             for metric_name, value in metrics.items():
                 flat_results[f"{task}_{metric_name}"] = value
         row.update(flat_results)
 
-    df = pd.DataFrame([row])
     results_dir = default_results_dir()
     results_dir.mkdir(parents=True, exist_ok=True)
     out_path = results_dir / f"{model_label}.csv"
-    df.to_csv(out_path, index=False)
+
+    # Merge with existing results (allows PPL and downstream to run as separate jobs)
+    if out_path.exists():
+        existing = pd.read_csv(out_path).to_dict(orient="records")[0]
+        existing.update(row)
+        row = existing
+
+    pd.DataFrame([row]).to_csv(out_path, index=False)
     print(f"Saved results to {out_path}")
 
 
 if __name__ == "__main__":
     main()
-
-
-
