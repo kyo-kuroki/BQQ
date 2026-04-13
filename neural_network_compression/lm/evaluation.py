@@ -180,6 +180,28 @@ def evaluate_downstream_task(
     return merged_results
 
 
+def _merge_save_csv(out_path: Path, row: dict) -> None:
+    """Merge row into existing CSV (or create new) and save."""
+    if out_path.exists():
+        existing = pd.read_csv(out_path).to_dict(orient="records")[0]
+        existing.update(row)
+        row = existing
+    pd.DataFrame([row]).to_csv(out_path, index=False)
+    print(f"Saved results to {out_path}")
+
+
+def _task_already_done(out_path: Path, lm_task_name: str) -> bool:
+    """Return True if the CSV already contains results for this lm_eval task."""
+    if not out_path.exists():
+        return False
+    try:
+        df = pd.read_csv(out_path)
+        cols = [c for c in df.columns if c.startswith(f"{lm_task_name}_")]
+        return bool(cols) and df[cols[0]].notna().all()
+    except Exception:
+        return False
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default=None, help="pytorch model path")
@@ -187,12 +209,63 @@ def main():
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seq_len", type=int, default=2048, help="sequence length for evaluation")
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size for lm_eval")
     parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
     parser.add_argument("--eval_downstream", action="store_true", help="Also evaluate downstream tasks (requires lm_eval)")
     parser.add_argument("--downstream_tasks", type=str, default=None,
                         help="Comma-separated subset of task names to run (default: all DEFAULT_DOWNSTREAM_TASK_CONFIGS)")
     parser.add_argument("--eval_c4", action="store_true", help="Also evaluate C4 PPL (full validation set)")
+    parser.add_argument("--task", type=str, default=None,
+                        help="Run a single downstream task by logical name and save immediately. "
+                             "Skips PPL. Exits early if result already present in CSV.")
     args = parser.parse_args()
+
+    model_label = (
+        os.path.splitext(os.path.basename(args.model_path))[0]
+        if args.model_path
+        else args.model_name.replace("/", "_")
+    )
+
+    results_dir = default_results_dir()
+    results_dir.mkdir(parents=True, exist_ok=True)
+    out_path = results_dir / f"{model_label}.csv"
+
+    # --task mode: single task, immediate save, skip if already done
+    if args.task is not None:
+        all_configs = get_default_downstream_task_configs()
+        task_config = next((c for c in all_configs if c["name"] == args.task), None)
+        if task_config is None:
+            valid = [c["name"] for c in all_configs]
+            raise ValueError(f"Unknown task '{args.task}'. Valid names: {valid}")
+
+        lm_task_name = str(task_config["task"])
+        if _task_already_done(out_path, lm_task_name):
+            print(f"Task '{args.task}' already done in {out_path}, skipping.")
+            return
+
+        print("Loading model:", args.model_name)
+        if args.model_path is None:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_name, device_map="auto", attn_implementation="flash_attention_2"
+            )
+        else:
+            try:
+                model = torch.load(args.model_path, weights_only=False)
+            except Exception:
+                model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
+        model.eval()
+
+        print(f"[task mode] running task={lm_task_name} ({task_config['num_fewshot']}-shot)")
+        dstask_results = evaluate_downstream_task(args, model, task_configs=[task_config])
+        row: dict = {"model": model_label}
+        for task, metrics in dstask_results.items():
+            if task == "__errors__":
+                continue
+            for metric_name, value in metrics.items():
+                row[f"{task}_{metric_name}"] = value
+
+        _merge_save_csv(out_path, row)
+        return
 
     print("Loading model:", args.model_name)
 
@@ -207,11 +280,6 @@ def main():
             model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 
     model.eval()
-    model_label = (
-        os.path.splitext(os.path.basename(args.model_path))[0]
-        if args.model_path
-        else args.model_name.replace("/", "_")
-    )
 
     test_loader = get_wikitext2_testloader(
         nsamples=None, seed=args.seed, seqlen=args.seq_len, model=args.model_name, batch_size=1
@@ -245,18 +313,7 @@ def main():
                 flat_results[f"{task}_{metric_name}"] = value
         row.update(flat_results)
 
-    results_dir = default_results_dir()
-    results_dir.mkdir(parents=True, exist_ok=True)
-    out_path = results_dir / f"{model_label}.csv"
-
-    # Merge with existing results (allows PPL and downstream to run as separate jobs)
-    if out_path.exists():
-        existing = pd.read_csv(out_path).to_dict(orient="records")[0]
-        existing.update(row)
-        row = existing
-
-    pd.DataFrame([row]).to_csv(out_path, index=False)
-    print(f"Saved results to {out_path}")
+    _merge_save_csv(out_path, row)
 
 
 if __name__ == "__main__":
