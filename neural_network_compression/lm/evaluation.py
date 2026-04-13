@@ -92,7 +92,7 @@ def compute_ppl_from_testloader(model, testloader, device="cuda"):
 
 
 
-def evaluate_downstream_task(args, model):
+def evaluate_zeroshot_downstream_task(args, model):
     print("Evaluating downstream tasks ...")
     from lm_eval.evaluator import simple_evaluate
     from lm_eval.models.huggingface import HFLM
@@ -108,6 +108,100 @@ def evaluate_downstream_task(args, model):
 
     print(results["results"])
     return results["results"]
+
+DEFAULT_DOWNSTREAM_TASK_CONFIGS = (
+    {"name": "arc_easy", "task": "arc_easy", "num_fewshot": 0},
+    {"name": "arc_challenge", "task": "arc_challenge", "num_fewshot": 0},
+    {"name": "hellaswag", "task": "hellaswag", "num_fewshot": 0},
+    {"name": "winogrande", "task": "winogrande", "num_fewshot": 0},
+    {"name": "piqa", "task": "piqa", "num_fewshot": 0},
+    {"name": "boolq", "task": "boolq", "num_fewshot": 0},
+    {"name": "race", "task": "race", "num_fewshot": 5},
+    {"name": "mmlu", "task": "mmlu", "num_fewshot": 5},
+    {"name": "mmlu_pro", "task": "mmlu_pro", "num_fewshot": 5},
+    {"name": "gsm8k", "task": "gsm8k", "num_fewshot": 8},
+    {"name": "mgsm", "task": "mgsm_direct_en", "num_fewshot": 8},
+    {"name": "math", "task": "leaderboard_math_hard", "num_fewshot": 4},
+)
+
+
+def get_default_downstream_task_configs() -> list[dict[str, object]]:
+    return [dict(task_config) for task_config in DEFAULT_DOWNSTREAM_TASK_CONFIGS]
+
+
+def evaluate_downstream_task(
+    args,
+    model,
+    *,
+    task_configs: list[dict[str, object]] | None = None,
+    lm_cls=None,
+    lm_kwargs: dict | None = None,
+    simple_evaluate_kwargs: dict | None = None,
+    continue_on_error: bool = False,
+):
+    print("Evaluating downstream tasks ...")
+
+    _patch_lm_eval_transformers_compat()
+
+    from lm_eval.evaluator import simple_evaluate
+    from lm_eval.models.huggingface import HFLM
+
+    tokenizer_name_or_path = getattr(args, "tokenizer_name_or_path", None)
+    if tokenizer_name_or_path is None:
+        tokenizer_name_or_path = getattr(args, "model_name_or_path", None)
+    if tokenizer_name_or_path is None:
+        tokenizer_name_or_path = getattr(args, "model_name", None)
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name_or_path,
+        trust_remote_code=True,
+        use_fast=True
+    )
+
+    lm_cls = HFLM if lm_cls is None else lm_cls
+    lm_kwargs = dict(lm_kwargs or {})
+    lm_kwargs.setdefault("batch_size", getattr(args, "batch_size", 1))
+    lm = lm_cls(pretrained=model, tokenizer=tokenizer, **lm_kwargs)
+
+    merged_results = {}
+    errors: dict[str, str] = {}
+    task_configs = task_configs or get_default_downstream_task_configs()
+    simple_kwargs = dict(simple_evaluate_kwargs or {})
+    simple_kwargs.setdefault("device", args.device)
+    simple_kwargs.setdefault("bootstrap_iters", 0)
+    simple_kwargs.setdefault("log_samples", False)
+
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        simple_kwargs.setdefault("limit", limit)
+
+    for task_config in task_configs:
+        logical_name = str(task_config.get("name", task_config["task"]))
+        task_name = str(task_config["task"])
+        num_fewshot = int(task_config.get("num_fewshot", 0))
+        print(f"[downstream] task={task_name} logical_name={logical_name} fewshot={num_fewshot}")
+        try:
+            res = simple_evaluate(
+                lm,
+                tasks=[task_name],
+                num_fewshot=num_fewshot,
+                **simple_kwargs,
+            )
+        except Exception as exc:
+            if not continue_on_error:
+                raise
+            errors[logical_name] = str(exc)
+            print(f"[downstream][ERROR] task={task_name}: {exc}")
+            continue
+
+        merged_results.update(res.get("results", {}))
+        merged_results.update(res.get("groups", {}))
+
+    if errors:
+        merged_results["__errors__"] = errors
+
+    print(merged_results)
+    return merged_results
+
   
 
 def main():
