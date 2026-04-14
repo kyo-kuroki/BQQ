@@ -1222,6 +1222,9 @@ class BinaryQuadraticQuantization():
             # Wres from CLEAN reconstruction (no compensation leakage)
             Wres = x_tensor - Wq_clean
 
+            # Intra-bit compensation only on LAST bit (earlier bits need clean residuals)
+            use_compensation = (bit_idx == bit_width - 1)
+
             # W_work: copy of Wres, modified by compensation WITHIN this bit only
             W_work = Wres.clone()
 
@@ -1268,8 +1271,8 @@ class BinaryQuadraticQuantization():
                         'bit_idx': bit_idx,
                     })
 
-                # Compensate remaining columns of W_work (this bit only)
-                if c1 < original_w:
+                # Compensate remaining columns of W_work (last bit only)
+                if use_compensation and c1 < original_w:
                     H_22 = H[c1:, c1:]
                     H_21 = H[c1:, c0:c1]
                     try:
