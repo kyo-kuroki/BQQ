@@ -247,6 +247,8 @@ def quantize_block(
     epochs,
     lr,
     max_grad_norm=1.0,
+    use_hessian=True,
+    hessian_cache_dir=None,
     scale_refine=True,
     damping=1e-6,
     device,
@@ -277,10 +279,25 @@ def quantize_block(
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\nInitial block MSE: {init_mse:.6f}')
 
-    # Collect Hessians
-    print('Collecting Hessians for block Linears...')
-    H_dict = collect_block_hessians(block, inputs_cache, dev)
-    print(f'  Collected {len(H_dict)} Hessians')
+    # Collect or load Hessians
+    H_dict = {}
+    if use_hessian:
+        cache_path = None
+        if hessian_cache_dir is not None:
+            cache_path = Path(hessian_cache_dir) / f'hessian_block_{block_idx}.pth'
+            if cache_path.exists():
+                print(f'Loading Hessian cache from {cache_path}')
+                H_dict = torch.load(cache_path, map_location='cpu', weights_only=False)
+
+        if not H_dict:
+            print('Collecting Hessians for block Linears...')
+            H_dict = collect_block_hessians(block, inputs_cache, dev)
+            print(f'  Collected {len(H_dict)} Hessians')
+
+            if cache_path is not None:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(H_dict, cache_path)
+                print(f'  Saved Hessian cache to {cache_path}')
 
     for i, linear_name in enumerate(linear_names):
         linear = _get_submodule(block, linear_name)
@@ -290,7 +307,7 @@ def quantize_block(
         print(f'\n--- [{i + 1}/{len(linear_names)}] {linear_name} '
               f'{tuple(weight.shape)} ---')
 
-        H = H_dict.get(linear_name)
+        H = H_dict.get(linear_name) if use_hessian else None
         A, Y, Z = quantize_weight_to_bqq(
             weight, bit_width=bit_width, group_size=group_size,
             num_steps=num_steps, rank_scale=rank_scale, seed=seed,
@@ -349,6 +366,10 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-5)
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
+    parser.add_argument('--no_hessian', action='store_true',
+                        help='Disable Hessian-aware quantization (use standard BQQ)')
+    parser.add_argument('--hessian_cache_dir', type=str, default=None,
+                        help='Directory to cache/load Hessian matrices')
     parser.add_argument('--no_scale_refine', action='store_true',
                         help='Disable Hessian-aware scale refinement')
     parser.add_argument('--damping', type=float, default=1e-6)
@@ -378,6 +399,8 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         max_grad_norm=args.max_grad_norm,
+        use_hessian=not args.no_hessian,
+        hessian_cache_dir=args.hessian_cache_dir,
         scale_refine=not args.no_scale_refine,
         damping=args.damping,
         device=args.device,
