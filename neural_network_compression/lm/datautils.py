@@ -252,25 +252,45 @@ def get_c4_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None,
 
 
 def get_redpajama1t_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
-    try:
-        traindata = load_dataset('togethercomputer/RedPajama-Data-1T-Sample', split='train')
-    except Exception as exc:
-        raise RuntimeError(
-            f"Failed to load RedPajama-Data-1T-Sample: {exc}"
-        ) from exc
+    # RedPajama-Data-1T-Sample was removed from the Hub; load V2 English sample documents
+    # directly via hf_hub_download to avoid the deprecated dataset script.
+    from huggingface_hub import hf_hub_download
+    from datasets import load_dataset as _load_dataset
+
+    EN_SAMPLE_FILES = [
+        f"sample/documents/2023-06/{i:04d}/en_{part}.json.gz"
+        for i in range(10)
+        for part in ("head", "middle")
+    ]
+
+    local_paths = []
+    for remote in EN_SAMPLE_FILES:
+        try:
+            p = hf_hub_download(
+                repo_id="togethercomputer/RedPajama-Data-V2",
+                filename=remote,
+                repo_type="dataset",
+            )
+            local_paths.append(p)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to download RedPajama-Data-V2 file {remote}: {exc}"
+            ) from exc
+
+    traindata = _load_dataset("json", data_files=local_paths, split="train")
 
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
 
     ids_list = []
-    for t in traindata["text"]:
+    for t in traindata["raw_content"]:
         if not t or not str(t).strip():
             continue
         out = tokenizer(str(t).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
         ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
 
     if len(ids_list) == 0:
-        raise ValueError("Empty RedPajama-Data-1T-Sample train split after filtering.")
+        raise ValueError("Empty RedPajama-Data-V2 sample after filtering.")
 
     input_ids = torch.cat(ids_list, dim=0)
     num_chunks = input_ids.numel() // seqlen
