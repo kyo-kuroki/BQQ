@@ -27,7 +27,7 @@ def _load_ptb_split(split):
 
 
 
-def get_wikitext2_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+def get_wikitext2_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
     traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 
     if tokenizer is None:
@@ -56,7 +56,8 @@ def get_wikitext2_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokeniz
 
     inps = input_ids[indices]
     tars = inps.clone()
-    tars[:, :-1] = -100
+    if mask_labels:
+        tars[:, :-1] = -100
     dataset = TensorDataset(inps, tars)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
@@ -103,7 +104,7 @@ def get_wikitext2_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenize
     return test_loader
 
 
-def get_ptb_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+def get_ptb_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
     traindata = _load_ptb_split("train")
 
     if tokenizer is None:
@@ -132,7 +133,8 @@ def get_ptb_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=Non
 
     inps = input_ids[indices]
     tars = inps.clone()
-    tars[:, :-1] = -100
+    if mask_labels:
+        tars[:, :-1] = -100
     dataset = TensorDataset(inps, tars)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
@@ -169,7 +171,7 @@ def get_ptb_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None
     return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
 
-def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True):
+def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
     traindata = load_dataset(
         "allenai/c4",
         data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
@@ -203,7 +205,8 @@ def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None
 
     inps = input_ids[indices]
     tars = inps.clone()
-    tars[:, :-1] = -100
+    if mask_labels:
+        tars[:, :-1] = -100
     dataset = TensorDataset(inps, tars)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
@@ -246,6 +249,46 @@ def get_c4_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None,
 
 
 
+
+
+def get_redpajama1t_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
+    try:
+        traindata = load_dataset('togethercomputer/RedPajama-Data-1T-Sample', split='train')
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load RedPajama-Data-1T-Sample: {exc}"
+        ) from exc
+
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
+
+    ids_list = []
+    for t in traindata["text"]:
+        if not t or not str(t).strip():
+            continue
+        out = tokenizer(str(t).strip() + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids_list.append(torch.tensor(out["input_ids"], dtype=torch.long))
+
+    if len(ids_list) == 0:
+        raise ValueError("Empty RedPajama-Data-1T-Sample train split after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
+    if nsamples is None or nsamples >= num_chunks:
+        indices = list(range(num_chunks))
+    else:
+        random.seed(seed)
+        indices = random.sample(range(num_chunks), nsamples)
+
+    inps = input_ids[indices]
+    tars = inps.clone()
+    if mask_labels:
+        tars[:, :-1] = -100
+    dataset = TensorDataset(inps, tars)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
 def get_loaders(
@@ -291,4 +334,14 @@ def get_loaders(
             tokenizer=tokenizer, batch_size=batch_size,
         )
         return train_loader, test_loader
-    raise ValueError(f"Unknown dataset name: {name!r}. Use 'wikitext2', 'ptb', or 'c4'.")
+    if "redpajama1t" in name:
+        train_loader = get_redpajama1t_trainloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+        )
+        test_loader = get_wikitext2_testloader(
+            model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+            tokenizer=tokenizer, batch_size=batch_size,
+        )
+        return train_loader, test_loader
+    raise ValueError(f"Unknown dataset name: {name!r}. Use 'wikitext2', 'ptb', 'c4', or 'redpajama1t'.")
