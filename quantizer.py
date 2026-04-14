@@ -976,7 +976,28 @@ class BinaryQuadraticQuantization():
             print(f'Patch Size:({ph}x{pw}), Count: {cnt}')
 
         x_tensor = torch.tensor(x_copy).float()
-        H = H.float()  # ensure float32
+        H = H.float()
+        dtype = torch.float32
+
+        # --- Precompute Hessian-related quantities (shared across all bits) ---
+        S = self._cholesky_safe(H, damping)
+        if S is None:
+            raise RuntimeError('Cholesky decomposition of H failed even with damping')
+
+        # S_j = S[c0:c1, :] for each column group, and col-sums
+        S_j_list = []
+        col_sum_S_list = []
+        for c0, c1 in w_ranges:
+            S_j = S[c0:c1, :]                              # (pw, full_w)
+            S_j_list.append(S_j)
+            col_sum_S_list.append(S_j.sum(dim=0, keepdim=True))  # (1, full_w)
+
+        # R_S = W_row @ S for each row group (target, invariant across bits)
+        R_S_rows = []
+        for r0, r1 in h_ranges:
+            R_S_rows.append(x_tensor[r0:r1, :].to(dtype=dtype) @ S)  # (ph, full_w)
+
+        ones_col_ph = {}  # cache per patch height
 
         # Per-patch binary data: binary_data[(i,j)] = [(Y_0, Z_0), (Y_1, Z_1), ...]
         binary_data = defaultdict(list)
@@ -1015,6 +1036,7 @@ class BinaryQuadraticQuantization():
                     coeffs_data[key].append(a_b[b].cpu())
 
             # --- 2. Hessian-aware scale refinement per row-group (batched solve) ---
+            # S, S_j_list, col_sum_S_list, R_S_rows are precomputed above (bit-invariant)
             num_row_groups = len(h_ranges)
             num_col_groups = len(w_ranges)
             current_bits = bit_idx + 1
@@ -1022,100 +1044,70 @@ class BinaryQuadraticQuantization():
             print(f'Bit {bit_idx}: refining scales for {num_row_groups} row-groups '
                   f'({n_params} params each, batched solve)')
 
-            # Cholesky of full H (shared across all rows)
-            S = self._cholesky_safe(H.float(), damping)
-            if S is None:
-                print('  WARNING: Cholesky failed on H, skipping refinement')
-            else:
-                dtype = torch.float32
-                ones_col_ph = {}  # cached per patch height
+            # Build PtP and Ptr per row (Phi is temporary, not stored)
+            PtP_list = []
+            Ptr_list = []
 
-                # Precompute S_j blocks and their column sums
-                S_j_list = []
-                col_sum_S_list = []
-                for c0, c1 in w_ranges:
-                    S_j = S[c0:c1, :]            # (pw, full_w)
-                    S_j_list.append(S_j)
-                    col_sum_S_list.append(S_j.sum(dim=0, keepdim=True))  # (1, full_w)
+            for i, (r0, r1) in enumerate(h_ranges):
+                ph = r1 - r0
+                R_S = R_S_rows[i]  # precomputed (ph, full_w)
 
-                # Build PtP and Ptr for each row, then batch solve
-                PtP_list = []
-                Ptr_list = []
-                row_valid = []
+                if ph not in ones_col_ph:
+                    ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
+                ones_col = ones_col_ph[ph]
 
-                for i, (r0, r1) in enumerate(h_ranges):
-                    ph = r1 - r0
-                    full_w = original_w
-                    W_row = x_tensor[r0:r1, :].to(dtype=dtype)
-                    R_S = W_row @ S  # (ph, full_w)
+                G_cols = []
+                for j in range(num_col_groups):
+                    for b_idx in range(current_bits):
+                        Y_b, Z_b = binary_data[(i, j)][b_idx]
+                        Y_b = Y_b.to(dtype=dtype)
+                        Z_b = Z_b.to(dtype=dtype)
 
-                    if ph not in ones_col_ph:
-                        ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
-                    ones_col = ones_col_ph[ph]
+                        G_a = (Y_b @ Z_b) @ S_j_list[j]
+                        G_b = Y_b.sum(dim=-1, keepdim=True) @ col_sum_S_list[j]
+                        G_c = ones_col @ (Z_b.sum(dim=-2, keepdim=True) @ S_j_list[j])
+                        G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
 
-                    # Build Phi columns
-                    G_cols = []
+                    G_d = ones_col @ col_sum_S_list[j]
+                    G_cols.append(G_d.reshape(-1))
+
+                Phi = torch.stack(G_cols, dim=1)  # (ph*full_w, n_params)
+                rhs = R_S.reshape(-1, 1)
+                PtP_list.append(Phi.T @ Phi)
+                Ptr_list.append(Phi.T @ rhs)
+
+            # Batch solve: (R, P, P) x (R, P, 1)
+            PtP_batch = torch.stack(PtP_list)
+            Ptr_batch = torch.stack(Ptr_list)
+            mean_diag = PtP_batch.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
+            eye = torch.eye(n_params, dtype=dtype).unsqueeze(0)
+
+            theta_batch = None
+            for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
+                try:
+                    A = PtP_batch + reg * mean_diag * eye
+                    sol = torch.linalg.solve(A, Ptr_batch)
+                    if sol.isfinite().all():
+                        theta_batch = sol.squeeze(-1)
+                        break
+                except Exception:
+                    continue
+
+            if theta_batch is not None:
+                for i in range(num_row_groups):
+                    theta = theta_batch[i]
+                    p = 0
                     for j in range(num_col_groups):
-                        S_j = S_j_list[j]
-                        col_sum_S = col_sum_S_list[j]
-
-                        bits = binary_data[(i, j)]
+                        coeffs = []
                         for b_idx in range(current_bits):
-                            Y_b, Z_b = bits[b_idx]
-                            Y_b = Y_b.to(dtype=dtype)
-                            Z_b = Z_b.to(dtype=dtype)
-
-                            G_a = (Y_b @ Z_b) @ S_j
-                            G_b = Y_b.sum(dim=-1, keepdim=True) @ col_sum_S
-                            G_c = ones_col @ (Z_b.sum(dim=-2, keepdim=True) @ S_j)
-                            G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
-
-                        G_d = ones_col @ col_sum_S_list[j]
-                        G_cols.append(G_d.reshape(-1))
-
-                    Phi = torch.stack(G_cols, dim=1)  # (ph*full_w, n_params)
-                    rhs = R_S.reshape(-1, 1)
-
-                    PtP_list.append(Phi.T @ Phi)
-                    Ptr_list.append(Phi.T @ rhs)
-                    row_valid.append(i)
-
-                if PtP_list:
-                    # Batch solve: (num_rows, n_params, n_params) @ (num_rows, n_params, 1)
-                    PtP_batch = torch.stack(PtP_list)    # (R, P, P)
-                    Ptr_batch = torch.stack(Ptr_list)     # (R, P, 1)
-                    mean_diag = PtP_batch.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)  # (R,1,1)
-                    eye = torch.eye(n_params, dtype=dtype).unsqueeze(0)
-
-                    theta_batch = None
-                    for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
-                        try:
-                            A = PtP_batch + reg * mean_diag * eye
-                            sol = torch.linalg.solve(A, Ptr_batch)  # (R, P, 1)
-                            if sol.isfinite().all():
-                                theta_batch = sol.squeeze(-1)  # (R, P)
-                                break
-                        except Exception:
-                            continue
-
-                    if theta_batch is not None:
-                        # Unpack theta into per-patch coefficients
-                        for row_idx, i in enumerate(row_valid):
-                            theta = theta_batch[row_idx]
-                            p = 0
-                            for j in range(num_col_groups):
-                                coeffs = []
-                                for b_idx in range(current_bits):
-                                    a_val = theta[p].item(); p += 1
-                                    b_val = theta[p].item(); p += 1
-                                    c_val = theta[p].item(); p += 1
-                                    coeffs.append(torch.tensor([a_val, b_val, c_val, 0.0]))
-                                d_val = theta[p].item(); p += 1
-                                coeffs[0][3] = d_val  # assign d to bit 0
-                                coeffs_data[(i, j)] = coeffs
-                        print(f'  Refined {len(row_valid)} row-groups')
-                    else:
-                        print('  WARNING: batched solve failed')
+                            coeffs.append(torch.tensor([theta[p].item(), theta[p+1].item(), theta[p+2].item(), 0.0]))
+                            p += 3
+                        coeffs[0][3] = theta[p].item()
+                        p += 1
+                        coeffs_data[(i, j)] = coeffs
+                print(f'  Refined {num_row_groups} row-groups')
+            else:
+                print('  WARNING: batched solve failed')
 
             # --- 3. Recompute reconst_accum from updated coefficients ---
             for s in patch_specs:
