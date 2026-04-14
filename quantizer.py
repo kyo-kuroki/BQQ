@@ -1213,19 +1213,12 @@ class BinaryQuadraticQuantization():
         all_decomposed = []
         num_col_groups = len(w_ranges)
 
-        # Wq_total: BQQ outputs WITH compensation (for final reconstruction)
-        # Wq_clean: BQQ outputs WITHOUT compensation (for bit-to-bit residual)
         Wq_total = torch.zeros(original_h, original_w, dtype=dtype)
-        Wq_clean = torch.zeros(original_h, original_w, dtype=dtype)
 
         for bit_idx in range(bit_width):
-            # Wres from CLEAN reconstruction (no compensation leakage)
-            Wres = x_tensor - Wq_clean
+            Wres = x_tensor - Wq_total
 
-            # Intra-bit compensation only on LAST bit (earlier bits need clean residuals)
-            use_compensation = (bit_idx == bit_width - 1)
-
-            # W_work: copy of Wres, modified by compensation WITHIN this bit only
+            # W_work: copy of Wres, modified by compensation WITHIN this bit
             W_work = Wres.clone()
 
             for j, (c0, c1) in enumerate(w_ranges):
@@ -1257,9 +1250,7 @@ class BinaryQuadraticQuantization():
                                   + coeff[1] * yb.sum(dim=1, keepdim=True)
                                   + coeff[2] * zb.sum(dim=0, keepdim=True)
                                   + coeff[3])
-                    comp_applied = W_work[r0:r1, c0:c1] - Wres[r0:r1, c0:c1]
-                    Wq_total[r0:r1, c0:c1] += bit_reconst  # with compensation (for final output)
-                    Wq_clean[r0:r1, c0:c1] += bit_reconst - comp_applied  # without compensation (for residual)
+                    Wq_total[r0:r1, c0:c1] += bit_reconst
                     # Error for compensation: measured on compensated W_work
                     E_j[r0:r1, :] = col_patches[b_idx] - bit_reconst
 
@@ -1271,8 +1262,8 @@ class BinaryQuadraticQuantization():
                         'bit_idx': bit_idx,
                     })
 
-                # Compensate remaining columns of W_work (last bit only)
-                if use_compensation and c1 < original_w:
+                # Compensate remaining columns of W_work
+                if c1 < original_w:
                     H_22 = H[c1:, c1:]
                     H_21 = H[c1:, c0:c1]
                     try:
