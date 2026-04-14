@@ -122,12 +122,18 @@ def get_quantizable_linears(block):
 
 
 def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
-                            rank_scale, seed, device_id):
-    """Quantize a 2D weight tensor with BQQ. Returns (A, Y, Z) for BinaryQuadratic."""
+                            rank_scale, seed, device_id, H=None,
+                            scale_refine=True, damping=1e-6):
+    """Quantize a 2D weight tensor with BQQ. Returns (A, Y, Z) for BinaryQuadratic.
+
+    If H is provided, uses intra-layer Hessian-aware BQQ (column-wise compensation).
+    Otherwise falls back to standard BQQ.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         consolidated_path = os.path.join(tmpdir, 'temp.pth')
         quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
-        quantizer.bqq_large_matrix_multi_worker(
+
+        kwargs = dict(
             max_patch_size=group_size,
             bit_width=bit_width,
             consolidated_path=consolidated_path,
@@ -135,6 +141,11 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
             seed=seed,
             main_gpu_id=device_id,
         )
+        if H is not None:
+            kwargs.update(H=H, hessian_mode='intra-layer',
+                          scale_refine=scale_refine, damping=damping)
+
+        quantizer.bqq_large_matrix_multi_worker(**kwargs)
         patches = torch.load(consolidated_path, weights_only=False, map_location='cpu')
 
     A, Y, Z = get_bqq_matrices(patches, bit_width)
@@ -256,6 +267,43 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
 # Main block quantization routine
 # ---------------------------------------------------------------------------
 
+def collect_block_hessians(block, inputs_cache, device):
+    """Collect H = X^T X for each Linear layer in block using cached block inputs."""
+    H_dict = {}
+    handles = []
+
+    linear_names = get_quantizable_linears(block)
+
+    def make_hook(name):
+        def _hook(module, inp, _out):
+            x = inp[0].detach().float()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
+            h = x.T @ x
+            if name not in H_dict:
+                H_dict[name] = h
+            else:
+                H_dict[name].add_(h)
+        return _hook
+
+    for name, module in block.named_modules():
+        if name in linear_names and isinstance(module, nn.Linear):
+            handles.append(module.register_forward_hook(make_hook(name)))
+
+    block.to(device).eval()
+    with torch.no_grad():
+        for inp in tqdm(inputs_cache, desc='Collecting block Hessians'):
+            try:
+                run_block_forward(block, inp, device)
+            except Exception:
+                pass
+
+    for h in handles:
+        h.remove()
+
+    return {k: v.cpu() for k, v in H_dict.items()}
+
+
 def quantize_block(
     model_name,
     block_idx,
@@ -269,6 +317,8 @@ def quantize_block(
     epochs,
     lr,
     max_grad_norm=1.0,
+    scale_refine=True,
+    damping=1e-6,
     device,
     save_dir,
 ):
@@ -312,6 +362,11 @@ def quantize_block(
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\nInitial block MSE (pretrained): {init_mse:.6f}')
 
+    # Collect Hessians for all Linears in block
+    print('Collecting Hessians for block Linears...')
+    H_dict = collect_block_hessians(block, inputs_cache, dev)
+    print(f'  Collected {len(H_dict)} Hessians')
+
     for i, linear_name in enumerate(linear_names):
         linear = _get_submodule(block, linear_name)
         weight = linear.weight.data.clone().float()
@@ -320,11 +375,13 @@ def quantize_block(
         print(f'\n--- [{i + 1}/{len(linear_names)}] {linear_name} '
               f'{tuple(weight.shape)} ---')
 
-        # a. BQQ quantize
+        # a. BQQ quantize (Hessian-aware if available)
+        H = H_dict.get(linear_name)
         A, Y, Z = quantize_weight_to_bqq(
             weight, bit_width=bit_width, group_size=group_size,
             num_steps=num_steps, rank_scale=rank_scale, seed=seed,
-            device_id=device_id,
+            device_id=device_id, H=H, scale_refine=scale_refine,
+            damping=damping,
         )
 
         # b. Replace Linear -> BinaryQuadratic
@@ -391,6 +448,11 @@ def main():
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
 
+    # Hessian-aware
+    parser.add_argument('--no_scale_refine', action='store_true',
+                        help='Disable Hessian-aware scale refinement after intra-layer')
+    parser.add_argument('--damping', type=float, default=1e-6)
+
     # Device / output
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--save_dir', type=str, required=True)
@@ -421,6 +483,8 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         max_grad_norm=args.max_grad_norm,
+        scale_refine=not args.no_scale_refine,
+        damping=args.damping,
         device=args.device,
         save_dir=args.save_dir,
     )
