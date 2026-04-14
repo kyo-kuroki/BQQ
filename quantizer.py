@@ -663,28 +663,29 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter'):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
         Args:
             use_batch: Trueの場合バッチ処理(デフォルト)。Falseならマルチプロセス。
             H: 入力相関行列 X^T X (in_features, in_features)。
-            hessian_mode: 'inter' = inter-bit scale refinement (default),
+            hessian_mode: 'inter' = inter-bit scale refinement,
                           'intra' = intra-bit column compensation (last bit only),
-                          'column' = column-wise N-bit BQQ + compensation.
+                          'intra-layer' = column-wise N-bit BQQ + compensation.
+            scale_refine: Trueの場合、最後にinter-bit hessian-aware scale refinementを実行。
             damping: Hessian-awareのTikhonov正則化。
         """
-        if H is not None and hessian_mode == 'column':
-            return self._column_wise_hessian_aware_large_matrix_batched(
+        if H is not None and hessian_mode == 'intra-layer':
+            return self._intra_layer_hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine)
         elif H is not None and hessian_mode == 'intra':
             return self._intra_bit_hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
         elif H is not None:
-            return self._hessian_aware_large_matrix_batched(
+            return self._inter_bit_hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
         elif use_batch:
@@ -922,7 +923,7 @@ class BinaryQuadraticQuantization():
     # Hessian-aware large matrix batched
     # ------------------------------------------------------------------
 
-    def _hessian_aware_large_matrix_batched(
+    def _inter_bit_hessian_aware_large_matrix_batched(
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
         damping=1e-6,
@@ -1292,14 +1293,15 @@ class BinaryQuadraticQuantization():
         self.x = copy.copy(x_copy)
         return Wq_total
 
-    def _column_wise_hessian_aware_large_matrix_batched(
+    def _intra_layer_hessian_aware_large_matrix_batched(
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6,
+        damping=1e-6, scale_refine=False,
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
         each with full N-bit BQQ decomposition followed by GPTQ-style compensation.
+        If scale_refine=True, finishes with inter-bit Hessian-aware scale refinement.
 
         For each column group j (left to right):
           1. N-bit BQQ decompose W_work[:, c0:c1] (all bits, all row groups)
@@ -1398,6 +1400,83 @@ class BinaryQuadraticQuantization():
                     print(f'  Compensated remaining {original_w - c1} columns')
                 except Exception as e:
                     print(f'  WARNING: compensation failed: {e}')
+
+        # --- Optional: inter-bit Hessian-aware scale refinement ---
+        if scale_refine:
+            from collections import defaultdict as _dd
+            print(f'Scale refine: {len(h_ranges)} row-groups, {bit_width} bits')
+
+            S = self._cholesky_safe(H, damping)
+            if S is None:
+                print('  WARNING: Cholesky failed, skipping scale refine')
+            else:
+                S_j_list = [S[c0:c1, :] for c0, c1 in w_ranges]
+                col_sum_S_list = [sj.sum(dim=0, keepdim=True) for sj in S_j_list]
+
+                binary_by_patch = _dd(list)
+                for p in sorted(all_decomposed, key=lambda pp: (pp['patch_row'], pp['patch_col'], pp['bit_idx'])):
+                    binary_by_patch[(p['patch_row'], p['patch_col'])].append((p['mat1'], p['mat2']))
+
+                n_params = num_col_groups * (3 * bit_width + 1)
+                PtP_list, Ptr_list = [], []
+                ones_col_ph = {}
+
+                for i, (r0, r1) in enumerate(h_ranges):
+                    ph = r1 - r0
+                    R_S = x_tensor[r0:r1, :].to(dtype=dtype) @ S
+                    if ph not in ones_col_ph:
+                        ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
+                    ones_col = ones_col_ph[ph]
+
+                    G_cols = []
+                    for j in range(num_col_groups):
+                        for b_idx in range(bit_width):
+                            Y_b, Z_b = binary_by_patch[(i, j)][b_idx]
+                            Y_b, Z_b = Y_b.to(dtype=dtype), Z_b.to(dtype=dtype)
+                            G_cols.extend([
+                                ((Y_b @ Z_b) @ S_j_list[j]).reshape(-1),
+                                (Y_b.sum(-1, keepdim=True) @ col_sum_S_list[j]).reshape(-1),
+                                (ones_col @ (Z_b.sum(-2, keepdim=True) @ S_j_list[j])).reshape(-1),
+                            ])
+                        G_cols.append((ones_col @ col_sum_S_list[j]).reshape(-1))
+
+                    Phi = torch.stack(G_cols, dim=1)
+                    PtP_list.append(Phi.T @ Phi)
+                    Ptr_list.append(Phi.T @ R_S.reshape(-1, 1))
+
+                PtP_batch = torch.stack(PtP_list)
+                Ptr_batch = torch.stack(Ptr_list)
+                mean_diag = PtP_batch.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
+                eye = torch.eye(n_params, dtype=dtype).unsqueeze(0)
+
+                theta_batch = None
+                for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
+                    try:
+                        sol = torch.linalg.solve(PtP_batch + reg * mean_diag * eye, Ptr_batch)
+                        if sol.isfinite().all():
+                            theta_batch = sol.squeeze(-1)
+                            break
+                    except Exception:
+                        continue
+
+                if theta_batch is not None:
+                    Wq = torch.zeros(original_h, original_w, dtype=dtype)
+                    for i, (r0, r1) in enumerate(h_ranges):
+                        theta = theta_batch[i]
+                        p2 = 0
+                        for j, (c0, c1) in enumerate(w_ranges):
+                            for b_idx in range(bit_width):
+                                a_v, b_v, c_v = theta[p2].item(), theta[p2+1].item(), theta[p2+2].item()
+                                p2 += 3
+                                Y_b, Z_b = binary_by_patch[(i, j)][b_idx]
+                                Wq[r0:r1, c0:c1] += (a_v * Y_b.float() @ Z_b.float()
+                                    + b_v * Y_b.float().sum(1, keepdim=True)
+                                    + c_v * Z_b.float().sum(0, keepdim=True))
+                            d_v = theta[p2].item(); p2 += 1
+                            Wq[r0:r1, c0:c1] += d_v
+                    print(f'  Scale refine done')
+                else:
+                    print('  WARNING: scale refine solve failed')
 
         # Save
         if consolidated_path and all_decomposed:
