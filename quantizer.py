@@ -663,17 +663,23 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
         結果は consolidated_path に1ファイルで保存する。
         既存の consolidated_path があれば完了済みパッチをスキップして再開する。
 
         Args:
-            use_batch: Trueの場合 run_bqq_compile_batched でバッチ処理(デフォルト)。
-                       Falseの場合マルチプロセスワーカーで処理。
+            use_batch: Trueの場合バッチ処理(デフォルト)。Falseならマルチプロセス。
+            H: 入力相関行列 X^T X (in_features, in_features)。
+               指定時はHessian-awareスケール最適化をbit毎に実行。
+            damping: Hessian-awareのTikhonov正則化。
         """
-        if use_batch:
+        if H is not None:
+            return self._hessian_aware_large_matrix_batched(
+                max_patch_size, bit_width, H, consolidated_path,
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
+        elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id)
@@ -886,7 +892,264 @@ class BinaryQuadraticQuantization():
 
         self.x = copy.copy(x_copy)
         return reconstructed_tensor
-    
+
+    # ------------------------------------------------------------------
+    # Hessian-aware scale refinement helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _cholesky_safe(C, damping=1e-6):
+        """Cholesky with adaptive damping."""
+        mean_diag = C.diagonal().mean().item()
+        for scale in [damping, 1e-4, 1e-2, 1e-1]:
+            try:
+                return torch.linalg.cholesky(
+                    C + scale * mean_diag * torch.eye(C.shape[0], device=C.device, dtype=C.dtype))
+            except torch.linalg.LinAlgError:
+                continue
+        return None
+
+    @staticmethod
+    def _refine_patch_hessian(W_patch, binary_list, H_j, damping=1e-6):
+        """
+        Hessian-aware scale refinement for a single patch.
+
+        Solves:  min_{a,b,c,d}  || (W - Wq) S_j ||^2
+        where S_j = chol(H_j),  Wq = sum_b [a_b Y_b Z_b + b_b Y_sum + c_b Z_sum] + d
+
+        Args:
+            W_patch: (ph, pw) original weight patch
+            binary_list: list of (Y_b, Z_b) tuples, one per bit (float tensors)
+            H_j: (pw, pw) input correlation sub-matrix
+            damping: Tikhonov regularization
+
+        Returns:
+            list of (4,) tensors [a, b, c, d_share] per bit, or None on failure
+        """
+        device = W_patch.device
+        dtype = torch.float32
+        ph, pw = W_patch.shape
+        num_bits = len(binary_list)
+
+        W_patch = W_patch.to(dtype=dtype)
+        H_j = H_j.to(device=device, dtype=dtype)
+
+        S_j = BinaryQuadraticQuantization._cholesky_safe(H_j, damping)
+        if S_j is None:
+            return None
+
+        R_S = W_patch @ S_j                           # (ph, pw)
+        col_sum_S = S_j.sum(dim=0, keepdim=True)       # (1, pw)
+        ones_col = torch.ones(ph, 1, device=device, dtype=dtype)
+
+        G_cols = []
+        for Y_b, Z_b in binary_list:
+            Y_b = Y_b.to(device=device, dtype=dtype)
+            Z_b = Z_b.to(device=device, dtype=dtype)
+            Y_sum = Y_b.sum(dim=-1, keepdim=True)       # (ph, 1)
+            Z_sum = Z_b.sum(dim=-2, keepdim=True)        # (1, pw)
+
+            G_a = (Y_b @ Z_b) @ S_j                     # (ph, pw)
+            G_b = Y_sum @ col_sum_S                      # (ph, pw)
+            G_c = ones_col @ (Z_sum @ S_j)               # (ph, pw)
+            G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
+
+        G_d = ones_col @ col_sum_S                       # (ph, pw)
+        G_cols.append(G_d.reshape(-1))
+
+        Phi = torch.stack(G_cols, dim=1)                 # (ph*pw, 3*bits+1)
+        rhs = R_S.reshape(-1, 1)
+
+        PtP = Phi.T @ Phi
+        Ptr = Phi.T @ rhs
+        mean_diag_p = PtP.diagonal().mean().item()
+
+        theta = None
+        for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
+            try:
+                lam = reg * mean_diag_p
+                A = PtP + lam * torch.eye(PtP.shape[0], device=device, dtype=dtype)
+                sol = torch.linalg.solve(A, Ptr).squeeze(1)
+                if sol.isfinite().all():
+                    theta = sol
+                    break
+            except Exception:
+                continue
+
+        if theta is None:
+            return None
+
+        # Pack into per-bit (4,) coefficients
+        # d is shared: assign full d to bit 0, 0 to rest
+        coeffs = []
+        d_val = theta[-1].item()
+        for b in range(num_bits):
+            a_val = theta[3 * b].item()
+            b_val = theta[3 * b + 1].item()
+            c_val = theta[3 * b + 2].item()
+            d_b = d_val if b == 0 else 0.0
+            coeffs.append(torch.tensor([a_val, b_val, c_val, d_b]))
+        return coeffs
+
+    # ------------------------------------------------------------------
+    # Hessian-aware large matrix batched
+    # ------------------------------------------------------------------
+
+    def _hessian_aware_large_matrix_batched(
+        self, max_patch_size, bit_width, H,
+        consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
+        damping=1e-6,
+    ):
+        """
+        Hessian-aware BQQ quantization.
+
+        Same patching and batched binary decomposition as _large_matrix_batched,
+        but after each bit, refines ALL scale coefficients (bits 0..current)
+        to minimise  tr((W - Wq) H (W - Wq)^T).
+
+        The refinement is done per-patch independently (row-group structure
+        makes patches on different rows fully independent).
+
+        Args:
+            H: Input correlation matrix (in_features, in_features), i.e. X^T X.
+               Must be on CPU; will be sliced per column-group.
+        """
+        from collections import defaultdict
+        rank_scale_copy = copy.copy(self.rank_scale)
+        x_copy = copy.deepcopy(self.x)
+        original_h, original_w = x_copy.shape
+
+        def get_max_divisor(num, max_value):
+            limit = max(int(math.sqrt(num)), max_value)
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        def compute_patch_ranges(dim_size, max_ps):
+            divisor = get_max_divisor(dim_size, max_ps)
+            if divisor >= max_ps // 2:
+                n = dim_size // divisor
+                return [(i * divisor, (i + 1) * divisor) for i in range(n)]
+            else:
+                n_full = dim_size // max_ps
+                rem = dim_size - n_full * max_ps
+                if 0 < rem < max_ps // 2 and n_full > 0:
+                    n_full -= 1
+                ranges = [(i * max_ps, (i + 1) * max_ps) for i in range(n_full)]
+                if n_full * max_ps < dim_size:
+                    ranges.append((n_full * max_ps, dim_size))
+                return ranges
+
+        h_ranges = compute_patch_ranges(original_h, max_patch_size)
+        w_ranges = compute_patch_ranges(original_w, max_patch_size)
+
+        patch_specs = []
+        for i, (r0, r1) in enumerate(h_ranges):
+            for j, (c0, c1) in enumerate(w_ranges):
+                patch_specs.append({'i': i, 'j': j, 'r0': r0, 'r1': r1, 'c0': c0, 'c1': c1})
+        total_patches = len(patch_specs)
+
+        size_counts = defaultdict(int)
+        for s in patch_specs:
+            size_counts[(s['r1'] - s['r0'], s['c1'] - s['c0'])] += 1
+        for (ph, pw), cnt in sorted(size_counts.items(), key=lambda x: -x[1]):
+            print(f'Patch Size:({ph}x{pw}), Count: {cnt}')
+
+        x_tensor = torch.tensor(x_copy).float()
+        H = H.float()  # ensure float32
+
+        # Per-patch binary data: binary_data[(i,j)] = [(Y_0, Z_0), (Y_1, Z_1), ...]
+        binary_data = defaultdict(list)
+        # Per-patch current coefficients: coeffs_data[(i,j)] = [coeff_0, coeff_1, ...]
+        coeffs_data = defaultdict(list)
+        # Reconstruction accumulator
+        reconst_accum = {}
+        for s in patch_specs:
+            reconst_accum[(s['i'], s['j'])] = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
+
+        for bit_idx in range(bit_width):
+            # --- 1. Compute residuals and run batched BQQ ---
+            size_groups = defaultdict(list)
+            for s in patch_specs:
+                key = (s['i'], s['j'])
+                ph, pw = s['r1'] - s['r0'], s['c1'] - s['c0']
+                original = x_tensor[s['r0']:s['r1'], s['c0']:s['c1']]
+                residual = original - reconst_accum[key]
+                size_groups[(ph, pw)].append((s, residual))
+
+            for (ph, pw), group in size_groups.items():
+                specs = [g[0] for g in group]
+                residuals = [g[1] for g in group]
+                x_batch = torch.stack(residuals)
+                print(f'Bit {bit_idx}: decomposing {len(residuals)} patches of ({ph}x{pw})')
+
+                y_b, z_b, a_b = self.run_bqq_compile_batched(
+                    x_batch, rank_scale=rank_scale_copy,
+                    zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                    Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                )
+
+                for b, s in enumerate(specs):
+                    key = (s['i'], s['j'])
+                    binary_data[key].append((y_b[b].cpu(), z_b[b].cpu()))
+                    coeffs_data[key].append(a_b[b].cpu())
+
+            # --- 2. Hessian-aware scale refinement (all bits 0..bit_idx) ---
+            print(f'Bit {bit_idx}: refining scales for {total_patches} patches (Hessian-aware)')
+            n_refined = 0
+            for s in patch_specs:
+                key = (s['i'], s['j'])
+                r0, r1, c0, c1 = s['r0'], s['r1'], s['c0'], s['c1']
+
+                W_patch = x_tensor[r0:r1, c0:c1]
+                H_j = H[c0:c1, c0:c1]
+
+                new_coeffs = self._refine_patch_hessian(
+                    W_patch, binary_data[key], H_j, damping)
+
+                if new_coeffs is not None:
+                    coeffs_data[key] = new_coeffs
+                    n_refined += 1
+
+            print(f'  Refined {n_refined}/{total_patches} patches')
+
+            # --- 3. Recompute reconst_accum from updated coefficients ---
+            for s in patch_specs:
+                key = (s['i'], s['j'])
+                accum = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
+                for (Y_b, Z_b), coeff in zip(binary_data[key], coeffs_data[key]):
+                    a0, a1, a2, a3 = coeff[0], coeff[1], coeff[2], coeff[3]
+                    accum += a0 * Y_b @ Z_b + a1 * Y_b.sum(dim=1, keepdim=True) \
+                           + a2 * Z_b.sum(dim=0, keepdim=True) + a3
+                reconst_accum[key] = accum
+
+        # --- Build all_decomposed for saving ---
+        all_decomposed = []
+        for s in patch_specs:
+            key = (s['i'], s['j'])
+            for bit_idx, ((Y_b, Z_b), coeff) in enumerate(
+                    zip(binary_data[key], coeffs_data[key])):
+                all_decomposed.append({
+                    'patch_row': s['i'], 'patch_col': s['j'],
+                    'row_start': s['r0'], 'row_end': s['r1'],
+                    'col_start': s['c0'], 'col_end': s['c1'],
+                    'coeff': coeff, 'mat1': Y_b, 'mat2': Z_b,
+                    'bit_idx': bit_idx,
+                })
+
+        if consolidated_path and all_decomposed:
+            os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
+            torch.save(all_decomposed, consolidated_path)
+            print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+
+        reconstructed_tensor = torch.zeros(original_h, original_w)
+        for s in patch_specs:
+            reconstructed_tensor[s['r0']:s['r1'], s['c0']:s['c1']] = reconst_accum[(s['i'], s['j'])]
+
+        self.x = copy.copy(x_copy)
+        return reconstructed_tensor
+
 
 class BinaryMatrixFactorization():
     def __init__(self):
