@@ -1210,26 +1210,25 @@ class BinaryQuadraticQuantization():
         x_tensor = torch.tensor(x_copy).float()
         H = H.float()
 
-        # Per-patch data
         all_decomposed = []
-        reconst_accum = {}
-        for s in patch_specs:
-            reconst_accum[(s['i'], s['j'])] = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
-
         num_col_groups = len(w_ranges)
 
+        # Wq_total: BQQ outputs WITH compensation (for final reconstruction)
+        # Wq_clean: BQQ outputs WITHOUT compensation (for bit-to-bit residual)
+        Wq_total = torch.zeros(original_h, original_w, dtype=dtype)
+        Wq_clean = torch.zeros(original_h, original_w, dtype=dtype)
+
         for bit_idx in range(bit_width):
-            # W_work: compensated copy of residual for this bit
-            # residual = x_tensor - reconst_from_previous_bits
-            W_work = x_tensor.clone()
-            for s in patch_specs:
-                key = (s['i'], s['j'])
-                W_work[s['r0']:s['r1'], s['c0']:s['c1']] -= reconst_accum[key]
+            # Wres from CLEAN reconstruction (no compensation leakage)
+            Wres = x_tensor - Wq_clean
+
+            # W_work: copy of Wres, modified by compensation WITHIN this bit only
+            W_work = Wres.clone()
 
             for j, (c0, c1) in enumerate(w_ranges):
                 pw = c1 - c0
 
-                # BQQ decompose column j for all row groups
+                # BQQ input = W_work[:, c0:c1] (compensated within this bit)
                 col_patches = []
                 for i, (r0, r1) in enumerate(h_ranges):
                     col_patches.append(W_work[r0:r1, c0:c1].clone())
@@ -1244,15 +1243,22 @@ class BinaryQuadraticQuantization():
                     Nstep=Nstep, device_id=main_gpu_id, seed=seed
                 )
 
-                # Store results and compute BQQ reconstruction
+                # Store BQQ results. Subtract compensation that was applied to this
+                # column's W_work, so Wq_total only contains the "clean" BQQ approx
+                # of the original Wres (not the compensated version).
+                # compensation_applied[:, c0:c1] = W_work[:, c0:c1] - Wres[:, c0:c1]
+                E_j = torch.zeros(original_h, pw, dtype=dtype)
                 for b_idx, (r0, r1) in enumerate(h_ranges):
-                    key = (b_idx, j)
                     yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
                     bit_reconst = (coeff[0] * yb @ zb
                                   + coeff[1] * yb.sum(dim=1, keepdim=True)
                                   + coeff[2] * zb.sum(dim=0, keepdim=True)
                                   + coeff[3])
-                    reconst_accum[key] += bit_reconst
+                    comp_applied = W_work[r0:r1, c0:c1] - Wres[r0:r1, c0:c1]
+                    Wq_total[r0:r1, c0:c1] += bit_reconst  # with compensation (for final output)
+                    Wq_clean[r0:r1, c0:c1] += bit_reconst - comp_applied  # without compensation (for residual)
+                    # Error for compensation: measured on compensated W_work
+                    E_j[r0:r1, :] = col_patches[b_idx] - bit_reconst
 
                     all_decomposed.append({
                         'patch_row': b_idx, 'patch_col': j,
@@ -1262,26 +1268,8 @@ class BinaryQuadraticQuantization():
                         'bit_idx': bit_idx,
                     })
 
-                    # Quantization error for this row group in column j
-                    E_row = col_patches[b_idx] - bit_reconst  # (ph, pw)
-
-                    # Compensate remaining columns in W_work for this row
-                    if c1 < original_w:
-                        # Only need to do the solve once (shared across rows)
-                        pass  # handled below
-
-                # Compensate remaining columns (solve once, apply to all rows)
+                # Compensate remaining columns of W_work (this bit only)
                 if c1 < original_w:
-                    # E_j = full-height error for column j
-                    E_j = torch.zeros(original_h, pw, dtype=dtype)
-                    for b_idx, (r0, r1) in enumerate(h_ranges):
-                        yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
-                        bit_reconst = (coeff[0] * yb @ zb
-                                      + coeff[1] * yb.sum(dim=1, keepdim=True)
-                                      + coeff[2] * zb.sum(dim=0, keepdim=True)
-                                      + coeff[3])
-                        E_j[r0:r1, :] = col_patches[b_idx] - bit_reconst
-
                     H_22 = H[c1:, c1:]
                     H_21 = H[c1:, c0:c1]
                     try:
@@ -1291,18 +1279,16 @@ class BinaryQuadraticQuantization():
                     except Exception as e:
                         print(f'  WARNING: compensation failed: {e}')
 
+            # W_work is discarded. Next bit starts fresh from x - Wq_total.
+
         # Save
         if consolidated_path and all_decomposed:
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
             torch.save(all_decomposed, consolidated_path)
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
 
-        reconstructed_tensor = torch.zeros(original_h, original_w)
-        for s in patch_specs:
-            reconstructed_tensor[s['r0']:s['r1'], s['c0']:s['c1']] = reconst_accum[(s['i'], s['j'])]
-
         self.x = copy.copy(x_copy)
-        return reconstructed_tensor
+        return Wq_total
 
 
 class BinaryMatrixFactorization():
