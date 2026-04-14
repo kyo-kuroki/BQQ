@@ -69,7 +69,7 @@ APPTAINER_CMD=(
 )
 
 "${APPTAINER_CMD[@]}" \
-    python block_wise_quant.py \
+    python blockwise_quant.py \
         --model_name  "${MODEL_NAME}" \
         --block_idx   "${BLOCK_IDX}" \
         --bit_width   "${BIT_WIDTH}" \

@@ -32,7 +32,7 @@ apptainer exec --nv \
     --env "HF_HOME=${HF_HOME}" \
     --pwd "${LM_DIR}" \
     "${SIF_PATH}" \
-    python block_wise_quant.py \
+    python blockwise_quant.py \
         --model_name "${MODEL_NAME}" \
         --block_idx "${BLOCK_IDX}" \
         --bit_width "${BIT_WIDTH}" \

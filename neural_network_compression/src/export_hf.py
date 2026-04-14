@@ -167,7 +167,7 @@ def export_for_hf(bqq_model, base_model_name, output_dir=None, save_tokenizer=Tr
     Export a BQQ model to HuggingFace-compatible directory.
 
     Args:
-        bqq_model: Model with BinaryQuadratic modules (from build_bqq_model or block_wise_quant)
+        bqq_model: Model with BinaryQuadratic modules (from build_bqq_model or blockwise_quant)
         base_model_name: Original HuggingFace model name (e.g. "Qwen/Qwen3-2B")
         output_dir: Directory to save. If None, defaults to bqq/{ModelName}-{N}bit
         save_tokenizer: Whether to copy tokenizer files from base model

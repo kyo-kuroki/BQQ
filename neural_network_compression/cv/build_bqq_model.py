@@ -3,7 +3,7 @@ Build a BQQ quantized vision model.
 
 Two modes:
   1. From compressed patch data (weight_aware_quant output)
-  2. From block-wise files (block_wise_quant output)
+  2. From block-wise files (blockwise_quant output)
 
 Usage:
   # From compressed patches
@@ -105,7 +105,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, Nstep
 # ---------------------------------------------------------------------------
 
 def assemble_from_blocks(model_name, block_dir, output_dir=None):
-    """Assemble full model from block_*.pth files (block_wise_quant output)."""
+    """Assemble full model from block_*.pth files (blockwise_quant output)."""
     block_dir = Path(block_dir)
     if output_dir is None:
         output_dir = SCRIPT_DIR / "quantized_bqq_model"

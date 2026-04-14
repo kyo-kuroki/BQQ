@@ -19,7 +19,7 @@ apptainer exec --nv \
     --env "HF_HOME=${HF_HOME}" \
     --pwd "${LM_DIR}" \
     "${SIF_PATH}" \
-    python block_wise_quant.py \
+    python blockwise_quant.py \
         --model_name "Qwen/Qwen3.5-4B" \
         --block_idx 15 \
         --bit_width 3 \

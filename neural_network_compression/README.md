@@ -14,7 +14,7 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 | `lm/scripts/qsub_submit_qwen35.sh` | Submit N-bit quantization array jobs on TSUBAME (Qwen3.5-2B/4B/9B) |
 | `lm/scripts/qsub_patch_array_job.sh` | SGE array job body for `quantize-target` (1 task = 1 weight tensor) |
 | `lm/scripts/qsub_extend_array_job.sh` | SGE array job body for `extend-target` (1 task = 1 weight tensor) |
-| `lm/block_wise_quant.py` | Block-wise quantization with block output error optimization |
+| `lm/blockwise_quant.py` | Block-wise quantization with block output error optimization |
 | `lm/build_bqq_model.py` | Replace Linear→BinaryQuadratic, build model from patches or blocks |
 | `lm/scale_refine_bqq.py` | Hessian-based scale factor refinement (post-quantization) |
 | `lm/fine_tuning.py` | Fine-tuning / KL distillation on a quantized model |
@@ -86,7 +86,7 @@ Block-wise quantization optimizes all continuous parameters in a transformer blo
 cd neural_network_compression/lm
 
 # Quantize a single block
-python block_wise_quant.py \
+python blockwise_quant.py \
     --model_name Qwen/Qwen3-2B \
     --block_idx 0 \
     --bit_width 2 \
@@ -114,7 +114,7 @@ As quantization progresses, the number of free parameters decreases (large Linea
 
 ```bash
 for i in $(seq 0 23); do
-    python block_wise_quant.py --model_name Qwen/Qwen3-2B \
+    python blockwise_quant.py --model_name Qwen/Qwen3-2B \
         --block_idx $i --save_dir blockwise_output/Qwen3-2B \
         --device cuda:$((i % 4)) &
 done

@@ -3,7 +3,7 @@ Build a BQQ quantized language model.
 
 Three modes:
   1. From compressed patch data (weight_aware_quant output)
-  2. From block-wise files (block_wise_quant output)
+  2. From block-wise files (blockwise_quant output)
   3. Programmatic: replace_linear_with_bqq() for custom pipelines
 
 Usage:
@@ -154,7 +154,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
 # ---------------------------------------------------------------------------
 
 def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None, output_dir=None):
-    """Assemble full model from block_*.pth files (block_wise_quant output)."""
+    """Assemble full model from block_*.pth files (blockwise_quant output)."""
     block_dir = Path(block_dir)
     output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
     output_dir.mkdir(parents=True, exist_ok=True)
