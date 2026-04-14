@@ -663,19 +663,22 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter'):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
-        結果は consolidated_path に1ファイルで保存する。
-        既存の consolidated_path があれば完了済みパッチをスキップして再開する。
 
         Args:
             use_batch: Trueの場合バッチ処理(デフォルト)。Falseならマルチプロセス。
             H: 入力相関行列 X^T X (in_features, in_features)。
-               指定時はHessian-awareスケール最適化をbit毎に実行。
+            hessian_mode: 'inter' = inter-bit scale refinement (default),
+                          'intra' = intra-bit column compensation (GPTQ-style).
             damping: Hessian-awareのTikhonov正則化。
         """
-        if H is not None:
+        if H is not None and hessian_mode == 'intra':
+            return self._intra_bit_hessian_aware_large_matrix_batched(
+                max_patch_size, bit_width, H, consolidated_path,
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
+        elif H is not None:
             return self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
@@ -1133,6 +1136,162 @@ class BinaryQuadraticQuantization():
                     'bit_idx': bit_idx,
                 })
 
+        if consolidated_path and all_decomposed:
+            os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
+            torch.save(all_decomposed, consolidated_path)
+            print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+
+        reconstructed_tensor = torch.zeros(original_h, original_w)
+        for s in patch_specs:
+            reconstructed_tensor[s['r0']:s['r1'], s['c0']:s['c1']] = reconst_accum[(s['i'], s['j'])]
+
+        self.x = copy.copy(x_copy)
+        return reconstructed_tensor
+
+
+
+
+    def _intra_bit_hessian_aware_large_matrix_batched(
+        self, max_patch_size, bit_width, H,
+        consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
+        damping=1e-6,
+    ):
+        """
+        Intra-bit Hessian-aware BQQ: GPTQ-style column compensation within each bit.
+
+        For each bit:
+          For each column group j (left to right):
+            1. BQQ decompose column j patches
+            2. Compensate remaining columns: W_work[:, c1:] += E_j @ H_12 @ H_22^{-1}
+               where E_j is the quantization error for column j
+
+        The compensation ensures that the Hessian-weighted error tr((W-Wq) H (W-Wq)^T)
+        is minimised by shifting remaining columns to absorb quantization errors.
+
+        NOTE: This does NOT include inter-bit scale refinement. Use
+        _hessian_aware_large_matrix_batched for that.
+        """
+        from collections import defaultdict
+        rank_scale_copy = copy.copy(self.rank_scale)
+        x_copy = copy.deepcopy(self.x)
+        original_h, original_w = x_copy.shape
+        dtype = torch.float32
+
+        def get_max_divisor(num, max_value):
+            limit = max(int(math.sqrt(num)), max_value)
+            for i in range(limit, 0, -1):
+                if num % i == 0 and i <= max_value:
+                    return i
+            return 1
+
+        def compute_patch_ranges(dim_size, max_ps):
+            divisor = get_max_divisor(dim_size, max_ps)
+            if divisor >= max_ps // 2:
+                n = dim_size // divisor
+                return [(i * divisor, (i + 1) * divisor) for i in range(n)]
+            else:
+                n_full = dim_size // max_ps
+                rem = dim_size - n_full * max_ps
+                if 0 < rem < max_ps // 2 and n_full > 0:
+                    n_full -= 1
+                ranges = [(i * max_ps, (i + 1) * max_ps) for i in range(n_full)]
+                if n_full * max_ps < dim_size:
+                    ranges.append((n_full * max_ps, dim_size))
+                return ranges
+
+        h_ranges = compute_patch_ranges(original_h, max_patch_size)
+        w_ranges = compute_patch_ranges(original_w, max_patch_size)
+
+        patch_specs = []
+        for i, (r0, r1) in enumerate(h_ranges):
+            for j, (c0, c1) in enumerate(w_ranges):
+                patch_specs.append({'i': i, 'j': j, 'r0': r0, 'r1': r1, 'c0': c0, 'c1': c1})
+
+        x_tensor = torch.tensor(x_copy).float()
+        H = H.float()
+
+        # Per-patch data
+        all_decomposed = []
+        reconst_accum = {}
+        for s in patch_specs:
+            reconst_accum[(s['i'], s['j'])] = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
+
+        num_col_groups = len(w_ranges)
+
+        for bit_idx in range(bit_width):
+            # W_work: compensated copy of residual for this bit
+            # residual = x_tensor - reconst_from_previous_bits
+            W_work = x_tensor.clone()
+            for s in patch_specs:
+                key = (s['i'], s['j'])
+                W_work[s['r0']:s['r1'], s['c0']:s['c1']] -= reconst_accum[key]
+
+            for j, (c0, c1) in enumerate(w_ranges):
+                pw = c1 - c0
+
+                # BQQ decompose column j for all row groups
+                col_patches = []
+                for i, (r0, r1) in enumerate(h_ranges):
+                    col_patches.append(W_work[r0:r1, c0:c1].clone())
+
+                x_batch = torch.stack(col_patches)
+                print(f'Bit {bit_idx}, col {j}/{num_col_groups}: '
+                      f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
+
+                y_b, z_b, a_b = self.run_bqq_compile_batched(
+                    x_batch, rank_scale=rank_scale_copy,
+                    zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                    Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                )
+
+                # Store results and compute BQQ reconstruction
+                for b_idx, (r0, r1) in enumerate(h_ranges):
+                    key = (b_idx, j)
+                    yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
+                    bit_reconst = (coeff[0] * yb @ zb
+                                  + coeff[1] * yb.sum(dim=1, keepdim=True)
+                                  + coeff[2] * zb.sum(dim=0, keepdim=True)
+                                  + coeff[3])
+                    reconst_accum[key] += bit_reconst
+
+                    all_decomposed.append({
+                        'patch_row': b_idx, 'patch_col': j,
+                        'row_start': r0, 'row_end': r1,
+                        'col_start': c0, 'col_end': c1,
+                        'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                        'bit_idx': bit_idx,
+                    })
+
+                    # Quantization error for this row group in column j
+                    E_row = col_patches[b_idx] - bit_reconst  # (ph, pw)
+
+                    # Compensate remaining columns in W_work for this row
+                    if c1 < original_w:
+                        # Only need to do the solve once (shared across rows)
+                        pass  # handled below
+
+                # Compensate remaining columns (solve once, apply to all rows)
+                if c1 < original_w:
+                    # E_j = full-height error for column j
+                    E_j = torch.zeros(original_h, pw, dtype=dtype)
+                    for b_idx, (r0, r1) in enumerate(h_ranges):
+                        yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
+                        bit_reconst = (coeff[0] * yb @ zb
+                                      + coeff[1] * yb.sum(dim=1, keepdim=True)
+                                      + coeff[2] * zb.sum(dim=0, keepdim=True)
+                                      + coeff[3])
+                        E_j[r0:r1, :] = col_patches[b_idx] - bit_reconst
+
+                    H_22 = H[c1:, c1:]
+                    H_21 = H[c1:, c0:c1]
+                    try:
+                        M = torch.linalg.solve(H_22, H_21)
+                        W_work[:, c1:] += E_j @ M.T
+                        print(f'  Compensated remaining {original_w - c1} columns')
+                    except Exception as e:
+                        print(f'  WARNING: compensation failed: {e}')
+
+        # Save
         if consolidated_path and all_decomposed:
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
             torch.save(all_decomposed, consolidated_path)
