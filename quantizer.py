@@ -910,65 +910,93 @@ class BinaryQuadraticQuantization():
         return None
 
     @staticmethod
-    def _refine_patch_hessian(W_patch, binary_list, H_j, damping=1e-6):
+    def _refine_row_group_hessian(W_row, binary_row, H_full, col_ranges, damping=1e-6):
         """
-        Hessian-aware scale refinement for a single patch.
+        Hessian-aware scale refinement for one row-group of patches.
 
-        Solves:  min_{a,b,c,d}  || (W - Wq) S_j ||^2
-        where S_j = chol(H_j),  Wq = sum_b [a_b Y_b Z_b + b_b Y_sum + c_b Z_sum] + d
+        Jointly optimises scale coefficients for ALL column patches in the same
+        row, because the output error  ||[w1,w2,...] X - [w1q,w2q,...] X||²
+        couples patches through the off-diagonal blocks of H.
+
+        Solves:  min_theta  || (W_row - Wq_row) S ||²
+        where S = chol(H_full),
+              W_row = (ph, full_width),
+              Wq_row = sum_b [...] assembled from all column patches.
 
         Args:
-            W_patch: (ph, pw) original weight patch
-            binary_list: list of (Y_b, Z_b) tuples, one per bit (float tensors)
-            H_j: (pw, pw) input correlation sub-matrix
+            W_row: (ph, full_width) original weight row-group
+            binary_row: dict j -> [(Y_0, Z_0), (Y_1, Z_1), ...] per column patch
+            H_full: (full_width, full_width) full input correlation for all columns
+            col_ranges: list of (c0, c1) for each column index j
             damping: Tikhonov regularization
 
         Returns:
-            list of (4,) tensors [a, b, c, d_share] per bit, or None on failure
+            dict j -> list of (4,) coefficients per bit, or None on failure
         """
-        device = W_patch.device
         dtype = torch.float32
-        ph, pw = W_patch.shape
-        num_bits = len(binary_list)
+        ph = W_row.shape[0]
+        full_w = W_row.shape[1]
 
-        W_patch = W_patch.to(dtype=dtype)
-        H_j = H_j.to(device=device, dtype=dtype)
+        W_row = W_row.to(dtype=dtype)
+        H_full = H_full.to(dtype=dtype)
 
-        S_j = BinaryQuadraticQuantization._cholesky_safe(H_j, damping)
-        if S_j is None:
+        S = BinaryQuadraticQuantization._cholesky_safe(H_full, damping)
+        if S is None:
             return None
 
-        R_S = W_patch @ S_j                           # (ph, pw)
-        col_sum_S = S_j.sum(dim=0, keepdim=True)       # (1, pw)
-        ones_col = torch.ones(ph, 1, device=device, dtype=dtype)
+        # Target: W_row @ S  (ph, full_w)
+        R_S = W_row @ S
 
+        # Build design matrix: one set of (a,b,c) per (bit, col_patch) + one d per col_patch
+        # Parameter order: for each j: [a_{0,j}, b_{0,j}, c_{0,j}, ..., a_{B,j}, b_{B,j}, c_{B,j}, d_j]
         G_cols = []
-        for Y_b, Z_b in binary_list:
-            Y_b = Y_b.to(device=device, dtype=dtype)
-            Z_b = Z_b.to(device=device, dtype=dtype)
-            Y_sum = Y_b.sum(dim=-1, keepdim=True)       # (ph, 1)
-            Z_sum = Z_b.sum(dim=-2, keepdim=True)        # (1, pw)
+        param_map = []  # (j, bit_or_d, param_type) for unpacking
 
-            G_a = (Y_b @ Z_b) @ S_j                     # (ph, pw)
-            G_b = Y_sum @ col_sum_S                      # (ph, pw)
-            G_c = ones_col @ (Z_sum @ S_j)               # (ph, pw)
-            G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
+        ones_col = torch.ones(ph, 1, dtype=dtype)
 
-        G_d = ones_col @ col_sum_S                       # (ph, pw)
-        G_cols.append(G_d.reshape(-1))
+        for j, (c0, c1) in enumerate(col_ranges):
+            pw = c1 - c0
+            S_j = S[c0:c1, :]  # (pw, full_w) — j-th col block of S
 
-        Phi = torch.stack(G_cols, dim=1)                 # (ph*pw, 3*bits+1)
+            col_sum_S = S_j.sum(dim=0, keepdim=True)  # (1, full_w)
+
+            bits = binary_row.get(j, [])
+            for b_idx, (Y_b, Z_b) in enumerate(bits):
+                Y_b = Y_b.to(dtype=dtype)
+                Z_b = Z_b.to(dtype=dtype)
+                Y_sum = Y_b.sum(dim=-1, keepdim=True)    # (ph, 1)
+                Z_sum = Z_b.sum(dim=-2, keepdim=True)     # (1, pw)
+
+                G_a = (Y_b @ Z_b) @ S_j                   # (ph, full_w)
+                G_b = Y_sum @ col_sum_S                    # (ph, full_w)
+                G_c = ones_col @ (Z_sum @ S_j)             # (ph, full_w)
+
+                G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
+                param_map.extend([(j, b_idx, 'a'), (j, b_idx, 'b'), (j, b_idx, 'c')])
+
+            # d term for this column patch
+            S_j_sum = S_j.sum(dim=0, keepdim=True)  # same as col_sum_S
+            G_d = ones_col @ S_j_sum                        # (ph, full_w)
+            G_cols.append(G_d.reshape(-1))
+            param_map.append((j, -1, 'd'))
+
+        if not G_cols:
+            return None
+
+        Phi = torch.stack(G_cols, dim=1)  # (ph * full_w, n_params)
         rhs = R_S.reshape(-1, 1)
 
         PtP = Phi.T @ Phi
         Ptr = Phi.T @ rhs
         mean_diag_p = PtP.diagonal().mean().item()
+        if mean_diag_p == 0:
+            return None
 
         theta = None
         for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
             try:
                 lam = reg * mean_diag_p
-                A = PtP + lam * torch.eye(PtP.shape[0], device=device, dtype=dtype)
+                A = PtP + lam * torch.eye(PtP.shape[0], dtype=dtype)
                 sol = torch.linalg.solve(A, Ptr).squeeze(1)
                 if sol.isfinite().all():
                     theta = sol
@@ -979,17 +1007,32 @@ class BinaryQuadraticQuantization():
         if theta is None:
             return None
 
-        # Pack into per-bit (4,) coefficients
-        # d is shared: assign full d to bit 0, 0 to rest
-        coeffs = []
-        d_val = theta[-1].item()
-        for b in range(num_bits):
-            a_val = theta[3 * b].item()
-            b_val = theta[3 * b + 1].item()
-            c_val = theta[3 * b + 2].item()
-            d_b = d_val if b == 0 else 0.0
-            coeffs.append(torch.tensor([a_val, b_val, c_val, d_b]))
-        return coeffs
+        # Unpack theta into per-patch, per-bit coefficients
+        from collections import defaultdict
+        abc = defaultdict(lambda: defaultdict(dict))  # abc[j][b][type] = val
+        d_vals = {}
+
+        for idx, (j, b_idx, ptype) in enumerate(param_map):
+            val = theta[idx].item()
+            if ptype == 'd':
+                d_vals[j] = val
+            else:
+                abc[j][b_idx][ptype] = val
+
+        result = {}
+        for j, (c0, c1) in enumerate(col_ranges):
+            bits = binary_row.get(j, [])
+            num_bits = len(bits)
+            coeffs = []
+            for b_idx in range(num_bits):
+                a_val = abc[j][b_idx].get('a', 0.0)
+                b_val = abc[j][b_idx].get('b', 0.0)
+                c_val = abc[j][b_idx].get('c', 0.0)
+                d_b = d_vals.get(j, 0.0) if b_idx == 0 else 0.0
+                coeffs.append(torch.tensor([a_val, b_val, c_val, d_b]))
+            result[j] = coeffs
+
+        return result
 
     # ------------------------------------------------------------------
     # Hessian-aware large matrix batched
@@ -1095,24 +1138,29 @@ class BinaryQuadraticQuantization():
                     binary_data[key].append((y_b[b].cpu(), z_b[b].cpu()))
                     coeffs_data[key].append(a_b[b].cpu())
 
-            # --- 2. Hessian-aware scale refinement (all bits 0..bit_idx) ---
-            print(f'Bit {bit_idx}: refining scales for {total_patches} patches (Hessian-aware)')
+            # --- 2. Hessian-aware scale refinement per row-group ---
+            # All column patches in the same row are jointly optimised because
+            # ||[w1,w2,...] X||^2 couples them through off-diagonal H blocks.
+            num_row_groups = len(h_ranges)
+            print(f'Bit {bit_idx}: refining scales for {num_row_groups} row-groups (Hessian-aware)')
             n_refined = 0
-            for s in patch_specs:
-                key = (s['i'], s['j'])
-                r0, r1, c0, c1 = s['r0'], s['r1'], s['c0'], s['c1']
+            for i, (r0, r1) in enumerate(h_ranges):
+                W_row = x_tensor[r0:r1, :]                # (ph, full_width)
+                # Collect column ranges and binary data for this row
+                col_ranges_for_row = [(c0, c1) for (c0, c1) in w_ranges]
+                binary_row = {}
+                for j in range(len(w_ranges)):
+                    binary_row[j] = binary_data[(i, j)]
 
-                W_patch = x_tensor[r0:r1, c0:c1]
-                H_j = H[c0:c1, c0:c1]
+                result = self._refine_row_group_hessian(
+                    W_row, binary_row, H, col_ranges_for_row, damping)
 
-                new_coeffs = self._refine_patch_hessian(
-                    W_patch, binary_data[key], H_j, damping)
-
-                if new_coeffs is not None:
-                    coeffs_data[key] = new_coeffs
+                if result is not None:
+                    for j, coeffs in result.items():
+                        coeffs_data[(i, j)] = coeffs
                     n_refined += 1
 
-            print(f'  Refined {n_refined}/{total_patches} patches')
+            print(f'  Refined {n_refined}/{num_row_groups} row-groups')
 
             # --- 3. Recompute reconst_accum from updated coefficients ---
             for s in patch_specs:
