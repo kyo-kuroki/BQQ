@@ -17,6 +17,10 @@ Usage (all targets sequentially):
 Usage (single target, for parallel SGE array jobs):
   python layerwise_quant.py --model_name Qwen/Qwen3-2B --target_idx 0 ...
   python layerwise_quant.py --model_name Qwen/Qwen3-2B --list_targets  # print count and exit
+
+Usage (block-level parallel, one task = one transformer block, 4-GPU parallel within block):
+  python layerwise_quant.py --model_name Qwen/Qwen3-2B --block_idx 0 ...
+  python layerwise_quant.py --model_name Qwen/Qwen3-2B --list_blocks   # print block count and exit
 """
 
 import argparse
@@ -27,6 +31,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from tqdm import tqdm
 
@@ -105,8 +110,125 @@ def collect_hessians(
     return {k: v for k, v in H.items() if v is not None}
 
 
+class _EarlyExit(Exception):
+    pass
+
+
+def collect_block_hessians(
+    model: nn.Module,
+    calibration_loader,
+    block_idx: int,
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """
+    Collect H = X^T X for all Linear layers in block_idx in a SINGLE forward pass.
+    An early-exit hook stops computation after the target block to save time.
+
+    Returns dict keyed by full module name (e.g. 'model.model.layers.3.self_attn.q_proj').
+    """
+    block = model.model.layers[block_idx]
+    block_prefix = f"model.model.layers.{block_idx}"
+
+    H: Dict[str, Optional[torch.Tensor]] = {}
+    handles = []
+
+    def make_hook(full_name: str):
+        def _hook(module, inp, _out):
+            x = inp[0].detach().float()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
+            h = x.T @ x
+            if H[full_name] is None:
+                H[full_name] = h
+            else:
+                H[full_name].add_(h)
+        return _hook
+
+    for name, module in block.named_modules():
+        if isinstance(module, nn.Linear):
+            full_name = f"{block_prefix}.{name}"
+            H[full_name] = None
+            handles.append(module.register_forward_hook(make_hook(full_name)))
+
+    # Early-exit: stop after block_idx to avoid running the rest of the model
+    def _exit_hook(module, inp, out):
+        raise _EarlyExit()
+
+    handles.append(block.register_forward_hook(_exit_hook))
+
+    model.eval()
+    model.to(device)
+
+    with torch.no_grad():
+        for batch in tqdm(calibration_loader, desc=f"Collecting Hessians (block {block_idx})"):
+            ids = batch[0] if isinstance(batch, (list, tuple)) else batch
+            ids = ids.to(device)
+            try:
+                model(ids)
+            except _EarlyExit:
+                pass
+            except Exception:
+                pass
+
+    for h in handles:
+        h.remove()
+
+    return {k: v for k, v in H.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
-# Main quantization
+# Multi-GPU parallel quantization worker (top-level for mp.spawn pickling)
+# ---------------------------------------------------------------------------
+
+def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
+    """
+    Worker spawned by mp.spawn.
+    Quantizes all tasks assigned to GPU `rank` (= cuda:{rank}).
+    gpu_tasks[rank] is the list of tasks for this worker.
+    """
+    tasks = gpu_tasks[rank]
+    gpu_id = rank
+
+    for task in tasks:
+        module_name = task['module_name']
+        display_idx = task['display_idx']
+        n_total = task['n_total']
+        param_name = f"{module_name}.weight"
+        tensor_path = Path(task['tensor_path'])
+        consolidated_path = Path(task['consolidated_path'])
+
+        if tensor_path.exists():
+            print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name}: already exists, skip")
+            continue
+
+        weight = task['weight']   # CPU tensor (shared memory)
+        H = task.get('H')         # CPU tensor (shared memory) or None
+
+        if H is None:
+            print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name}: no Hessian, skip")
+            continue
+
+        print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
+
+        quantizer = BinaryQuadraticQuantization(weight, rank_scale=common['rank_scale'])
+        reconstructed = quantizer.bqq_large_matrix_multi_worker(
+            max_patch_size=common['group_size'],
+            bit_width=common['bit_width'],
+            consolidated_path=str(consolidated_path),
+            Nstep=common['num_steps'],
+            seed=common['seed'],
+            main_gpu_id=gpu_id,
+            H=H,
+            hessian_mode='intra-layer',
+            scale_refine=common['scale_refine'],
+            damping=common['damping'],
+        )
+        torch.save(reconstructed.cpu(), tensor_path)
+        print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] Saved: {tensor_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main quantization (original: all targets or single --target_idx)
 # ---------------------------------------------------------------------------
 
 def get_target_names(model_name: str, layer_threshold: int = 0) -> List[str]:
@@ -230,6 +352,134 @@ def layerwise_quantize(
 
 
 # ---------------------------------------------------------------------------
+# Block-level quantization (--block_idx): one task per transformer block,
+# all Linear layers collected in one forward pass, quantized in parallel
+# across all available GPUs via mp.spawn.
+# ---------------------------------------------------------------------------
+
+def layerwise_quantize_block(
+    model_name: str,
+    save_dir: Path,
+    block_idx: int,
+    *,
+    bit_width: int,
+    group_size: int,
+    num_steps: int,
+    rank_scale: float,
+    seed: int,
+    scale_refine: bool,
+    damping: float,
+    calibration_loader,
+):
+    """
+    Quantize all Linear layers in transformer block `block_idx`.
+
+    Efficiency improvements vs per-target mode:
+    - Model loaded once (not N times)
+    - All Hessians collected in a single forward pass (early-exit after block)
+    - Quantization distributed across all available GPUs via mp.spawn
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    consolidated_dir = save_dir / '_consolidated'
+    consolidated_dir.mkdir(parents=True, exist_ok=True)
+
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    print(f"Loading model: {model_name}")
+    model = load_causal_lm(model_name)
+
+    n_blocks = len(model.model.layers)
+    if block_idx >= n_blocks:
+        raise ValueError(f"--block_idx {block_idx} >= n_blocks {n_blocks}")
+
+    block = model.model.layers[block_idx]
+    block_prefix = f"model.model.layers.{block_idx}"
+
+    # Enumerate quantization targets in this block
+    linear_names = []
+    for name, module in block.named_modules():
+        if isinstance(module, nn.Linear):
+            linear_names.append(name)
+    n_total = len(linear_names)
+
+    print(f"Block {block_idx}/{n_blocks-1}: {n_total} Linear targets, {n_gpus} GPU(s)")
+
+    # Collect all Hessians in one forward pass (early exit after block)
+    print("Collecting Hessians (single forward pass for all targets in block)...")
+    H_dict = collect_block_hessians(model, calibration_loader, block_idx, device)
+    print(f"  Collected {len(H_dict)} Hessians")
+
+    # Snapshot weights before freeing model
+    target_data = []
+    for i, linear_name in enumerate(linear_names):
+        module_name = f"{block_prefix}.{linear_name}"
+        param_name = f"{module_name}.weight"
+        tensor_path = save_dir / f"{param_name}.pth"
+        consolidated_path = consolidated_dir / f"{param_name}.pth"
+
+        submodule = block
+        for part in linear_name.split('.'):
+            submodule = getattr(submodule, part)
+        weight = submodule.weight.detach().cpu().float()
+        H = H_dict.get(module_name)
+
+        target_data.append({
+            'module_name': module_name,
+            'display_idx': i + 1,
+            'n_total': n_total,
+            'tensor_path': str(tensor_path),
+            'consolidated_path': str(consolidated_path),
+            'weight': weight,
+            'H': H,
+        })
+
+    # Free model
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
+    # Filter already-done targets
+    todo = [t for t in target_data if not Path(t['tensor_path']).exists()]
+    if not todo:
+        print("All targets already done, skipping block.")
+        return
+
+    skipped = n_total - len(todo)
+    if skipped:
+        print(f"Skipping {skipped} already-done target(s), processing {len(todo)}")
+
+    # Share tensors across processes
+    for task in todo:
+        task['weight'].share_memory_()
+        if task['H'] is not None:
+            task['H'].share_memory_()
+
+    # Distribute tasks round-robin across GPUs
+    gpu_tasks: List[List[dict]] = [[] for _ in range(n_gpus)]
+    for i, task in enumerate(todo):
+        gpu_tasks[i % n_gpus].append(task)
+
+    common = dict(
+        group_size=group_size,
+        bit_width=bit_width,
+        num_steps=num_steps,
+        rank_scale=rank_scale,
+        seed=seed,
+        scale_refine=scale_refine,
+        damping=damping,
+    )
+
+    if n_gpus == 1:
+        _quantize_block_worker(0, gpu_tasks, common)
+    else:
+        mp.spawn(_quantize_block_worker, args=(gpu_tasks, common), nprocs=n_gpus, join=True)
+
+    print(f"\nDone. Block {block_idx} output: {save_dir}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -263,7 +513,7 @@ def main():
     parser.add_argument('--main_gpu_id', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default=None)
 
-    # Parallel mode
+    # Mode: per-target parallel (original)
     parser.add_argument('--target_idx', type=int, default=None,
                         help='0-based index of the single target to quantize. '
                              'Used for parallel SGE array jobs.')
@@ -271,13 +521,35 @@ def main():
                         help='Print the number of quantization targets and exit '
                              '(for use by submit scripts).')
 
+    # Mode: per-block parallel (new)
+    parser.add_argument('--block_idx', type=int, default=None,
+                        help='0-based transformer block index. '
+                             'Quantizes all Linear layers in the block using all available GPUs.')
+    parser.add_argument('--list_blocks', action='store_true',
+                        help='Print the number of transformer blocks and exit '
+                             '(for use by submit scripts).')
+
     args = parser.parse_args()
 
-    # --list_targets: just print count and exit (no GPU needed)
+    # --list_targets: print count and exit (no GPU needed)
     if args.list_targets:
         names = get_target_names(args.model_name, args.layer_threshold)
         print(len(names))
         return
+
+    # --list_blocks: print block count and exit (no GPU needed)
+    if args.list_blocks:
+        model = load_causal_lm(args.model_name)
+        print(len(model.model.layers))
+        del model
+        return
+
+    # Output dir
+    save_dir = args.save_dir
+    if save_dir is None:
+        save_dir = default_compressed_data_dir(
+            args.model_name, args.group_size, args.num_steps)
+    save_dir = Path(save_dir)
 
     # Data
     from transformers import AutoTokenizer
@@ -287,13 +559,24 @@ def main():
         seqlen=args.seqlen, model=args.model_name, tokenizer=tokenizer,
     )
 
-    # Output dir
-    save_dir = args.save_dir
-    if save_dir is None:
-        save_dir = default_compressed_data_dir(
-            args.model_name, args.group_size, args.num_steps)
-    save_dir = Path(save_dir)
+    # --block_idx: block-level mode (one model load, one Hessian pass, multi-GPU)
+    if args.block_idx is not None:
+        layerwise_quantize_block(
+            model_name=args.model_name,
+            save_dir=save_dir,
+            block_idx=args.block_idx,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            rank_scale=args.rank_scale,
+            seed=args.seed,
+            scale_refine=args.scale_refine,
+            damping=args.damping,
+            calibration_loader=train_loader,
+        )
+        return
 
+    # Default: per-target mode (all targets or single --target_idx)
     layerwise_quantize(
         model_name=args.model_name,
         save_dir=save_dir,
