@@ -7,13 +7,16 @@ Layer-wise Hessian-aware BQQ quantization for language models.
    (column-wise N-bit decomposition + GPTQ-style compensation + optional scale refine)
 4. Save in same format as weight_aware_quant_cached.py (consolidated patch files)
 
-Usage:
+Usage (all targets sequentially):
   python layerwise_quant.py \
     --model_name Qwen/Qwen3-2B \
     --save_dir bqq_compressed_data/Qwen3-2B-2bit-32gs-hessian \
     --bit_width 2 --group_size 32 --num_steps 20000 \
-    --dataset c4 --nsamples 128 --seqlen 2048 \
-    --scale_refine
+    --dataset c4 --nsamples 128 --seqlen 2048
+
+Usage (single target, for parallel SGE array jobs):
+  python layerwise_quant.py --model_name Qwen/Qwen3-2B --target_idx 0 ...
+  python layerwise_quant.py --model_name Qwen/Qwen3-2B --list_targets  # print count and exit
 """
 
 import argparse
@@ -106,6 +109,19 @@ def collect_hessians(
 # Main quantization
 # ---------------------------------------------------------------------------
 
+def get_target_names(model_name: str, layer_threshold: int = 0) -> List[str]:
+    """Return ordered list of quantization target module names for the given model."""
+    model = load_causal_lm(model_name)
+    names = []
+    for name, param in model.named_parameters():
+        if is_quantization_target(name) and param.ndim == 2:
+            if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
+                continue
+            names.append(name[:-len('.weight')])
+    del model
+    return names
+
+
 def layerwise_quantize(
     model_name: str,
     save_dir: Path,
@@ -120,9 +136,13 @@ def layerwise_quantize(
     damping: float,
     calibration_loader,
     layer_threshold: int = 0,
+    target_idx: Optional[int] = None,
 ):
     """
-    Quantize all target weights with intra-layer Hessian-aware BQQ.
+    Quantize target weights with intra-layer Hessian-aware BQQ.
+
+    If target_idx is given, only that single weight (0-based index into the
+    full target list) is quantized.  This enables parallel SGE array jobs.
     """
     device = torch.device(f'cuda:{main_gpu_id}' if torch.cuda.is_available() else 'cpu')
     save_dir = Path(save_dir)
@@ -140,16 +160,29 @@ def layerwise_quantize(
         if is_quantization_target(name) and param.ndim == 2:
             if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
                 continue
-            # Module name = param name without ".weight"
             module_name = name[:-len('.weight')]
             target_params[module_name] = param.detach().cpu().float()
 
-    target_names = list(target_params.keys())
-    print(f"Found {len(target_names)} quantization targets")
+    all_target_names = list(target_params.keys())
+    print(f"Found {len(all_target_names)} quantization targets")
 
-    # Collect Hessians
-    print(f"Collecting Hessians ({len(target_names)} layers)...")
-    H_dict = collect_hessians(model, calibration_loader, target_names, device)
+    # When a specific index is requested, narrow to that single target
+    if target_idx is not None:
+        if target_idx >= len(all_target_names):
+            raise ValueError(
+                f"--target_idx {target_idx} is out of range "
+                f"(model has {len(all_target_names)} targets)"
+            )
+        selected_name = all_target_names[target_idx]
+        print(f"Single-target mode: [{target_idx+1}/{len(all_target_names)}] {selected_name}")
+        work_items = {selected_name: target_params[selected_name]}
+    else:
+        work_items = target_params
+
+    # Collect Hessians only for the targets we will actually quantize
+    hessian_targets = list(work_items.keys())
+    print(f"Collecting Hessians ({len(hessian_targets)} layer(s))...")
+    H_dict = collect_hessians(model, calibration_loader, hessian_targets, device)
     print(f"  Collected {len(H_dict)} Hessians")
 
     # Free model from GPU
@@ -157,23 +190,24 @@ def layerwise_quantize(
     del model
     torch.cuda.empty_cache()
 
-    # Quantize each target
-    for idx, (module_name, weight) in enumerate(target_params.items()):
+    # Quantize
+    n_total = len(all_target_names)
+    for module_name, weight in work_items.items():
+        display_idx = all_target_names.index(module_name) + 1
         param_name = f"{module_name}.weight"
         consolidated_path = consolidated_dir / f'{param_name}.pth'
         tensor_path = save_dir / f'{param_name}.pth'
 
-        # Skip if already done
         if tensor_path.exists():
-            print(f"[{idx+1}/{len(target_params)}] {param_name}: already exists, skipping")
+            print(f"[{display_idx}/{n_total}] {param_name}: already exists, skipping")
             continue
 
         if module_name not in H_dict:
-            print(f"[{idx+1}/{len(target_params)}] {param_name}: no Hessian, skipping")
+            print(f"[{display_idx}/{n_total}] {param_name}: no Hessian, skipping")
             continue
 
         H = H_dict[module_name].cpu()
-        print(f"\n[{idx+1}/{len(target_params)}] {param_name} {tuple(weight.shape)}")
+        print(f"\n[{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
 
         quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
@@ -189,7 +223,6 @@ def layerwise_quantize(
             damping=damping,
         )
 
-        # Save reconstructed tensor (same format as weight_aware_quant_cached)
         torch.save(reconstructed.cpu(), tensor_path)
         print(f"  Saved: {tensor_path}")
 
@@ -230,7 +263,21 @@ def main():
     parser.add_argument('--main_gpu_id', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default=None)
 
+    # Parallel mode
+    parser.add_argument('--target_idx', type=int, default=None,
+                        help='0-based index of the single target to quantize. '
+                             'Used for parallel SGE array jobs.')
+    parser.add_argument('--list_targets', action='store_true',
+                        help='Print the number of quantization targets and exit '
+                             '(for use by submit scripts).')
+
     args = parser.parse_args()
+
+    # --list_targets: just print count and exit (no GPU needed)
+    if args.list_targets:
+        names = get_target_names(args.model_name, args.layer_threshold)
+        print(len(names))
+        return
 
     # Data
     from transformers import AutoTokenizer
@@ -260,6 +307,7 @@ def main():
         damping=args.damping,
         calibration_loader=train_loader,
         layer_threshold=args.layer_threshold,
+        target_idx=args.target_idx,
     )
 
 
