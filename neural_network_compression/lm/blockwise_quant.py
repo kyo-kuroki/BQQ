@@ -3,10 +3,12 @@ Block-wise BQQ quantization with block output error optimization.
 
 Pipeline:
   1. Load pretrained model, cache each block's input/output via calibration data
-  2. For target block, sequentially for each Linear weight:
-     a. BQQ quantize the weight
-     b. Replace Linear -> BinaryQuadratic (Y,Z fixed; a,b,c,d learnable)
-     c. Optimize ALL continuous params in block (BQQ a,b,c,d + remaining
+  2. For target block, process Linear weights in REVERSE order (last -> first):
+     a. Collect H = X^T X just-in-time from current block state
+        (downstream layers already quantized+fine-tuned -> X is accurate)
+     b. BQQ quantize the weight using fresh H
+     c. Replace Linear -> BinaryQuadratic (Y,Z fixed; a,b,c,d learnable)
+     d. Optimize ALL continuous params in block (BQQ a,b,c,d + remaining
         unquantized Linear weights + LayerNorm params) to minimize
         block output MSE vs pretrained output
   3. Save quantized block
@@ -267,41 +269,42 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
 # Main block quantization routine
 # ---------------------------------------------------------------------------
 
-def collect_block_hessians(block, inputs_cache, device):
-    """Collect H = X^T X for each Linear layer in block using cached block inputs."""
-    H_dict = {}
-    handles = []
+def collect_single_hessian(block, linear_name, inputs_cache, device):
+    """Collect H = X^T X for one Linear layer given the current block state.
 
-    linear_names = get_quantizable_linears(block)
+    Called just before quantizing that layer so H reflects the actual input
+    distribution (including the effect of previously quantized + fine-tuned
+    layers earlier in the block).
+    """
+    H = None
 
-    def make_hook(name):
-        def _hook(module, inp, _out):
-            x = inp[0].detach().float()
-            if x.dim() == 3:
-                x = x.reshape(-1, x.shape[-1])
-            h = x.T @ x
-            if name not in H_dict:
-                H_dict[name] = h
-            else:
-                H_dict[name].add_(h)
-        return _hook
-
+    target_module = None
     for name, module in block.named_modules():
-        if name in linear_names and isinstance(module, nn.Linear):
-            handles.append(module.register_forward_hook(make_hook(name)))
+        if name == linear_name and isinstance(module, nn.Linear):
+            target_module = module
+            break
+    if target_module is None:
+        return None
 
+    def _hook(module, inp, _out):
+        nonlocal H
+        x = inp[0].detach().float()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        h = x.T @ x
+        H = h if H is None else H.add_(h)
+
+    handle = target_module.register_forward_hook(_hook)
     block.to(device).eval()
     with torch.no_grad():
-        for inp in tqdm(inputs_cache, desc='Collecting block Hessians'):
+        for inp in inputs_cache:
             try:
                 run_block_forward(block, inp, device)
             except Exception:
                 pass
+    handle.remove()
 
-    for h in handles:
-        h.remove()
-
-    return {k: v.cpu() for k, v in H_dict.items()}
+    return H.cpu() if H is not None else None
 
 
 def quantize_block(
@@ -329,11 +332,17 @@ def quantize_block(
 
     Steps:
       1. Cache block I/O from pretrained model
-      2. For each Linear (in order):
-         a. BQQ quantize weight
-         b. Replace Linear -> BinaryQuadratic
-         c. Optimize all continuous params via block output MSE
+      2. For each Linear (in REVERSE order, last -> first):
+         a. Collect H = X^T X for this layer from current block state
+            (reflects previously quantized + fine-tuned layers behind it)
+         b. BQQ quantize weight using that fresh H
+         c. Replace Linear -> BinaryQuadratic
+         d. Optimize all continuous params via block output MSE
       3. Save result
+
+    Reverse order + just-in-time Hessian: each H is collected after all
+    layers downstream have already been quantized and fine-tuned, so X
+    accurately reflects the input distribution the layer will actually see.
     """
     dev = torch.device(device)
     device_id = dev.index if dev.type == 'cuda' else 0
@@ -353,10 +362,13 @@ def quantize_block(
     del model
     torch.cuda.empty_cache()
 
-    # --- 2. Sequential quantize-optimize ---
+    # --- 2. Sequential quantize-optimize (reverse order, just-in-time Hessian) ---
     linear_names = get_quantizable_linears(block)
-    print(f'\nBlock {block_idx} quantization targets ({len(linear_names)}):')
-    for name in linear_names:
+    linear_names_reversed = list(reversed(linear_names))
+    n = len(linear_names)
+
+    print(f'\nBlock {block_idx} quantization targets ({n}), processing back-to-front:')
+    for name in linear_names_reversed:
         lin = _get_submodule(block, name)
         print(f'  {name}: {tuple(lin.weight.shape)}')
 
@@ -364,36 +376,23 @@ def quantize_block(
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\nInitial block MSE (pretrained): {init_mse:.6f}')
 
-    # Collect or load Hessians
-    H_dict = {}
-    if use_hessian:
-        cache_path = None
-        if hessian_cache_dir is not None:
-            cache_path = Path(hessian_cache_dir) / f'hessian_block_{block_idx}.pth'
-            if cache_path.exists():
-                print(f'Loading Hessian cache from {cache_path}')
-                H_dict = torch.load(cache_path, map_location='cpu', weights_only=False)
-
-        if not H_dict:
-            print('Collecting Hessians for block Linears...')
-            H_dict = collect_block_hessians(block, inputs_cache, dev)
-            print(f'  Collected {len(H_dict)} Hessians')
-
-            if cache_path is not None:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(H_dict, cache_path)
-                print(f'  Saved Hessian cache to {cache_path}')
-
-    for i, linear_name in enumerate(linear_names):
+    for i, linear_name in enumerate(linear_names_reversed):
+        orig_idx = n - 1 - i  # position in forward order (for display)
         linear = _get_submodule(block, linear_name)
         weight = linear.weight.data.clone().float()
         bias = linear.bias.data.clone().float() if linear.bias is not None else None
 
-        print(f'\n--- [{i + 1}/{len(linear_names)}] {linear_name} '
-              f'{tuple(weight.shape)} ---')
+        print(f'\n--- [{i + 1}/{n}] {linear_name} {tuple(weight.shape)} ---')
 
-        # a. BQQ quantize (Hessian-aware if use_hessian and H available)
-        H = H_dict.get(linear_name) if use_hessian else None
+        # a. Collect Hessian just-in-time from current block state.
+        #    All layers downstream (indices > orig_idx) are already quantized
+        #    and fine-tuned, so X accurately reflects this layer's real input.
+        H = None
+        if use_hessian:
+            print('  Collecting Hessian (just-in-time)...')
+            H = collect_single_hessian(block, linear_name, inputs_cache, dev)
+
+        # b. BQQ quantize
         A, Y, Z = quantize_weight_to_bqq(
             weight, bit_width=bit_width, group_size=group_size,
             num_steps=num_steps, rank_scale=rank_scale, seed=seed,
@@ -401,14 +400,14 @@ def quantize_block(
             damping=damping,
         )
 
-        # b. Replace Linear -> BinaryQuadratic
+        # c. Replace Linear -> BinaryQuadratic
         replace_linear_in_block(block, linear_name, A, Y, Z, bias=bias)
 
         # MSE after quantization (before optimization)
         mse_before = compute_block_mse(block, inputs_cache, targets_cache, dev)
         print(f'  Block MSE after quant: {mse_before:.6f}')
 
-        # c. Optimize continuous params
+        # d. Optimize continuous params
         optimize_block_params(
             block, inputs_cache, targets_cache,
             epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
