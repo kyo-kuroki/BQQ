@@ -31,6 +31,9 @@ get_num_targets() {
         --bind "${BQQ_ROOT}:${BQQ_ROOT}" \
         --bind "${HF_HOME}:${HF_HOME}" \
         --env "HF_HOME=${HF_HOME}" \
+        --env "OPENBLAS_NUM_THREADS=1" \
+        --env "OMP_NUM_THREADS=1" \
+        --env "MKL_NUM_THREADS=1" \
         --pwd "${LM_DIR}" \
         "${SIF_PATH}" \
         python layerwise_quant.py \
