@@ -75,7 +75,7 @@ submit_layerwise_block() {
         -N "${JOB_NAME}" \
         -o "${LOG_DIR}/" \
         -l h_rt="${WALLTIME}" \
-        -l gpu_4=1 \
+        -l gpu_1=4 \
         -t "1-${N_BLOCKS_VAL}":1 \
         -tc "${TC}" \
         -v MODEL_NAME="${MODEL_NAME}" \

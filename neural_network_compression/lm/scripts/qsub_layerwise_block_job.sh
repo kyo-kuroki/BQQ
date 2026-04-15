@@ -2,7 +2,7 @@
 #$ -S /bin/bash
 #$ -cwd
 #$ -j y
-#$ -l gpu_4=1
+#$ -l gpu_1=4
 #$ -l h_rt=2:00:00
 
 # Layer-wise BQQ quantization: block-level array job.
