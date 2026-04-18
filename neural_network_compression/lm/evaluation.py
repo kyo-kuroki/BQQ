@@ -25,6 +25,7 @@ _src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
 import bqq_modules  # noqa: F401
+from build_bqq_model import dequantize_bqq_model
 
 
 WORKSPACE_ROOT = BQQ_ROOT.parent
@@ -251,6 +252,7 @@ def main():
         else:
             try:
                 model = torch.load(args.model_path, weights_only=False)
+                model = dequantize_bqq_model(model)
             except Exception:
                 model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
         model.eval()
@@ -276,6 +278,7 @@ def main():
     else:
         try:
             model = torch.load(args.model_path, weights_only=False)
+            model = dequantize_bqq_model(model)
         except Exception:
             model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 

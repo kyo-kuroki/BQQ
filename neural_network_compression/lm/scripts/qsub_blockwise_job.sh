@@ -47,6 +47,7 @@ NSAMPLES="${NSAMPLES:-128}"
 SEQLEN="${SEQLEN:-2048}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-1e-5}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 BQQ_ROOT="$(dirname "$(dirname "${LM_SCRIPT_DIR}")")"
 HF_HOME="${HF_HOME:-/gs/bs/tga-artic/k-kuroki/hf_cache}"
@@ -81,7 +82,8 @@ APPTAINER_CMD=(
         --epochs      "${EPOCHS}" \
         --lr          "${LR}" \
         --device      cuda:0 \
-        --save_dir    "${SAVE_DIR}"
+        --save_dir    "${SAVE_DIR}" \
+        ${EXTRA_ARGS}
 
 echo ""
 echo "Done: block_${BLOCK_IDX}  $(date --iso-8601=seconds)"

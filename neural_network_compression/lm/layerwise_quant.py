@@ -124,10 +124,10 @@ def collect_block_hessians(
     Collect H = X^T X for all Linear layers in block_idx in a SINGLE forward pass.
     An early-exit hook stops computation after the target block to save time.
 
-    Returns dict keyed by full module name (e.g. 'model.model.layers.3.self_attn.q_proj').
+    Returns dict keyed by full module name (e.g. 'model.layers.3.self_attn.q_proj').
     """
     block = model.model.layers[block_idx]
-    block_prefix = f"model.model.layers.{block_idx}"
+    block_prefix = f"model.layers.{block_idx}"
 
     H: Dict[str, Optional[torch.Tensor]] = {}
     handles = []
@@ -395,7 +395,7 @@ def layerwise_quantize_block(
         raise ValueError(f"--block_idx {block_idx} >= n_blocks {n_blocks}")
 
     block = model.model.layers[block_idx]
-    block_prefix = f"model.model.layers.{block_idx}"
+    block_prefix = f"model.layers.{block_idx}"
 
     # Enumerate quantization targets in this block
     linear_names = []

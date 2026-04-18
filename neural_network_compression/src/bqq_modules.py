@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.autograd import Function
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +53,479 @@ class BinaryQuadratic(nn.Module):
         W = W.sum(dim=0) + self.d.type(dtype)
         W = W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
         return W
+
+
+# ---------------------------------------------------------------------------
+# Packed BQQ module (bit-packed Y/Z for 8x memory reduction)
+# ---------------------------------------------------------------------------
+
+class PackedBinaryQuadratic(nn.Module):
+    """BQQ layer with Y and Z stored as packed uint8 (8x smaller than bool).
+
+    Forward uses integer AND + popcount to compute W_core without unpacking
+    to float, keeping packed bits in memory throughout.
+
+    Storage layout
+    --------------
+    Y_packed : [bit_width, row_width, col_width, y_row, ceil(inter_dim/8)]  uint8
+    Z_packed : [bit_width, row_width, col_width, z_col, ceil(inter_dim/8)]  uint8
+                (Z is transposed before packing so inter_dim is the last axis)
+    Y_sum_i16: [bit_width, row_width, col_width, y_row, 1]  int16  (precomputed)
+    Z_sum_i16: [bit_width, row_width, col_width, 1, z_col]  int16  (precomputed)
+    """
+
+    def __init__(self, Y_packed, Z_packed, a, b, c, d,
+                 Y_sum_i16, Z_sum_i16,
+                 inter_dimension, y_row, z_col,
+                 bias=None):
+        super().__init__()
+        self.bit_width, self.row_width, self.col_width = Y_packed.shape[:3]
+        self.y_row = y_row
+        self.z_col = z_col
+        self.inter_dimension = inter_dimension
+        self._k8 = Y_packed.shape[-1]  # ceil(inter_dimension / 8)
+
+        self.register_buffer("Y_packed", Y_packed)
+        self.register_buffer("Z_packed", Z_packed)
+        self.register_buffer("Y_sum_i16", Y_sum_i16)
+        self.register_buffer("Z_sum_i16", Z_sum_i16)
+
+        self.a = nn.Parameter(a)
+        self.b = nn.Parameter(b)
+        self.c = nn.Parameter(c)
+        self.d = nn.Parameter(d)
+        self.bias = nn.Parameter(bias) if bias is not None else None
+
+    @staticmethod
+    def _np_packbits(t: torch.Tensor, last_dim_size: int) -> torch.Tensor:
+        """Pack a bool tensor along its last axis using numpy packbits.
+
+        t must be on CPU and have last-dimension size == last_dim_size.
+        Returns a uint8 tensor with last dimension == ceil(last_dim_size / 8).
+        numpy packbits uses big-endian ordering (first element → MSB), which
+        matches the ordering assumed by _popcount_uint8 in forward.
+        """
+        arr = t.numpy().astype(np.uint8)          # flatten to numpy
+        flat = arr.reshape(-1, last_dim_size)
+        packed_flat = np.packbits(flat, axis=-1)  # big-endian, pads with 0
+        k8 = packed_flat.shape[-1]
+        result = torch.from_numpy(packed_flat).reshape(*t.shape[:-1], k8)
+        return result.contiguous()
+
+    @classmethod
+    def from_unpacked(cls, bq: 'BinaryQuadratic') -> 'PackedBinaryQuadratic':
+        """Convert a BinaryQuadratic layer to PackedBinaryQuadratic."""
+        Y = bq.Y.cpu()  # [B, r, c, y_row, inter_dim] bool
+        Z = bq.Z.cpu()  # [B, r, c, inter_dim, z_col] bool
+
+        bit_width, row_width, col_width, y_row, inter_dim = Y.shape
+        z_col = Z.shape[-1]
+
+        # Pack Y along inter_dimension (last axis)
+        Y_packed = cls._np_packbits(Y, inter_dim)  # [..., y_row, ceil(inter_dim/8)]
+
+        # Pack Z along inter_dimension (axis -2); transpose first so inter_dim is last
+        Z_t = Z.permute(0, 1, 2, 4, 3).contiguous()  # [..., z_col, inter_dim]
+        Z_packed = cls._np_packbits(Z_t, inter_dim)   # [..., z_col, ceil(inter_dim/8)]
+
+        # Precompute sums as int16 (values 0..inter_dim; fits in int16 for any realistic rank)
+        Y_sum = Y.sum(dim=-1, keepdim=True).to(torch.int16)   # [..., y_row, 1]
+        Z_sum = Z.sum(dim=-2, keepdim=True).to(torch.int16)   # [..., 1, z_col]
+
+        return cls(
+            Y_packed=Y_packed,
+            Z_packed=Z_packed,
+            a=bq.a.data.clone(),
+            b=bq.b.data.clone(),
+            c=bq.c.data.clone(),
+            d=bq.d.data.clone(),
+            Y_sum_i16=Y_sum,
+            Z_sum_i16=Z_sum,
+            inter_dimension=inter_dim,
+            y_row=y_row,
+            z_col=z_col,
+            bias=bq.bias.data.clone() if bq.bias is not None else None,
+        )
+
+    # ------------------------------------------------------------------
+    # Kernel selection flag.
+    # Set PackedBinaryQuadratic.use_packed_kernel = True once a custom
+    # CUDA kernel (AND + popcount binary matmul) is registered.
+    # When False (default), forward unpacks to bool and uses cuBLAS.
+    # ------------------------------------------------------------------
+    use_packed_kernel: bool = False
+
+    # ------------------------------------------------------------------
+    # ZYX kernel flag.
+    # When True, forward uses Y@(Z@X) via Triton binary-float kernels
+    # (avoids materialising W_core; two binary-masked float accumulations).
+    # Registered automatically when bqq_triton_kernel is imported.
+    # ------------------------------------------------------------------
+    use_zy_x_kernel: bool = False
+
+    def _unpack_to_bool(self, packed: torch.Tensor, n_bits: int) -> torch.Tensor:
+        """Unpack uint8 tensor to bool along the last axis.
+
+        packed : [..., k8]  uint8, big-endian bit order (MSB = index 0)
+        returns: [..., n_bits] bool  (trailing padding bits are dropped)
+        """
+        # shifts: [8] tensor – extracts each bit from MSB to LSB
+        shifts = torch.arange(7, -1, -1, dtype=torch.uint8, device=packed.device)
+        # [..., k8, 8] → [..., k8*8] → [..., n_bits]
+        unpacked = ((packed.unsqueeze(-1) >> shifts) & 1).reshape(*packed.shape[:-1], -1)
+        return unpacked[..., :n_bits].bool()
+
+    def _matmul_via_unpack(self, dtype: torch.dtype) -> torch.Tensor:
+        """Unpack Y/Z to bool, cast to dtype, use cuBLAS matmul.
+
+        Returns [bit_width, row_width, col_width, y_row, z_col].
+        """
+        Y = self._unpack_to_bool(self.Y_packed, self.inter_dimension)
+        # Z was stored transposed as [..., z_col, inter_dim]; transpose back
+        Z_t = self._unpack_to_bool(self.Z_packed, self.inter_dimension)
+        # Y: [..., y_row, inter_dim]  Z_t: [..., z_col, inter_dim]
+        return torch.matmul(Y.to(dtype), Z_t.to(dtype).transpose(-2, -1))
+
+    def _matmul_via_packed_kernel(self, dtype: torch.dtype) -> torch.Tensor:
+        """Binary matmul using custom CUDA AND+popcount kernel (not yet implemented).
+
+        Placeholder: raises NotImplementedError until a kernel is registered.
+        To add a kernel, assign a callable to PackedBinaryQuadratic.packed_kernel:
+
+            PackedBinaryQuadratic.packed_kernel = my_kernel_fn
+            PackedBinaryQuadratic.use_packed_kernel = True
+
+        The kernel must accept (Y_packed, Z_packed, y_row, z_col, inter_dim)
+        and return a float tensor of shape [B, y_row, z_col] where
+        B = bit_width * row_width * col_width.
+        """
+        if not hasattr(PackedBinaryQuadratic, 'packed_kernel'):
+            raise NotImplementedError(
+                "Set PackedBinaryQuadratic.packed_kernel and use_packed_kernel=True "
+                "after loading the custom CUDA extension."
+            )
+        B = self.bit_width * self.row_width * self.col_width
+        Y_flat = self.Y_packed.reshape(B, self.y_row, self._k8)
+        Z_flat = self.Z_packed.reshape(B, self.z_col, self._k8)
+        W_core = PackedBinaryQuadratic.packed_kernel(
+            Y_flat, Z_flat, self.y_row, self.z_col, self.inter_dimension
+        ).to(dtype)
+        return W_core.reshape(
+            self.bit_width, self.row_width, self.col_width, self.y_row, self.z_col
+        )
+
+    def _compute_W_core(self, dtype: torch.dtype) -> torch.Tensor:
+        if PackedBinaryQuadratic.use_packed_kernel:
+            return self._matmul_via_packed_kernel(dtype)
+        return self._matmul_via_unpack(dtype)
+
+    def _forward_zy_x(self, X: torch.Tensor) -> torch.Tensor:
+        """Forward via Y@(Z@X): avoids materialising the [B,y_row,z_col] W_core intermediate.
+
+        Two Triton passes:
+          Phase 1 — T[b,n,k]    = Σ_j Z_bool[b,k,j] * X[n, col(b), j]   (binary Z × float X)
+          Phase 2 — core[b,n,i] = Σ_k Y_bool[b,i,k] * T[b,n,k]          (binary Y × float T)
+
+        T shape is [B, batch, k8*8] (small).  W is never formed.
+        """
+        from bqq_triton_kernel import binary_z_x, binary_y_t
+
+        dtype = X.dtype
+        device = self.Y_packed.device
+        X = X.to(device)
+
+        # Flatten all leading dimensions so X is [N, in_features]
+        orig_shape = X.shape
+        X_2d = X.reshape(-1, orig_shape[-1])
+        batch = X_2d.shape[0]          # N = batch * seq_len (or just batch)
+        B = self.bit_width * self.row_width * self.col_width
+
+        # Reshape X: [N, col_width, z_col]
+        X_view = X_2d.reshape(batch, self.col_width, self.z_col).contiguous()
+
+        Y_flat = self.Y_packed.reshape(B, self.y_row, self._k8)   # [B, y_row, k8]
+        Z_flat = self.Z_packed.reshape(B, self.z_col, self._k8)   # [B, z_col, k8]
+
+        # Phase 1: T = Z @ X  →  [B, batch, k8*8]
+        T = binary_z_x(Z_flat, X_view.to(torch.float16).contiguous(),
+                       self.inter_dimension, self.col_width)
+
+        # Phase 2: core = Y @ T  →  [B, batch, y_row]  float32
+        core = binary_y_t(Y_flat, T, self.inter_dimension)
+
+        # Reshape and weight by a: [bit_width, row_width, col_width, batch, y_row]
+        core = core.reshape(self.bit_width, self.row_width, self.col_width, batch, self.y_row)
+
+        a = self.a.squeeze(-1).squeeze(-1).to(torch.float32)   # [bit, row, col]
+        # a_term[row, batch, y_row] = Σ_{bit,col} a[bit,row,col] * core[bit,row,col,batch,i]
+        a_term = torch.einsum('brc,brcni->rni', a, core)       # [row, batch, y_row]
+
+        # b_term: b * Y_sum_eff * X_col_sum
+        b_f = self.b.squeeze(-1).squeeze(-1).to(torch.float32)  # [bit, row, col]
+        Y_sum_f = self.Y_sum_i16.squeeze(-1).to(torch.float32)  # [bit, row, col, y_row]
+        Y_sum_eff = torch.einsum('brc,brci->rci', b_f, Y_sum_f)  # [row, col, y_row]
+        X_col_sum = X_view.to(torch.float32).sum(dim=-1)          # [batch, col]
+        # b_term[row, batch, y_row] = Σ_col Y_sum_eff[row,col,i] * X_col_sum[batch,col]
+        b_term = torch.einsum('rci,nc->rni', Y_sum_eff, X_col_sum)  # [row, batch, y_row]
+
+        # c_term: c * Z_sum_eff · X — no y_row dependence
+        c_f = self.c.squeeze(-1).squeeze(-1).to(torch.float32)  # [bit, row, col]
+        Z_sum_f = self.Z_sum_i16.squeeze(-2).to(torch.float32)  # [bit, row, col, z_col]
+        Z_sum_eff = torch.einsum('brc,brcj->rcj', c_f, Z_sum_f)   # [row, col, z_col]
+        # c_term[row, batch] = Σ_{col,j} X[batch,col,j] * Z_sum_eff[row,col,j]
+        c_term = torch.einsum('ncj,rcj->rn', X_view.to(torch.float32), Z_sum_eff)  # [row, batch]
+
+        # d_term: d · X_col_sum — no y_row dependence
+        d_f = self.d.squeeze(-1).squeeze(-1).to(torch.float32)  # [row, col]
+        d_term = torch.einsum('rc,nc->rn', d_f, X_col_sum)       # [row, batch]
+
+        # Assemble: [row, N, y_row] → [N, row*y_row] → orig leading dims
+        out = (a_term + b_term
+               + (c_term + d_term).unsqueeze(-1))   # [row, N, y_row]
+        out = out.to(dtype).permute(1, 0, 2).reshape(batch, self.row_width * self.y_row)
+
+        # Restore original leading shape: [..., out_features]
+        out = out.reshape(*orig_shape[:-1], self.row_width * self.y_row)
+
+        if self.bias is not None:
+            out = out + self.bias.to(dtype=dtype, device=device)
+        return out
+
+    def forward(self, X):
+        if PackedBinaryQuadratic.use_zy_x_kernel:
+            return self._forward_zy_x(X)
+
+        dtype = X.dtype
+        device = self.Y_packed.device
+
+        W_core = self._compute_W_core(dtype)
+        Y_sum = self.Y_sum_i16.to(dtype)
+        Z_sum = self.Z_sum_i16.to(dtype)
+
+        W = (self.a.to(dtype) * W_core
+             + self.b.to(dtype) * Y_sum
+             + self.c.to(dtype) * Z_sum)
+        W = W.sum(dim=0) + self.d.to(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(
+            self.row_width * self.y_row, self.col_width * self.z_col
+        )
+
+        if self.bias is None:
+            return X.to(device) @ W.T
+        else:
+            return X.to(device) @ W.T + self.bias.to(dtype=dtype, device=device)
+
+    def get_weight(self, dtype=torch.float32):
+        W_core = self._compute_W_core(dtype)
+        Y_sum = self.Y_sum_i16.to(dtype)
+        Z_sum = self.Z_sum_i16.to(dtype)
+        W = (self.a.to(dtype) * W_core
+             + self.b.to(dtype) * Y_sum
+             + self.c.to(dtype) * Z_sum)
+        W = W.sum(dim=0) + self.d.to(dtype)
+        W = W.permute(0, 2, 1, 3).reshape(
+            self.row_width * self.y_row, self.col_width * self.z_col
+        )
+        return W
+
+
+class PartialBQQLinear(nn.Module):
+    """Mixed-precision linear layer for progressive patch-wise quantization.
+
+    Patches are quantized incrementally:
+      - Quantized patches: Y, Z stored as bool buffers (frozen);
+        a, b, c, d are nn.Parameters (trainable).
+      - Unquantized patches: represented by float_weight (trainable nn.Parameter).
+
+    Forward assembles W via::
+
+        W = torch.where(mask_full, W_bqq, float_weight)
+
+    so gradients automatically flow to a/b/c/d for quantized patches and to
+    float_weight for unquantized patches — no manual gradient masking needed.
+
+    Workflow
+    --------
+    1. Create from an nn.Linear.
+    2. Repeatedly call quantize_patch(i, j, A_ij, Y_ij, Z_ij) for batches of
+       patches, interleaved with block-level MSE fine-tuning.
+    3. When all patches are done, call to_binaryquadratic() to obtain a
+       standard BinaryQuadratic module (float_weight is discarded).
+    """
+
+    def __init__(self, weight: torch.Tensor, bias, group_size: int, bit_width: int):
+        super().__init__()
+        out_features, in_features = weight.shape
+
+        # dim must be exactly divisible by group_size.
+        # (dim == group_size is the degenerate case: 1 patch of size gs×gs.)
+        def _patch_dims(dim, gs, name):
+            if dim % gs != 0:
+                raise ValueError(
+                    f"{name}={dim} is not divisible by group_size={gs}."
+                )
+            return dim // gs, gs
+
+        self.group_size = group_size
+        self.bit_width = bit_width
+        self.row_width, self.y_row = _patch_dims(out_features, group_size, 'out_features')
+        self.col_width, self.z_col = _patch_dims(in_features,  group_size, 'in_features')
+        self.inter_dimension = None  # set lazily on first quantize_patch call
+
+        # Full float weight — trainable for unquantized patches
+        self.float_weight = nn.Parameter(weight.clone().float())
+        self.bias_param = nn.Parameter(bias.clone().float()) if bias is not None else None
+
+        # quantized_mask[i, j] = True iff patch (i, j) has been BQQ-quantized
+        self.register_buffer(
+            'quantized_mask',
+            torch.zeros(self.row_width, self.col_width, dtype=torch.bool),
+        )
+        # Y, Z buffers and a/b/c/d params are registered lazily in _init_bqq_tensors()
+        # once inter_dimension is known from the first quantize_patch call.
+
+    # ------------------------------------------------------------------
+    # Lazy initialisation of BQQ tensors
+    # ------------------------------------------------------------------
+
+    def _init_bqq_tensors(self, inter_dimension: int) -> None:
+        bw = self.bit_width
+        rw, cw = self.row_width, self.col_width
+        yr, zc = self.y_row, self.z_col
+        dev = self.float_weight.device
+
+        self.inter_dimension = inter_dimension
+        self.register_buffer(
+            'Y', torch.zeros(bw, rw, cw, yr, inter_dimension, dtype=torch.bool, device=dev)
+        )
+        self.register_buffer(
+            'Z', torch.zeros(bw, rw, cw, inter_dimension, zc, dtype=torch.bool, device=dev)
+        )
+        self.a = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
+        self.b = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
+        self.c = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
+        self.d = nn.Parameter(torch.zeros(rw, cw, 1, 1, device=dev))
+
+    # ------------------------------------------------------------------
+    # Patch registration
+    # ------------------------------------------------------------------
+
+    def quantize_patch(
+        self,
+        i: int,
+        j: int,
+        A_ij: torch.Tensor,
+        Y_ij: torch.Tensor,
+        Z_ij: torch.Tensor,
+    ) -> None:
+        """Register a BQQ-quantized patch.
+
+        Parameters
+        ----------
+        i, j  : patch row / column indices
+        A_ij  : (bit_width, 4)             – BQQ coefficients from quantize_weight_to_bqq
+        Y_ij  : (bit_width, y_row, inter_dim) – binary factor matrix (already optimised)
+        Z_ij  : (bit_width, inter_dim, z_col)  – binary factor matrix (already optimised)
+        """
+        inter_dim = Y_ij.shape[-1]
+        if self.inter_dimension is None:
+            self._init_bqq_tensors(inter_dim)
+
+        dev = self.float_weight.device
+        with torch.no_grad():
+            self.Y[:, i, j] = (Y_ij > 0.5).to(dev)
+            self.Z[:, i, j] = (Z_ij > 0.5).to(dev)
+            # A_ij[:, 0..2] → a, b, c per-patch; A_ij[:, 3].sum() → d (matches BinaryQuadratic)
+            self.a.data[:, i, j, 0, 0] = A_ij[:, 0].to(dev)
+            self.b.data[:, i, j, 0, 0] = A_ij[:, 1].to(dev)
+            self.c.data[:, i, j, 0, 0] = A_ij[:, 2].to(dev)
+            self.d.data[i, j, 0, 0] = A_ij[:, 3].sum().to(dev)
+            self.quantized_mask[i, j] = True
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def _bqq_weight(self, dtype: torch.dtype) -> torch.Tensor:
+        """Reconstruct full W from BQQ parameters (all patches, shape (out, in))."""
+        W_core = torch.matmul(self.Y.to(dtype), self.Z.to(dtype))
+        Y_sum = self.Y.sum(dim=-1, keepdim=True).to(dtype)
+        Z_sum = self.Z.sum(dim=-2, keepdim=True).to(dtype)
+        W = (self.a.to(dtype) * W_core
+             + self.b.to(dtype) * Y_sum
+             + self.c.to(dtype) * Z_sum)
+        W = W.sum(dim=0) + self.d.to(dtype)  # (row_width, col_width, y_row, z_col)
+        W = W.permute(0, 2, 1, 3).reshape(
+            self.row_width * self.y_row, self.col_width * self.z_col
+        )
+        return W
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        dtype = X.dtype
+        dev = self.float_weight.device
+
+        if self.inter_dimension is None or not self.quantized_mask.any():
+            # No patches quantized yet — pure float forward
+            W = self.float_weight.to(dtype)
+        elif self.quantized_mask.all():
+            # All patches quantized — pure BQQ forward
+            W = self._bqq_weight(dtype)
+        else:
+            # Mixed: select quantized patches from BQQ, rest from float_weight.
+            # torch.where gradient routing:
+            #   - quantized positions → grad flows to a/b/c/d (via W_bqq); float_weight gets 0
+            #   - unquantized positions → grad flows to float_weight; a/b/c/d get 0
+            W_bqq = self._bqq_weight(dtype)
+            mask = (self.quantized_mask
+                    .repeat_interleave(self.y_row, dim=0)
+                    .repeat_interleave(self.z_col, dim=1))
+            W = torch.where(mask, W_bqq, self.float_weight.to(dtype))
+
+        result = X.to(dev) @ W.T
+        if self.bias_param is not None:
+            result = result + self.bias_param.to(dtype=dtype, device=dev)
+        return result
+
+    # ------------------------------------------------------------------
+    # Conversion
+    # ------------------------------------------------------------------
+
+    def to_binaryquadratic(self) -> 'BinaryQuadratic':
+        """Convert to BinaryQuadratic. Raises if any patch is still unquantized."""
+        if not self.quantized_mask.all():
+            n = (~self.quantized_mask).sum().item()
+            raise RuntimeError(
+                f"to_binaryquadratic() called but {n} patches are still unquantized"
+            )
+        # Build BinaryQuadratic directly to avoid the constructor
+        # (which expects a packed A tensor; we already have decomposed a/b/c/d)
+        bqq = BinaryQuadratic.__new__(BinaryQuadratic)
+        nn.Module.__init__(bqq)
+        bqq.bit_width = self.bit_width
+        bqq.row_width = self.row_width
+        bqq.col_width = self.col_width
+        bqq.y_row = self.y_row
+        bqq.inter_dimension = self.inter_dimension
+        bqq.z_col = self.z_col
+        bqq.register_buffer('Y', self.Y.clone())
+        bqq.register_buffer('Z', self.Z.clone())
+        bqq.a = nn.Parameter(self.a.data.clone())
+        bqq.b = nn.Parameter(self.b.data.clone())
+        bqq.c = nn.Parameter(self.c.data.clone())
+        bqq.d = nn.Parameter(self.d.data.clone())
+        bqq.bias = (nn.Parameter(self.bias_param.data.clone())
+                    if self.bias_param is not None else None)
+        return bqq
+
+
+def pack_binaryquadratic_model(model: nn.Module) -> nn.Module:
+    """Recursively replace all BinaryQuadratic layers with PackedBinaryQuadratic."""
+    for name, module in list(model.named_children()):
+        if isinstance(module, BinaryQuadratic):
+            setattr(model, name, PackedBinaryQuadratic.from_unpacked(module))
+        else:
+            pack_binaryquadratic_model(module)
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +716,19 @@ class BQQLinear(nn.Module):
             out_2d = out_2d + self.bias.to(out_2d.device, dtype=torch.float32)
         out = out_2d.view(*orig_shape, self.out_features)
         return out.to(dtype=input.dtype)
+
+
+# Auto-register Triton AND+popcount kernel if available (CUDA + Triton required).
+# Falls back to cuBLAS unpack path silently if not available.
+try:
+    import os as _os
+    import sys as _sys
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from bqq_triton_kernel import packed_binary_matmul as _pbm
+    PackedBinaryQuadratic.packed_kernel = staticmethod(_pbm)
+    PackedBinaryQuadratic.use_packed_kernel = True
+except Exception:
+    pass
 
 
 class BQQLinearInference(nn.Module):

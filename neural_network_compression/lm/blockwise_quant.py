@@ -35,7 +35,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-from build_bqq_model import BinaryQuadratic
+from build_bqq_model import BinaryQuadratic, PartialBQQLinear
 from compressed_data import get_bqq_matrices
 from datautils import get_loaders
 from model_loader import load_causal_lm
@@ -324,6 +324,7 @@ def quantize_block(
     hessian_cache_dir=None,
     scale_refine=True,
     damping=1e-6,
+    reverse=True,
     device,
     save_dir,
 ):
@@ -362,13 +363,14 @@ def quantize_block(
     del model
     torch.cuda.empty_cache()
 
-    # --- 2. Sequential quantize-optimize (reverse order, just-in-time Hessian) ---
+    # --- 2. Sequential quantize-optimize (just-in-time Hessian) ---
     linear_names = get_quantizable_linears(block)
-    linear_names_reversed = list(reversed(linear_names))
+    ordered_names = list(reversed(linear_names)) if reverse else list(linear_names)
     n = len(linear_names)
+    direction = 'back-to-front' if reverse else 'front-to-back'
 
-    print(f'\nBlock {block_idx} quantization targets ({n}), processing back-to-front:')
-    for name in linear_names_reversed:
+    print(f'\nBlock {block_idx} quantization targets ({n}), processing {direction}:')
+    for name in ordered_names:
         lin = _get_submodule(block, name)
         print(f'  {name}: {tuple(lin.weight.shape)}')
 
@@ -376,8 +378,8 @@ def quantize_block(
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\nInitial block MSE (pretrained): {init_mse:.6f}')
 
-    for i, linear_name in enumerate(linear_names_reversed):
-        orig_idx = n - 1 - i  # position in forward order (for display)
+    for i, linear_name in enumerate(ordered_names):
+        orig_idx = (n - 1 - i) if reverse else i  # position in forward order (for display)
         linear = _get_submodule(block, linear_name)
         weight = linear.weight.data.clone().float()
         bias = linear.bias.data.clone().float() if linear.bias is not None else None
@@ -432,6 +434,219 @@ def quantize_block(
 
 
 # ---------------------------------------------------------------------------
+# Progressive block quantization (patch-wise stochastic)
+# ---------------------------------------------------------------------------
+
+def _compute_batch_sizes(total: int, num_rounds: int, schedule: str) -> list:
+    """Compute patch batch sizes for each round.
+
+    Parameters
+    ----------
+    total      : total number of patches
+    num_rounds : number of quantization rounds
+    schedule   : 'linear'    — equal batches (total // num_rounds each)
+                 'geometric' — decreasing batches with 2:1 ratio between
+                               consecutive rounds (more patches quantized early,
+                               finer adjustments later)
+
+    Geometric formula
+    -----------------
+    Sizes are proportional to 2^(N-1), 2^(N-2), ..., 2^0
+    (sum = 2^N - 1), then scaled to sum to `total`.
+    Example for N=4, total=1000: [533, 267, 133, 67]
+    """
+    if num_rounds == 1:
+        return [total]
+
+    if schedule == 'linear':
+        base = total // num_rounds
+        sizes = [base] * num_rounds
+        sizes[-1] += total - sum(sizes)   # absorb rounding remainder into last round
+    else:  # geometric
+        denom = (1 << num_rounds) - 1     # 2^N - 1
+        raw = [(1 << (num_rounds - 1 - i)) * total / denom for i in range(num_rounds)]
+        sizes = [max(1, round(s)) for s in raw]
+        sizes[-1] = max(1, total - sum(sizes[:-1]))   # ensure exact sum
+
+    return sizes
+
+
+def quantize_block_progressive(
+    model_name,
+    block_idx,
+    dataloader,
+    *,
+    bit_width,
+    group_size,
+    num_steps,
+    rank_scale,
+    seed,
+    epochs,
+    lr,
+    max_grad_norm=1.0,
+    num_rounds=4,
+    schedule='geometric',
+    device,
+    save_dir,
+):
+    """
+    Quantize all Linear weights in a block via progressive patch-wise BQQ.
+
+    Unlike the sequential approach, no Hessian is collected and no ordering
+    assumption is made.  All patches across all layers are quantized in
+    random batches, with block-output MSE fine-tuning after each batch:
+
+      1. Convert every Linear → PartialBQQLinear (float weights, no BQQ yet).
+      2. Pre-compute batch sizes for all rounds using _compute_batch_sizes().
+      3. For each round:
+         a. Randomly pick the next batch of unquantized patches.
+         b. For each selected patch, extract the current float weight values
+            and run BQQ optimisation (Y, Z, A solved jointly as usual).
+         c. Register the result: Y/Z frozen as buffers; A values become the
+            initial a/b/c/d parameters for the fine-tuning step.
+         d. Optimise all trainable params (a/b/c/d of quantized patches +
+            float_weight of unquantized patches + LayerNorm) to minimise
+            block output MSE.
+      4. Convert every PartialBQQLinear → BinaryQuadratic and save.
+
+    Gradient routing in PartialBQQLinear.forward() is handled automatically
+    by torch.where: quantized positions route to a/b/c/d; unquantized
+    positions route to float_weight.
+
+    Parameters
+    ----------
+    num_rounds : int
+        Number of quantization rounds (default 4).
+    schedule : str
+        'linear'    — equal-sized batches each round.
+        'geometric' — decreasing batches with 2:1 ratio between consecutive
+                      rounds (more patches early, finer adjustments later).
+    """
+    dev = torch.device(device)
+    device_id = dev.index if dev.type == 'cuda' else 0
+
+    # --- 1. Cache block I/O ---
+    print(f'Loading model: {model_name}')
+    model = load_causal_lm(model_name)
+
+    print(f'Caching block {block_idx} I/O ...')
+    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
+    print(f'  Cached {len(inputs_cache)} samples')
+
+    block = copy.deepcopy(model.model.layers[block_idx]).float()
+    del model
+    torch.cuda.empty_cache()
+
+    # --- 2. Convert all Linear → PartialBQQLinear ---
+    linear_names = get_quantizable_linears(block)
+    n_layers = len(linear_names)
+    print(f'\nBlock {block_idx}: {n_layers} quantizable layers → PartialBQQLinear')
+
+    for lname in linear_names:
+        lin = _get_submodule(block, lname)
+        partial = PartialBQQLinear(
+            lin.weight.data,
+            lin.bias.data if lin.bias is not None else None,
+            group_size=group_size,
+            bit_width=bit_width,
+        )
+        _set_submodule(block, lname, partial)
+        print(f'  {lname}: {tuple(lin.weight.shape)} '
+              f'→ {partial.row_width}×{partial.col_width} patches')
+
+    # Build flat list of all (layer_name, i, j) patch identifiers
+    all_patches = []
+    for lname in linear_names:
+        layer = _get_submodule(block, lname)
+        for i in range(layer.row_width):
+            for j in range(layer.col_width):
+                all_patches.append((lname, i, j))
+
+    total_patches = len(all_patches)
+    batch_sizes = _compute_batch_sizes(total_patches, num_rounds, schedule)
+    print(f'\nTotal patches: {total_patches}, rounds: {num_rounds}, '
+          f'schedule: {schedule}')
+    print(f'Batch sizes per round: {batch_sizes}  (sum={sum(batch_sizes)})')
+
+    init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
+    print(f'Initial block MSE (pretrained): {init_mse:.6f}')
+
+    # --- 3. Progressive rounds ---
+    rng = torch.Generator()
+    rng.manual_seed(seed)
+
+    # Shuffle all patches once; then slice off batch_sizes[r] from the front each round
+    perm = torch.randperm(total_patches, generator=rng).tolist()
+    shuffled = [all_patches[k] for k in perm]
+    offset = 0
+
+    for round_idx, batch_size in enumerate(batch_sizes, start=1):
+        batch = shuffled[offset:offset + batch_size]
+        offset += batch_size
+
+        print(f'\n=== Round {round_idx}/{num_rounds}: quantizing {len(batch)} patches '
+              f'({offset}/{total_patches} total) ===')
+
+        # a. Quantize selected patches — group by layer to call quantize_weight_to_bqq
+        #    once per layer (uses multiprocessing across all patches of that layer)
+        #    rather than once per patch (avoids process-creation overhead × N_patches).
+        patches_by_layer = {}
+        for lname, i, j in batch:
+            patches_by_layer.setdefault(lname, []).append((i, j))
+
+        for lname, ij_list in patches_by_layer.items():
+            layer = _get_submodule(block, lname)
+            print(f'  [{lname}] BQQ quantize full layer '
+                  f'{tuple(layer.float_weight.shape)} → activating {len(ij_list)} patches')
+            A_all, Y_all, Z_all = quantize_weight_to_bqq(
+                layer.float_weight.data.clone(),
+                bit_width=bit_width,
+                group_size=group_size,
+                num_steps=num_steps,
+                rank_scale=rank_scale,
+                seed=seed,
+                device_id=device_id,
+            )
+            for i, j in ij_list:
+                layer.quantize_patch(i, j, A_all[:, i, j, :], Y_all[:, i, j], Z_all[:, i, j])
+
+        # b. Block MSE before fine-tuning
+        mse_before = compute_block_mse(block, inputs_cache, targets_cache, dev)
+        print(f'  Block MSE after quantizing:   {mse_before:.6f}')
+
+        # c. Fine-tune all trainable params (a/b/c/d + float_weight + LayerNorm)
+        optimize_block_params(
+            block, inputs_cache, targets_cache,
+            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+        )
+
+        mse_after = compute_block_mse(block, inputs_cache, targets_cache, dev)
+        print(f'  Block MSE after fine-tuning:  {mse_after:.6f} '
+              f'(Δ={mse_after - mse_before:+.6f})')
+
+    # --- 4. Convert PartialBQQLinear → BinaryQuadratic ---
+    print('\nConverting PartialBQQLinear → BinaryQuadratic ...')
+    for lname in linear_names:
+        layer = _get_submodule(block, lname)
+        assert isinstance(layer, PartialBQQLinear), f"Expected PartialBQQLinear at {lname}"
+        _set_submodule(block, lname, layer.to_binaryquadratic())
+        print(f'  {lname}: converted')
+
+    # --- 5. Save ---
+    save_path = Path(save_dir) / f'block_{block_idx}.pth'
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(block.cpu(), save_path)
+
+    final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
+    print(f'\n=== Block {block_idx} done ===')
+    print(f'  Initial MSE: {init_mse:.6f}')
+    print(f'  Final MSE:   {final_mse:.6f}')
+    print(f'  Saved to: {save_path}')
+
+    return block
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -464,14 +679,34 @@ def main():
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
 
-    # Hessian-aware
+    # Mode
+    parser.add_argument('--mode', type=str, default='sequential',
+                        choices=['sequential', 'progressive'],
+                        help=('"sequential": existing layer-by-layer approach (default); '
+                              '"progressive": patch-wise stochastic quantization '
+                              '(no Hessian, random patch batches + fine-tuning)'))
+
+    # Hessian-aware (sequential mode only)
     parser.add_argument('--no_hessian', action='store_true',
-                        help='Disable Hessian-aware quantization (use standard BQQ)')
+                        help='[sequential] Disable Hessian-aware quantization')
+    parser.add_argument('--no_reverse', action='store_true',
+                        help='[sequential] Process layers front-to-back instead of back-to-front')
     parser.add_argument('--hessian_cache_dir', type=str, default=None,
-                        help='Directory to cache/load Hessian matrices')
+                        help='[sequential] Directory to cache/load Hessian matrices')
     parser.add_argument('--no_scale_refine', action='store_true',
-                        help='Disable Hessian-aware scale refinement after intra-layer')
+                        help='[sequential] Disable Hessian-aware scale refinement')
     parser.add_argument('--damping', type=float, default=1e-6)
+
+    # Progressive mode only
+    parser.add_argument('--num_rounds', type=int, default=4,
+                        help='[progressive] Number of quantization rounds (default 4)')
+    parser.add_argument('--schedule', type=str, default='geometric',
+                        choices=['linear', 'geometric'],
+                        help='[progressive] Batch size schedule: '
+                             '"linear" = equal batches each round; '
+                             '"geometric" = 2:1 decreasing ratio '
+                             '(more patches early, finer adjustments later) '
+                             '(default: geometric)')
 
     # Device / output
     parser.add_argument('--device', type=str, default='cuda:0')
@@ -491,7 +726,7 @@ def main():
         tokenizer=tokenizer,
     )
 
-    quantize_block(
+    common_kwargs = dict(
         model_name=args.model_name,
         block_idx=args.block_idx,
         dataloader=train_loader,
@@ -503,13 +738,23 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         max_grad_norm=args.max_grad_norm,
-        use_hessian=not args.no_hessian,
-        hessian_cache_dir=args.hessian_cache_dir,
-        scale_refine=not args.no_scale_refine,
-        damping=args.damping,
         device=args.device,
         save_dir=args.save_dir,
     )
+
+    if args.mode == 'progressive':
+        quantize_block_progressive(**common_kwargs,
+                                   num_rounds=args.num_rounds,
+                                   schedule=args.schedule)
+    else:
+        quantize_block(
+            **common_kwargs,
+            use_hessian=not args.no_hessian,
+            hessian_cache_dir=args.hessian_cache_dir,
+            scale_refine=not args.no_scale_refine,
+            damping=args.damping,
+            reverse=not args.no_reverse,
+        )
 
 
 if __name__ == '__main__':
