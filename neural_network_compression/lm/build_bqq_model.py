@@ -135,6 +135,44 @@ def dequantize_bqq_model(model: nn.Module, dtype: torch.dtype = torch.bfloat16) 
     return model
 
 
+def load_bqq_as_fp(
+    model_path: str | os.PathLike,
+    model_name: str,
+    dtype: torch.dtype = torch.bfloat16,
+    attn_implementation: str = "flash_attention_2",
+) -> nn.Module:
+    """Load a BQQ .pth, dequantize to FP weights, and rebuild as a fresh HF model
+    with the requested attn_implementation (e.g. flash_attention_2) for full-speed eval.
+
+    The BQQ-saved model carries whatever attn impl was baked in at save time
+    (typically eager/SDPA), so this reload step is required to switch to FA2.
+    """
+    import gc
+
+    src = torch.load(model_path, weights_only=False, map_location="cpu")
+    src = dequantize_bqq_model(src, dtype=dtype)
+    state_dict = src.state_dict()
+    del src
+    gc.collect()
+
+    fresh = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        dtype=dtype,
+        attn_implementation=attn_implementation,
+        device_map="auto",
+    )
+    missing, unexpected = fresh.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[load_bqq_as_fp] {len(missing)} missing keys (e.g. {missing[:3]})")
+    if unexpected:
+        print(f"[load_bqq_as_fp] {len(unexpected)} unexpected keys (e.g. {unexpected[:3]})")
+
+    del state_dict
+    gc.collect()
+    torch.cuda.empty_cache()
+    return fresh
+
+
 # ---------------------------------------------------------------------------
 # Build full model from compressed patches
 # ---------------------------------------------------------------------------
