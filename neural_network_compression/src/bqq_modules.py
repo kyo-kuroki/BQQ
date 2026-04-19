@@ -219,82 +219,38 @@ class PackedBinaryQuadratic(nn.Module):
             return self._matmul_via_packed_kernel(dtype)
         return self._matmul_via_unpack(dtype)
 
+    # Batch size threshold for fused ZYX kernel.
+    # The optimised fused kernel (with b/c terms folded into the bit loop)
+    # is competitive or faster at all tested batch sizes, so the threshold
+    # is set high.  Lower it if W-reconstruction becomes faster for your
+    # specific hardware / layer shape.
+    zy_x_batch_threshold: int = 256
+
     def _forward_zy_x(self, X: torch.Tensor) -> torch.Tensor:
-        """Forward via Y@(Z@X): avoids materialising the [B,y_row,z_col] W_core intermediate.
+        """Fused ZYX forward: computes X @ W.T without materialising W or T.
 
-        Two Triton passes:
-          Phase 1 — T[b,n,k]    = Σ_j Z_bool[b,k,j] * X[n, col(b), j]   (binary Z × float X)
-          Phase 2 — core[b,n,i] = Σ_k Y_bool[b,i,k] * T[b,n,k]          (binary Y × float T)
+        All four output terms (a*Y@Z@X, b*Ysum*Xsum, c*Zsum*X, d*Xsum) are
+        computed concurrently inside a single Triton kernel launch.
 
-        T shape is [B, batch, k8*8] (small).  W is never formed.
+        Auto-selects fused kernel for small batch (faster per-token) and falls
+        back to W-reconstruction + cuBLAS for large batch (amortised W build).
         """
-        from bqq_triton_kernel import binary_z_x, binary_y_t
+        batch = X.reshape(-1, X.shape[-1]).shape[0]
+        if batch > self.zy_x_batch_threshold:
+            # Fall back to W-reconstruction for large batch
+            return self._forward_w_recon(X)
 
-        dtype = X.dtype
-        device = self.Y_packed.device
-        X = X.to(device)
+        from bqq_triton_kernel import fused_bqq_forward
 
-        # Flatten all leading dimensions so X is [N, in_features]
-        orig_shape = X.shape
-        X_2d = X.reshape(-1, orig_shape[-1])
-        batch = X_2d.shape[0]          # N = batch * seq_len (or just batch)
-        B = self.bit_width * self.row_width * self.col_width
+        return fused_bqq_forward(
+            self.Y_packed, self.Z_packed,
+            X.to(self.Y_packed.device),
+            self.a, self.b, self.c, self.d,
+            bias=self.bias,
+        )
 
-        # Reshape X: [N, col_width, z_col]
-        X_view = X_2d.reshape(batch, self.col_width, self.z_col).contiguous()
-
-        Y_flat = self.Y_packed.reshape(B, self.y_row, self._k8)   # [B, y_row, k8]
-        Z_flat = self.Z_packed.reshape(B, self.z_col, self._k8)   # [B, z_col, k8]
-
-        # Phase 1: T = Z @ X  →  [B, batch, k8*8]
-        T = binary_z_x(Z_flat, X_view.to(torch.float16).contiguous(),
-                       self.inter_dimension, self.col_width)
-
-        # Phase 2: core = Y @ T  →  [B, batch, y_row]  float32
-        core = binary_y_t(Y_flat, T, self.inter_dimension)
-
-        # Reshape and weight by a: [bit_width, row_width, col_width, batch, y_row]
-        core = core.reshape(self.bit_width, self.row_width, self.col_width, batch, self.y_row)
-
-        a = self.a.squeeze(-1).squeeze(-1).to(torch.float32)   # [bit, row, col]
-        # a_term[row, batch, y_row] = Σ_{bit,col} a[bit,row,col] * core[bit,row,col,batch,i]
-        a_term = torch.einsum('brc,brcni->rni', a, core)       # [row, batch, y_row]
-
-        # b_term: b * Y_sum_eff * X_col_sum
-        b_f = self.b.squeeze(-1).squeeze(-1).to(torch.float32)  # [bit, row, col]
-        Y_sum_f = self.Y_sum_i16.squeeze(-1).to(torch.float32)  # [bit, row, col, y_row]
-        Y_sum_eff = torch.einsum('brc,brci->rci', b_f, Y_sum_f)  # [row, col, y_row]
-        X_col_sum = X_view.to(torch.float32).sum(dim=-1)          # [batch, col]
-        # b_term[row, batch, y_row] = Σ_col Y_sum_eff[row,col,i] * X_col_sum[batch,col]
-        b_term = torch.einsum('rci,nc->rni', Y_sum_eff, X_col_sum)  # [row, batch, y_row]
-
-        # c_term: c * Z_sum_eff · X — no y_row dependence
-        c_f = self.c.squeeze(-1).squeeze(-1).to(torch.float32)  # [bit, row, col]
-        Z_sum_f = self.Z_sum_i16.squeeze(-2).to(torch.float32)  # [bit, row, col, z_col]
-        Z_sum_eff = torch.einsum('brc,brcj->rcj', c_f, Z_sum_f)   # [row, col, z_col]
-        # c_term[row, batch] = Σ_{col,j} X[batch,col,j] * Z_sum_eff[row,col,j]
-        c_term = torch.einsum('ncj,rcj->rn', X_view.to(torch.float32), Z_sum_eff)  # [row, batch]
-
-        # d_term: d · X_col_sum — no y_row dependence
-        d_f = self.d.squeeze(-1).squeeze(-1).to(torch.float32)  # [row, col]
-        d_term = torch.einsum('rc,nc->rn', d_f, X_col_sum)       # [row, batch]
-
-        # Assemble: [row, N, y_row] → [N, row*y_row] → orig leading dims
-        out = (a_term + b_term
-               + (c_term + d_term).unsqueeze(-1))   # [row, N, y_row]
-        out = out.to(dtype).permute(1, 0, 2).reshape(batch, self.row_width * self.y_row)
-
-        # Restore original leading shape: [..., out_features]
-        out = out.reshape(*orig_shape[:-1], self.row_width * self.y_row)
-
-        if self.bias is not None:
-            out = out + self.bias.to(dtype=dtype, device=device)
-        return out
-
-    def forward(self, X):
-        if PackedBinaryQuadratic.use_zy_x_kernel:
-            return self._forward_zy_x(X)
-
+    def _forward_w_recon(self, X: torch.Tensor) -> torch.Tensor:
+        """W-reconstruction forward: build W then use cuBLAS for X @ W.T."""
         dtype = X.dtype
         device = self.Y_packed.device
 
@@ -314,6 +270,11 @@ class PackedBinaryQuadratic(nn.Module):
             return X.to(device) @ W.T
         else:
             return X.to(device) @ W.T + self.bias.to(dtype=dtype, device=device)
+
+    def forward(self, X):
+        if PackedBinaryQuadratic.use_zy_x_kernel:
+            return self._forward_zy_x(X)
+        return self._forward_w_recon(X)
 
     def get_weight(self, dtype=torch.float32):
         W_core = self._compute_W_core(dtype)
