@@ -683,10 +683,13 @@ __global__ void bqq_forward_v5_kernel(
             for (int w = 1; w < N_WARPS; w++)
                 total += warp_acc[w * 32 + lane];
             int i = it * 32 + lane;
-            if (i < y_row)
-                atomicAdd(
-                    &out[(size_t)n * row_width * y_row + r * y_row + i],
-                    total);
+            if (i < y_row) {
+                size_t idx = (size_t)n * row_width * y_row + r * y_row + i;
+                if (col_splits > 1)
+                    atomicAdd(&out[idx], total);
+                else
+                    out[idx] = total;   /* no atomics needed for single split */
+            }
         }
         __syncthreads();
     }
@@ -727,9 +730,9 @@ torch::Tensor bqq_forward_cuda(
     if (mode == 5) {
         /* ── v5: grid-split + uint32 bulk loads ────────────────── */
         constexpr int NW = 4;
-        /* auto-tune col_splits for ~20 warps/SM */
+        /* auto-tune col_splits for max occupancy (~48 warps/SM) */
         int sm_count = 56;  /* TODO: query at runtime */
-        int col_splits = max(1, (20 * sm_count + row_width * NW - 1)
+        int col_splits = max(1, (48 * sm_count + row_width * NW - 1)
                                 / (row_width * NW));
         col_splits = min(col_splits, col_width);
         /* prefer divisors of col_width for even distribution */
