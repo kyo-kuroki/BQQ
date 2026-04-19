@@ -698,24 +698,23 @@ __global__ void bqq_forward_v5_kernel(
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * v6: shared-memory tiled — burst DRAM load + SRAM compute
+ * v6: SRAM-tiled with batch reuse
  * ═══════════════════════════════════════════════════════════════════
  *
- * cuBLAS-style tiling: load ALL weight data for the block's c-range
- * into shared memory in one cooperative burst, then compute entirely
- * from SRAM (~20 cycle latency vs ~400 cycle DRAM).
+ * Key insight: Z/Y weights are the SAME across all batch elements.
+ * Load Z/Y to shared memory ONCE, then each warp processes a
+ * different batch element using the SAME cached weights.
  *
- * Phase 1 — Cooperative burst load (all threads help):
- *   Z_smem, Y_smem, X_smem, coeff_smem ← DRAM
- *   128 threads issue independent loads → memory pipeline filled
- *   → near full DRAM bandwidth utilisation
+ *   Grid: (row_width * col_splits, ceil(batch / N_WARPS))
+ *   Block: N_WARPS * 32 threads
+ *   Warp w → batch element n = blockIdx.y * N_WARPS + w
  *
- * Phase 2 — Compute from SRAM only:
- *   Same warp-shuffle inner loop as v5, but all data reads hit
- *   shared memory instead of DRAM.
+ * Phase 1: ALL warps cooperatively load Z/Y/coefficients → SRAM
+ * Phase 2: each warp loads its own X[n,...] and computes from SRAM
+ *          → Z/Y reused N_WARPS times per SRAM load!
  *
- * Shared memory per block: ~5 KB (col_splits=16, c_count=4)
- * → 8 blocks/SM = 32 warps/SM (vs 36 in v5 but SRAM-speed)
+ * For batch=128, N_WARPS=4: weights loaded 32 times (vs 128 in v5)
+ * → 4x DRAM bandwidth savings
  */
 
 template <int N_WARPS, int N_I_TILES, int K8_MAX>
@@ -728,6 +727,7 @@ __global__ void bqq_forward_v6_kernel(
     const float*   __restrict__ c_ptr,
     const float*   __restrict__ d_ptr,
     float*         __restrict__ out,
+    int batch,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
     int col_splits)
@@ -735,7 +735,7 @@ __global__ void bqq_forward_v6_kernel(
     const int combined = blockIdx.x;
     const int r  = combined / col_splits;
     const int cs = combined % col_splits;
-    const int n  = blockIdx.y;
+    const int n  = blockIdx.y * N_WARPS + (threadIdx.x >> 5);  /* each warp = different batch */
     const int warp_id = threadIdx.x >> 5;
     const int lane    = threadIdx.x & 31;
     const int tid     = threadIdx.x;
@@ -745,26 +745,20 @@ __global__ void bqq_forward_v6_kernel(
     const int c_start = cs * c_per_split;
     const int c_end   = min(c_start + c_per_split, col_width);
     const int c_count = c_end - c_start;
-    const int n_cp    = c_count * bit_width;          /* total (c,p) pairs */
+    const int n_cp    = c_count * bit_width;
 
-    /* ── shared memory layout ──────────────────────────────── */
+    /* ── shared memory: weights (batch-INDEPENDENT) ────────── */
     extern __shared__ char smem_raw[];
-    const int z_size = n_cp * z_col * k8;             /* uint8 */
-    const int y_size = n_cp * y_row * k8;
-    const int x_size = c_count * z_col;               /* float */
-    const int cf_size = n_cp * 3 + c_count;           /* float: a,b,c per cp + d per c */
+    const int z_size  = n_cp * z_col * k8;
+    const int y_size  = n_cp * y_row * k8;
+    const int cf_size = n_cp * 3 + c_count;
 
     uint8_t* Z_sm = reinterpret_cast<uint8_t*>(smem_raw);
     uint8_t* Y_sm = Z_sm + z_size;
-    float*   X_sm = reinterpret_cast<float*>(Y_sm + ((y_size + 3) & ~3));
-    float*   C_sm = X_sm + x_size;                    /* coefficients */
-    float*   W_sm = C_sm + cf_size;                   /* warp_acc */
+    float*   C_sm = reinterpret_cast<float*>(Y_sm + ((y_size + 3) & ~3));
 
-    /* ════ Phase 1: cooperative burst load ════════════════════
-     * All threads issue independent loads → fills memory pipeline
-     * → achieves near-peak DRAM bandwidth                      */
+    /* ════ Phase 1: load weights to SRAM (ALL warps help) ════ */
 
-    /* load Z */
     for (int i = tid; i < z_size; i += nthreads) {
         int cp  = i / (z_col * k8);
         int jbk = i % (z_col * k8);
@@ -772,7 +766,6 @@ __global__ void bqq_forward_v6_kernel(
         int B   = p * row_width * col_width + r * col_width + (c_start + ci);
         Z_sm[i] = Z[(size_t)B * z_col * k8 + jbk];
     }
-    /* load Y */
     for (int i = tid; i < y_size; i += nthreads) {
         int cp  = i / (y_row * k8);
         int ibk = i % (y_row * k8);
@@ -780,12 +773,6 @@ __global__ void bqq_forward_v6_kernel(
         int B   = p * row_width * col_width + r * col_width + (c_start + ci);
         Y_sm[i] = Y[(size_t)B * y_row * k8 + ibk];
     }
-    /* load X */
-    for (int i = tid; i < c_count * z_col; i += nthreads) {
-        int ci = i / z_col, j = i % z_col;
-        X_sm[i] = X[n * col_width * z_col + (c_start + ci) * z_col + j];
-    }
-    /* load coefficients (a, b, c, d) */
     for (int i = tid; i < n_cp; i += nthreads) {
         int ci = i / bit_width, p = i % bit_width;
         int B  = p * row_width * col_width + r * col_width + (c_start + ci);
@@ -798,14 +785,19 @@ __global__ void bqq_forward_v6_kernel(
 
     __syncthreads();
 
-    /* ════ Phase 2: compute entirely from SRAM ════════════════ */
+    /* ════ Phase 2: each warp computes its own batch element ══
+     *      X is loaded from DRAM (per-n), weights from SRAM    */
+
+    if (n >= batch) return;     /* warp has no work */
 
     float acc[N_I_TILES];
     #pragma unroll
     for (int it = 0; it < N_I_TILES; it++) acc[it] = 0.0f;
 
-    for (int ci = warp_id; ci < c_count; ci += N_WARPS) {
-        float x_val = (lane < z_col) ? X_sm[ci * z_col + lane] : 0.0f;
+    for (int ci = 0; ci < c_count; ci++) {
+        /* X from DRAM (batch-specific), Z/Y from SRAM (shared) */
+        float x_val = (lane < z_col) ?
+            X[n * col_width * z_col + (c_start + ci) * z_col + lane] : 0.0f;
         float xsum = warp_reduce_sum(x_val);
         xsum = __shfl_sync(0xffffffff, xsum, 0);
 
@@ -876,24 +868,16 @@ __global__ void bqq_forward_v6_kernel(
         for (int it = 0; it < N_I_TILES; it++) acc[it] += dt;
     }
 
-    /* ── cross-warp reduction + output ──────────────────────── */
+    /* ── output: each warp writes its own batch element ────── */
+    /* no cross-warp reduction needed (warps handle different n) */
     #pragma unroll
     for (int it = 0; it < N_I_TILES; it++) {
-        W_sm[warp_id * 32 + lane] = acc[it];
-        __syncthreads();
-        if (warp_id == 0) {
-            float total = W_sm[lane];
-            #pragma unroll
-            for (int w = 1; w < N_WARPS; w++)
-                total += W_sm[w * 32 + lane];
-            int i = it * 32 + lane;
-            if (i < y_row) {
-                auto idx = (size_t)n * row_width * y_row + r * y_row + i;
-                if (col_splits > 1) atomicAdd(&out[idx], total);
-                else                out[idx] = total;
-            }
+        int i = it * 32 + lane;
+        if (i < y_row) {
+            auto idx = (size_t)n * row_width * y_row + r * y_row + i;
+            if (col_splits > 1) atomicAdd(&out[idx], acc[it]);
+            else                out[idx] = acc[it];
         }
-        __syncthreads();
     }
 }
 
@@ -929,34 +913,34 @@ torch::Tensor bqq_forward_cuda(
     if (mode == 0) mode = 5;   /* default = grid-split (v6 SRAM has no data reuse) */
 
     if (mode == 6) {
-        /* ── v6: shared-memory tiled ───────────────────────────── */
+        /* ── v6: SRAM-tiled with batch reuse ───────────────────── */
         constexpr int NW = 4;
-        int sm_count = 56;
-        int col_splits = max(1, (32 * sm_count + row_width * NW - 1)
-                                / (row_width * NW));
-        col_splits = min(col_splits, col_width);
+        /* col_splits: keep smem < 48KB */
+        int col_splits = max(1, col_width / 8);
         while (col_splits > 1 && col_width % col_splits != 0)
             col_splits--;
 
         int c_count = (col_width + col_splits - 1) / col_splits;
         int n_cp = c_count * bit_width;
-        /* shared memory = Z + Y + X + coeff + warp_acc */
+        /* shared memory = Z + Y + coeff (NO X — X is per-batch from DRAM) */
         int z_sz = n_cp * z_col * k8;
         int y_sz = n_cp * y_row * k8;
         int smem = z_sz + ((y_sz + 3) & ~3)
-                 + (c_count * z_col + n_cp * 3 + c_count + NW * 32) * sizeof(float);
+                 + (n_cp * 3 + c_count) * sizeof(float);
 
         out = torch::zeros({batch, row_width, y_row},
             torch::dtype(torch::kFloat32).device(X.device()));
         op = out.data_ptr<float>();
 
-        dim3 grid(row_width * col_splits, batch);
+        /* grid.y = batch tiles (N_WARPS batch elements per block) */
+        dim3 grid(row_width * col_splits, (batch + NW - 1) / NW);
         dim3 block(NW * 32);
 
         #define LAUNCH_V6(NI, K8M) \
             bqq_forward_v6_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
                 yp, zp, xp, ap, bp, cp, dp, op, \
-                row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+                batch, row_width, col_width, bit_width, y_row, z_col, k8, \
+                col_splits)
 
         if (ni == 1) {
             if      (k8 <= 4)  LAUNCH_V6(1, 4);
