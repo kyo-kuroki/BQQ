@@ -412,6 +412,126 @@ __global__ void bqq_forward_multiw_kernel(
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * v4: popcount + multi-warp i-split  — minimal shuffles
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Combines AND+popcount with multi-warp for occupancy.
+ *
+ *   Thread = j (z_col direction) for warp reduction
+ *   Warp  w handles i = w*IPW .. (w+1)*IPW-1  (y_row split)
+ *   → y_row / N_WARPS reductions per warp  (vs y_row in v1)
+ *   → NO cross-warp reduction needed (each warp writes independent i rows)
+ *
+ * Per (p, c, i) iteration:
+ *   1. Y bytes broadcast-loaded (all threads read same address → L1 hit)
+ *   2. inner = Σ_bk popc(Y[i,bk] AND Z[j=lane,bk])  — k8 AND+popc ops
+ *   3. core_i = warp_reduce(X[j] * inner)             — ONE reduction
+ *
+ * Block: N_WARPS × 32 threads    Grid: (row_width, batch)
+ */
+
+template <int N_WARPS, int IPW_MAX, int K8_MAX>
+__global__ void bqq_forward_popcount_multiw_kernel(
+    const uint8_t* __restrict__ Y,
+    const uint8_t* __restrict__ Z,
+    const float*   __restrict__ X,
+    const float*   __restrict__ a_ptr,
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,
+    float*         __restrict__ out,
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8)
+{
+    const int r       = blockIdx.x;
+    const int n       = blockIdx.y;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;     /* = j index for z_col */
+
+    /* i-range for this warp */
+    const int ipw     = (y_row + N_WARPS - 1) / N_WARPS;
+    const int i_start = warp_id * ipw;
+    const int i_end   = min(i_start + ipw, y_row);
+    const int my_cnt  = i_end - i_start;
+
+    float acc[IPW_MAX];
+    #pragma unroll
+    for (int ii = 0; ii < IPW_MAX; ii++) acc[ii] = 0.0f;
+
+    for (int ci = 0; ci < col_width; ci++) {
+        const int rc     = r * col_width + ci;
+        const int x_base = n * col_width * z_col + ci * z_col;
+
+        /* X[n, c, j=lane] — private per thread */
+        const float x_val = (lane < z_col) ? X[x_base + lane] : 0.0f;
+
+        float xsum = warp_reduce_sum(x_val);
+        xsum = __shfl_sync(0xffffffff, xsum, 0);
+
+        for (int p = 0; p < bit_width; p++) {
+            const int   B_idx = p * row_width * col_width + rc;
+            const float a_val = a_ptr[B_idx];
+            const float b_val = b_ptr[B_idx];
+            const float c_val = c_ptr[B_idx];
+
+            /* Z bytes for j=lane — private, reused across all i */
+            uint8_t zb[K8_MAX];
+            int z_sum_j = 0;
+            #pragma unroll
+            for (int bk = 0; bk < K8_MAX; bk++) {
+                if (bk < k8 && lane < z_col) {
+                    zb[bk] = Z[(size_t)B_idx * z_col * k8 + lane * k8 + bk];
+                    z_sum_j += __popc(static_cast<unsigned>(zb[bk]));
+                } else {
+                    zb[bk] = 0;
+                }
+            }
+
+            /* z_dot_x = Σ_j X[j]·Zsum[j] — ONE reduction per (p,c) */
+            float z_dot_x = warp_reduce_sum(x_val * static_cast<float>(z_sum_j));
+            z_dot_x = __shfl_sync(0xffffffff, z_dot_x, 0);
+
+            /* ── i-loop: only this warp's i-range ────────────── */
+            for (int ii = 0; ii < my_cnt; ii++) {
+                const int i = i_start + ii;
+
+                /* Y bytes — broadcast (all threads read same addr → L1 hit) */
+                int y_sum_i = 0;
+                int inner   = 0;
+                #pragma unroll
+                for (int bk = 0; bk < K8_MAX; bk++) {
+                    if (bk < k8) {
+                        uint8_t yv = Y[(size_t)B_idx * y_row * k8 + i * k8 + bk];
+                        y_sum_i += __popc(static_cast<unsigned>(yv));
+                        inner   += __popc(static_cast<unsigned>(yv & zb[bk]));
+                    }
+                }
+
+                /* core_i = Σ_j X[j] · popc(Y[i]&Z[j]) — ONE reduction */
+                float core_i = warp_reduce_sum(x_val * static_cast<float>(inner));
+                core_i = __shfl_sync(0xffffffff, core_i, 0);
+
+                acc[ii] += a_val * core_i
+                         + b_val * xsum * static_cast<float>(y_sum_i)
+                         + c_val * z_dot_x;
+            }
+        }
+
+        const float d_term = d_ptr[rc] * xsum;
+        for (int ii = 0; ii < my_cnt; ii++) acc[ii] += d_term;
+    }
+
+    /* store — all threads have identical acc[], lane 0 writes */
+    if (lane == 0) {
+        for (int ii = 0; ii < my_cnt; ii++) {
+            int i = i_start + ii;
+            out[(size_t)n * row_width * y_row + r * y_row + i] = acc[ii];
+        }
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * dispatch
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -423,7 +543,7 @@ torch::Tensor bqq_forward_cuda(
     torch::Tensor c, torch::Tensor d,
     int batch, int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
-    int mode)     /* 0 = auto, 1 = warp-shuffle, 2 = popcount, 3 = multi-warp */
+    int mode)     /* 0=auto, 1=warp-shfl, 2=popcount-1w, 3=multi-w-shfl, 4=multi-w-popcount */
 {
     auto out = torch::empty({batch, row_width, y_row},
         torch::dtype(torch::kFloat32).device(X.device()));
@@ -440,9 +560,37 @@ torch::Tensor bqq_forward_cuda(
     int nj = (z_col + 31) / 32;
     int ni = (y_row + 31) / 32;
 
-    if (mode == 0) mode = 3;   /* default = multi-warp */
+    if (mode == 0) mode = 3;   /* default = multi-warp shuffle (fastest) */
 
-    if (mode == 3) {
+    if (mode == 4) {
+        /* ── popcount + multi-warp i-split ─────────────────────── */
+        constexpr int NW = 8;
+        dim3 grid(row_width, batch);
+        dim3 block(NW * 32);
+        int ipw = (y_row + NW - 1) / NW;  /* i per warp */
+
+        #define LAUNCH_V4(IPW, K8M) \
+            bqq_forward_popcount_multiw_kernel<NW, IPW, K8M> \
+                <<<grid, block>>>(yp, zp, xp, ap, bp, cp, dp, op, \
+                    row_width, col_width, bit_width, y_row, z_col, k8)
+
+        if (ipw <= 4) {
+            if      (k8 <= 4)  LAUNCH_V4(4, 4);
+            else if (k8 <= 8)  LAUNCH_V4(4, 8);
+            else               LAUNCH_V4(4, 16);
+        } else if (ipw <= 8) {
+            if      (k8 <= 4)  LAUNCH_V4(8, 4);
+            else if (k8 <= 8)  LAUNCH_V4(8, 8);
+            else               LAUNCH_V4(8, 16);
+        } else if (ipw <= 16) {
+            if      (k8 <= 8)  LAUNCH_V4(16, 8);
+            else               LAUNCH_V4(16, 16);
+        } else {
+            LAUNCH_V4(32, 16);
+        }
+        #undef LAUNCH_V4
+
+    } else if (mode == 3) {
         /* ── multi-warp kernel (N_WARPS=4 → 128 threads/block) ── */
         constexpr int NW = 4;
         dim3 grid(row_width, batch);
