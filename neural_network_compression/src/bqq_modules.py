@@ -225,26 +225,41 @@ class PackedBinaryQuadratic(nn.Module):
         )
 
     def _forward_w_recon(self, X: torch.Tensor) -> torch.Tensor:
-        """W-reconstruction forward: build W then use cuBLAS for X @ W.T."""
-        dtype = X.dtype
+        """Fused W-reconstruction + cuBLAS matmul.
+
+        Step 1: single CUDA kernel reconstructs W as FP16 via AND+popcount.
+        Step 2: cuBLAS FP16 Tensor Core for X @ W.T.
+        """
+        from bqq_cuda_ext import _get_ext
+
+        ext = _get_ext()
         device = self.Y_packed.device
+        B_total = self.bit_width * self.row_width * self.col_width
 
-        W_core = self._compute_W_core(dtype)
-        Y_sum = self.Y_sum_i16.to(dtype)
-        Z_sum = self.Z_sum_i16.to(dtype)
+        Y_flat = self.Y_packed.reshape(B_total, self.y_row, self._k8).contiguous()
+        Z_flat = self.Z_packed.reshape(B_total, self.z_col, self._k8).contiguous()
+        a_flat = self.a.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
+        b_flat = self.b.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
+        c_flat = self.c.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
+        d_flat = self.d.squeeze(-1).squeeze(-1).reshape(
+            self.row_width * self.col_width).float().contiguous()
 
-        W = (self.a.to(dtype) * W_core
-             + self.b.to(dtype) * Y_sum
-             + self.c.to(dtype) * Z_sum)
-        W = W.sum(dim=0) + self.d.to(dtype)
-        W = W.permute(0, 2, 1, 3).reshape(
-            self.row_width * self.y_row, self.col_width * self.z_col
+        # Step 1: reconstruct W as FP16 (single CUDA kernel, AND+popcount)
+        W_half = ext.reconstruct_W(
+            Y_flat, Z_flat, a_flat, b_flat, c_flat, d_flat,
+            self.row_width, self.col_width, self.bit_width,
+            self.y_row, self.z_col, self._k8,
         )
 
-        if self.bias is None:
-            return X.to(device) @ W.T
-        else:
-            return X.to(device) @ W.T + self.bias.to(dtype=dtype, device=device)
+        # Step 2: cuBLAS FP16 Tensor Core matmul
+        orig_shape = X.shape
+        X_2d = X.to(device).reshape(-1, orig_shape[-1]).half()
+        out = X_2d @ W_half.T
+
+        if self.bias is not None:
+            out = out + self.bias.half().to(device)
+
+        return out.reshape(*orig_shape[:-1], self.row_width * self.y_row).to(X.dtype)
 
     def forward(self, X):
         if PackedBinaryQuadratic.use_zy_x_kernel:

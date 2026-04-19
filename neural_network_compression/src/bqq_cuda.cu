@@ -181,6 +181,100 @@ __global__ void bqq_forward_kernel(
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * Fused W-reconstruction kernel
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Reconstructs the full weight matrix W via AND+popcount in one
+ * kernel launch (replaces 4-5 separate ops in the Python path).
+ *
+ * W[r*yr+i, c*zc+j] = Σ_p { a_p · popc(Y_p[i,:] & Z_p[:,j])
+ *                          + b_p · popc(Y_p[i,:])
+ *                          + c_p · popc(Z_p[:,j]) } + d[r,c]
+ *
+ * Each thread computes one W element independently.
+ * Output in FP16 → enables cuBLAS FP16 Tensor Core for X @ W.T.
+ */
+
+__global__ void reconstruct_W_kernel(
+    const uint8_t* __restrict__ Y,      /* [B_total, y_row, k8] */
+    const uint8_t* __restrict__ Z,      /* [B_total, z_col, k8] */
+    const float*   __restrict__ a_ptr,  /* [B_total] */
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,  /* [row_width * col_width] */
+    __half*        __restrict__ W_out,  /* [out_features, in_features] fp16 */
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8)
+{
+    const int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int in_idx  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int out_features = row_width * y_row;
+    const int in_features  = col_width * z_col;
+
+    if (out_idx >= out_features || in_idx >= in_features) return;
+
+    const int r = out_idx / y_row, i = out_idx % y_row;
+    const int c = in_idx  / z_col, j = in_idx  % z_col;
+
+    float val = 0.0f;
+    for (int p = 0; p < bit_width; p++) {
+        const int B = p * row_width * col_width + r * col_width + c;
+        const auto* yp = Y + (size_t)B * y_row * k8 + i * k8;
+        const auto* zp = Z + (size_t)B * z_col * k8 + j * k8;
+
+        int inner = 0, ys = 0, zs = 0;
+        /* k8 bytes per row/col — load as uint32 when k8=4 */
+        if (k8 == 4) {
+            uint32_t yw = *reinterpret_cast<const uint32_t*>(yp);
+            uint32_t zw = *reinterpret_cast<const uint32_t*>(zp);
+            inner = __popc(yw & zw);
+            ys    = __popc(yw);
+            zs    = __popc(zw);
+        } else {
+            for (int bk = 0; bk < k8; bk++) {
+                inner += __popc(static_cast<unsigned>(yp[bk] & zp[bk]));
+                ys    += __popc(static_cast<unsigned>(yp[bk]));
+                zs    += __popc(static_cast<unsigned>(zp[bk]));
+            }
+        }
+        val += a_ptr[B] * (float)inner
+             + b_ptr[B] * (float)ys
+             + c_ptr[B] * (float)zs;
+    }
+    val += d_ptr[r * col_width + c];
+    W_out[out_idx * in_features + in_idx] = __float2half(val);
+}
+
+torch::Tensor reconstruct_W(
+    torch::Tensor Y_packed, torch::Tensor Z_packed,
+    torch::Tensor a, torch::Tensor b,
+    torch::Tensor c, torch::Tensor d,
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8)
+{
+    int out_f = row_width * y_row;
+    int in_f  = col_width * z_col;
+
+    auto W = torch::empty({out_f, in_f},
+        torch::dtype(torch::kFloat16).device(Y_packed.device()));
+
+    dim3 block(16, 16);
+    dim3 grid((out_f + 15) / 16, (in_f + 15) / 16);
+
+    reconstruct_W_kernel<<<grid, block>>>(
+        Y_packed.data_ptr<uint8_t>(),
+        Z_packed.data_ptr<uint8_t>(),
+        a.data_ptr<float>(), b.data_ptr<float>(),
+        c.data_ptr<float>(), d.data_ptr<float>(),
+        reinterpret_cast<__half*>(W.data_ptr<at::Half>()),
+        row_width, col_width, bit_width,
+        y_row, z_col, k8);
+
+    return W;
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * dispatch
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -306,6 +400,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("batch"), py::arg("row_width"), py::arg("col_width"),
           py::arg("bit_width"), py::arg("y_row"), py::arg("z_col"),
           py::arg("k8"), py::arg("mode") = 0);
+    m.def("reconstruct_W", &reconstruct_W,
+          "Reconstruct W matrix via AND+popcount (returns FP16)");
     m.def("prefetch_tensors_to_l2", &prefetch_tensors_to_l2,
           "Prefetch weight tensors into L2 cache");
     m.def("set_l2_persistence", &set_l2_persistence,
