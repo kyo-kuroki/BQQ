@@ -237,7 +237,6 @@ class PackedBinaryQuadratic(nn.Module):
         if kernel == "recon" or (kernel == "auto" and batch > self.zy_x_recon_threshold):
             return self._forward_w_recon(X)
 
-        # Try CUDA warp kernel
         if kernel in ("cuda", "auto"):
             try:
                 from bqq_cuda_ext import cuda_bqq_forward
@@ -250,7 +249,6 @@ class PackedBinaryQuadratic(nn.Module):
             except Exception:
                 if kernel == "cuda":
                     raise
-                # auto mode: fall through to triton
 
         # Triton fallback
         if kernel in ("triton", "auto"):
