@@ -698,6 +698,206 @@ __global__ void bqq_forward_v5_kernel(
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * v6: shared-memory tiled — burst DRAM load + SRAM compute
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * cuBLAS-style tiling: load ALL weight data for the block's c-range
+ * into shared memory in one cooperative burst, then compute entirely
+ * from SRAM (~20 cycle latency vs ~400 cycle DRAM).
+ *
+ * Phase 1 — Cooperative burst load (all threads help):
+ *   Z_smem, Y_smem, X_smem, coeff_smem ← DRAM
+ *   128 threads issue independent loads → memory pipeline filled
+ *   → near full DRAM bandwidth utilisation
+ *
+ * Phase 2 — Compute from SRAM only:
+ *   Same warp-shuffle inner loop as v5, but all data reads hit
+ *   shared memory instead of DRAM.
+ *
+ * Shared memory per block: ~5 KB (col_splits=16, c_count=4)
+ * → 8 blocks/SM = 32 warps/SM (vs 36 in v5 but SRAM-speed)
+ */
+
+template <int N_WARPS, int N_I_TILES, int K8_MAX>
+__global__ void bqq_forward_v6_kernel(
+    const uint8_t* __restrict__ Y,
+    const uint8_t* __restrict__ Z,
+    const float*   __restrict__ X,
+    const float*   __restrict__ a_ptr,
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,
+    float*         __restrict__ out,
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8,
+    int col_splits)
+{
+    const int combined = blockIdx.x;
+    const int r  = combined / col_splits;
+    const int cs = combined % col_splits;
+    const int n  = blockIdx.y;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+    const int tid     = threadIdx.x;
+    const int nthreads = N_WARPS * 32;
+
+    const int c_per_split = (col_width + col_splits - 1) / col_splits;
+    const int c_start = cs * c_per_split;
+    const int c_end   = min(c_start + c_per_split, col_width);
+    const int c_count = c_end - c_start;
+    const int n_cp    = c_count * bit_width;          /* total (c,p) pairs */
+
+    /* ── shared memory layout ──────────────────────────────── */
+    extern __shared__ char smem_raw[];
+    const int z_size = n_cp * z_col * k8;             /* uint8 */
+    const int y_size = n_cp * y_row * k8;
+    const int x_size = c_count * z_col;               /* float */
+    const int cf_size = n_cp * 3 + c_count;           /* float: a,b,c per cp + d per c */
+
+    uint8_t* Z_sm = reinterpret_cast<uint8_t*>(smem_raw);
+    uint8_t* Y_sm = Z_sm + z_size;
+    float*   X_sm = reinterpret_cast<float*>(Y_sm + ((y_size + 3) & ~3));
+    float*   C_sm = X_sm + x_size;                    /* coefficients */
+    float*   W_sm = C_sm + cf_size;                   /* warp_acc */
+
+    /* ════ Phase 1: cooperative burst load ════════════════════
+     * All threads issue independent loads → fills memory pipeline
+     * → achieves near-peak DRAM bandwidth                      */
+
+    /* load Z */
+    for (int i = tid; i < z_size; i += nthreads) {
+        int cp  = i / (z_col * k8);
+        int jbk = i % (z_col * k8);
+        int ci  = cp / bit_width, p = cp % bit_width;
+        int B   = p * row_width * col_width + r * col_width + (c_start + ci);
+        Z_sm[i] = Z[(size_t)B * z_col * k8 + jbk];
+    }
+    /* load Y */
+    for (int i = tid; i < y_size; i += nthreads) {
+        int cp  = i / (y_row * k8);
+        int ibk = i % (y_row * k8);
+        int ci  = cp / bit_width, p = cp % bit_width;
+        int B   = p * row_width * col_width + r * col_width + (c_start + ci);
+        Y_sm[i] = Y[(size_t)B * y_row * k8 + ibk];
+    }
+    /* load X */
+    for (int i = tid; i < c_count * z_col; i += nthreads) {
+        int ci = i / z_col, j = i % z_col;
+        X_sm[i] = X[n * col_width * z_col + (c_start + ci) * z_col + j];
+    }
+    /* load coefficients (a, b, c, d) */
+    for (int i = tid; i < n_cp; i += nthreads) {
+        int ci = i / bit_width, p = i % bit_width;
+        int B  = p * row_width * col_width + r * col_width + (c_start + ci);
+        C_sm[i * 3 + 0] = a_ptr[B];
+        C_sm[i * 3 + 1] = b_ptr[B];
+        C_sm[i * 3 + 2] = c_ptr[B];
+    }
+    for (int i = tid; i < c_count; i += nthreads)
+        C_sm[n_cp * 3 + i] = d_ptr[r * col_width + (c_start + i)];
+
+    __syncthreads();
+
+    /* ════ Phase 2: compute entirely from SRAM ════════════════ */
+
+    float acc[N_I_TILES];
+    #pragma unroll
+    for (int it = 0; it < N_I_TILES; it++) acc[it] = 0.0f;
+
+    for (int ci = warp_id; ci < c_count; ci += N_WARPS) {
+        float x_val = (lane < z_col) ? X_sm[ci * z_col + lane] : 0.0f;
+        float xsum = warp_reduce_sum(x_val);
+        xsum = __shfl_sync(0xffffffff, xsum, 0);
+
+        for (int p = 0; p < bit_width; p++) {
+            int cp = ci * bit_width + p;
+            float a_val = C_sm[cp * 3 + 0];
+            float b_val = C_sm[cp * 3 + 1];
+            float c_val = C_sm[cp * 3 + 2];
+            float t_sum = 0.0f;
+
+            /* Z/Y from shared memory → registers */
+            constexpr int NW = (K8_MAX + 3) / 4;
+            uint32_t z_w[NW];
+            if (lane < z_col) {
+                auto zp = reinterpret_cast<const uint32_t*>(
+                    Z_sm + cp * z_col * k8 + lane * k8);
+                #pragma unroll
+                for (int w = 0; w < NW; w++)
+                    z_w[w] = (w * 4 < k8) ? zp[w] : 0;
+            } else {
+                #pragma unroll
+                for (int w = 0; w < NW; w++) z_w[w] = 0;
+            }
+
+            uint32_t y_w[N_I_TILES][NW];
+            #pragma unroll
+            for (int it = 0; it < N_I_TILES; it++) {
+                int i = it * 32 + lane;
+                if (i < y_row) {
+                    auto yp = reinterpret_cast<const uint32_t*>(
+                        Y_sm + cp * y_row * k8 + i * k8);
+                    #pragma unroll
+                    for (int w = 0; w < NW; w++)
+                        y_w[it][w] = (w * 4 < k8) ? yp[w] : 0;
+                } else {
+                    #pragma unroll
+                    for (int w = 0; w < NW; w++) y_w[it][w] = 0;
+                }
+            }
+
+            #pragma unroll
+            for (int bk = 0; bk < K8_MAX; bk++) {
+                if (bk >= k8) break;
+                int wi = bk >> 2, bs = (bk & 3) << 3;
+                uint8_t zb = (z_w[wi] >> bs) & 0xFF;
+
+                #pragma unroll
+                for (int bit = 0; bit < 8; bit++) {
+                    int sh = 7 - bit;
+                    float t_k = warp_reduce_sum(
+                        ((zb >> sh) & 1) ? x_val : 0.0f);
+                    t_k = __shfl_sync(0xffffffff, t_k, 0);
+                    float t_aug = a_val * t_k + b_val * xsum;
+                    #pragma unroll
+                    for (int it = 0; it < N_I_TILES; it++) {
+                        uint8_t yb = (y_w[it][wi] >> bs) & 0xFF;
+                        if ((yb >> sh) & 1) acc[it] += t_aug;
+                    }
+                    t_sum += t_k;
+                }
+            }
+            float ct = c_val * t_sum;
+            #pragma unroll
+            for (int it = 0; it < N_I_TILES; it++) acc[it] += ct;
+        }
+        float dt = C_sm[n_cp * 3 + ci] * xsum;
+        #pragma unroll
+        for (int it = 0; it < N_I_TILES; it++) acc[it] += dt;
+    }
+
+    /* ── cross-warp reduction + output ──────────────────────── */
+    #pragma unroll
+    for (int it = 0; it < N_I_TILES; it++) {
+        W_sm[warp_id * 32 + lane] = acc[it];
+        __syncthreads();
+        if (warp_id == 0) {
+            float total = W_sm[lane];
+            #pragma unroll
+            for (int w = 1; w < N_WARPS; w++)
+                total += W_sm[w * 32 + lane];
+            int i = it * 32 + lane;
+            if (i < y_row) {
+                auto idx = (size_t)n * row_width * y_row + r * y_row + i;
+                if (col_splits > 1) atomicAdd(&out[idx], total);
+                else                out[idx] = total;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  * dispatch
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -726,9 +926,51 @@ torch::Tensor bqq_forward_cuda(
     int nj = (z_col + 31) / 32;
     int ni = (y_row + 31) / 32;
 
-    if (mode == 0) mode = 5;   /* default = grid-split + uint32 + preload */
+    if (mode == 0) mode = 5;   /* default = grid-split (v6 SRAM has no data reuse) */
 
-    if (mode == 5) {
+    if (mode == 6) {
+        /* ── v6: shared-memory tiled ───────────────────────────── */
+        constexpr int NW = 4;
+        int sm_count = 56;
+        int col_splits = max(1, (32 * sm_count + row_width * NW - 1)
+                                / (row_width * NW));
+        col_splits = min(col_splits, col_width);
+        while (col_splits > 1 && col_width % col_splits != 0)
+            col_splits--;
+
+        int c_count = (col_width + col_splits - 1) / col_splits;
+        int n_cp = c_count * bit_width;
+        /* shared memory = Z + Y + X + coeff + warp_acc */
+        int z_sz = n_cp * z_col * k8;
+        int y_sz = n_cp * y_row * k8;
+        int smem = z_sz + ((y_sz + 3) & ~3)
+                 + (c_count * z_col + n_cp * 3 + c_count + NW * 32) * sizeof(float);
+
+        out = torch::zeros({batch, row_width, y_row},
+            torch::dtype(torch::kFloat32).device(X.device()));
+        op = out.data_ptr<float>();
+
+        dim3 grid(row_width * col_splits, batch);
+        dim3 block(NW * 32);
+
+        #define LAUNCH_V6(NI, K8M) \
+            bqq_forward_v6_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
+                yp, zp, xp, ap, bp, cp, dp, op, \
+                row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+
+        if (ni == 1) {
+            if      (k8 <= 4)  LAUNCH_V6(1, 4);
+            else if (k8 <= 8)  LAUNCH_V6(1, 8);
+            else               LAUNCH_V6(1, 16);
+        } else if (ni <= 2) {
+            if      (k8 <= 8)  LAUNCH_V6(2, 8);
+            else               LAUNCH_V6(2, 16);
+        } else {
+            LAUNCH_V6(4, 16);
+        }
+        #undef LAUNCH_V6
+
+    } else if (mode == 5) {
         /* ── v5: grid-split + uint32 bulk loads ────────────────── */
         constexpr int NW = 4;
         /* auto-tune col_splits for max occupancy (~48 warps/SM) */
@@ -870,6 +1112,7 @@ torch::Tensor bqq_forward_cuda(
 
     return out;
 }
+
 
 
 /* ═══════════════════════════════════════════════════════════════════
