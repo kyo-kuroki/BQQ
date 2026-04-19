@@ -155,9 +155,6 @@ class PackedBinaryQuadratic(nn.Module):
     # ------------------------------------------------------------------
     use_packed_kernel: bool = False
 
-    # When True, forward uses the CUDA fused kernel instead of
-    # W-reconstruction + cuBLAS.
-    use_zy_x_kernel: bool = False
 
     def _unpack_to_bool(self, packed: torch.Tensor, n_bits: int) -> torch.Tensor:
         """Unpack uint8 tensor to bool along the last axis.
@@ -215,56 +212,22 @@ class PackedBinaryQuadratic(nn.Module):
             return self._matmul_via_packed_kernel(dtype)
         return self._matmul_via_unpack(dtype)
 
-    def _forward_zy_x(self, X: torch.Tensor) -> torch.Tensor:
-        from bqq_cuda_ext import cuda_bqq_forward
-        return cuda_bqq_forward(
-            self.Y_packed, self.Z_packed,
-            X.to(self.Y_packed.device),
-            self.a, self.b, self.c, self.d,
-            bias=self.bias,
-        )
-
-    def _forward_w_recon(self, X: torch.Tensor) -> torch.Tensor:
-        """Fused W-reconstruction + cuBLAS matmul.
-
-        Step 1: single CUDA kernel reconstructs W as FP16 via AND+popcount.
-        Step 2: cuBLAS FP16 Tensor Core for X @ W.T.
-        """
-        from bqq_cuda_ext import _get_ext
-
-        ext = _get_ext()
-        device = self.Y_packed.device
-        B_total = self.bit_width * self.row_width * self.col_width
-
-        Y_flat = self.Y_packed.reshape(B_total, self.y_row, self._k8).contiguous()
-        Z_flat = self.Z_packed.reshape(B_total, self.z_col, self._k8).contiguous()
-        a_flat = self.a.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
-        b_flat = self.b.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
-        c_flat = self.c.squeeze(-1).squeeze(-1).reshape(B_total).float().contiguous()
-        d_flat = self.d.squeeze(-1).squeeze(-1).reshape(
-            self.row_width * self.col_width).float().contiguous()
-
-        # Step 1: reconstruct W as FP16 (single CUDA kernel, AND+popcount)
-        W_half = ext.reconstruct_W(
-            Y_flat, Z_flat, a_flat, b_flat, c_flat, d_flat,
-            self.row_width, self.col_width, self.bit_width,
-            self.y_row, self.z_col, self._k8,
-        )
-
-        # Step 2: cuBLAS FP16 Tensor Core matmul
-        orig_shape = X.shape
-        X_2d = X.to(device).reshape(-1, orig_shape[-1]).half()
-        out = X_2d @ W_half.T
-
-        if self.bias is not None:
-            out = out + self.bias.half().to(device)
-
-        return out.reshape(*orig_shape[:-1], self.row_width * self.y_row).to(X.dtype)
+    _empty_bias = None  # cached empty tensor for no-bias case
 
     def forward(self, X):
-        if PackedBinaryQuadratic.use_zy_x_kernel:
-            return self._forward_zy_x(X)
-        return self._forward_w_recon(X)
+        from bqq_cuda_ext import _get_ext
+        ext = _get_ext()
+        if self.bias is not None:
+            b = self.bias
+        else:
+            if PackedBinaryQuadratic._empty_bias is None or \
+               PackedBinaryQuadratic._empty_bias.device != self.Y_packed.device:
+                PackedBinaryQuadratic._empty_bias = torch.empty(
+                    0, device=self.Y_packed.device)
+            b = PackedBinaryQuadratic._empty_bias
+        return ext.bqq_forward(
+            self.Y_packed, self.Z_packed, X,
+            self.a, self.b, self.c, self.d, b)
 
     def get_weight(self, dtype=torch.float32):
         W_core = self._compute_W_core(dtype)

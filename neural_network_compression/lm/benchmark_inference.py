@@ -121,8 +121,6 @@ def main():
     if args.pack:
         print("Packing BinaryQuadratic → PackedBinaryQuadratic...")
         pack_binaryquadratic_model(model_bqq)
-        PackedBinaryQuadratic.use_zy_x_kernel = True
-
     model_bqq = model_bqq.to(device).eval()
 
     # Pre-compile CUDA kernel (first call triggers JIT compilation)

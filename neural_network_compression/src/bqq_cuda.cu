@@ -275,64 +275,121 @@ torch::Tensor reconstruct_W(
 
 
 /* ═══════════════════════════════════════════════════════════════════
- * dispatch
- * ═══════════════════════════════════════════════════════════════════ */
+ * Unified forward: one call from Python, zero tensor manipulation
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Accepts raw packed tensors in their storage shapes.  Internally
+ * handles all flatten/reshape, dispatches the right kernel, and
+ * returns the result in the same leading shape as X.
+ *
+ * seq_len <= 32 → fused warp-shuffle kernel (no W materialisation)
+ * seq_len >  32 → reconstruct_W (popcount) + cuBLAS FP16 matmul
+ */
 
-torch::Tensor bqq_forward_cuda(
-    torch::Tensor Y_packed,
-    torch::Tensor Z_packed,
-    torch::Tensor X,
-    torch::Tensor a, torch::Tensor b,
-    torch::Tensor c, torch::Tensor d,
-    int batch, int row_width, int col_width, int bit_width,
-    int y_row, int z_col, int k8,
-    int mode)
+torch::Tensor bqq_forward(
+    torch::Tensor Y_packed,     /* [bit, row, col, y_row, k8]  uint8 */
+    torch::Tensor Z_packed,     /* [bit, row, col, z_col, k8]  uint8 */
+    torch::Tensor X,            /* [..., in_features]                */
+    torch::Tensor a,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor b,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor c,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor d,            /* [row, col, 1, 1]                  */
+    torch::Tensor bias)         /* [out_features] or empty           */
 {
-    auto yp = Y_packed.data_ptr<uint8_t>();
-    auto zp = Z_packed.data_ptr<uint8_t>();
-    auto xp = X.data_ptr<float>();
-    auto ap = a.data_ptr<float>();
-    auto bp = b.data_ptr<float>();
-    auto cp = c.data_ptr<float>();
-    auto dp = d.data_ptr<float>();
+    /* ── extract dimensions from tensor shapes ─────────────── */
+    const int bit_width = Y_packed.size(0);
+    const int row_width = Y_packed.size(1);
+    const int col_width = Y_packed.size(2);
+    const int y_row     = Y_packed.size(3);
+    const int k8        = Y_packed.size(4);
+    const int z_col     = Z_packed.size(3);
+    const int out_f     = row_width * y_row;
+    const int in_f      = col_width * z_col;
+    const int B_total   = bit_width * row_width * col_width;
+    const int ni        = (y_row + 31) / 32;
 
-    int ni = (y_row + 31) / 32;
+    /* ── flatten X to [batch, in_features] ─────────────────── */
+    auto X_shape = X.sizes().vec();
+    int64_t batch = 1;
+    for (int i = 0; i < (int)X_shape.size() - 1; i++) batch *= X_shape[i];
+    auto X_2d = X.reshape({batch, in_f});
 
-    constexpr int NW = 4;
-    int sm_count = 56;
-    int col_splits = max(1, (48 * sm_count + row_width * NW - 1)
-                            / (row_width * NW));
-    col_splits = min(col_splits, col_width);
-    while (col_splits > 1 && col_width % col_splits != 0)
-        col_splits--;
+    /* ── flatten weights (views, no copy if contiguous) ─────── */
+    auto Y_flat = Y_packed.reshape({B_total, y_row, k8}).contiguous();
+    auto Z_flat = Z_packed.reshape({B_total, z_col, k8}).contiguous();
+    auto a_flat = a.reshape({B_total}).to(torch::kFloat32).contiguous();
+    auto b_flat = b.reshape({B_total}).to(torch::kFloat32).contiguous();
+    auto c_flat = c.reshape({B_total}).to(torch::kFloat32).contiguous();
+    auto d_flat = d.reshape({row_width * col_width}).to(torch::kFloat32).contiguous();
 
-    auto out = torch::zeros({batch, row_width, y_row},
-        torch::dtype(torch::kFloat32).device(X.device()));
-    auto op = out.data_ptr<float>();
+    torch::Tensor result;
 
-    dim3 grid(row_width * col_splits, batch);
-    dim3 block(NW * 32);
-    int smem = NW * 32 * sizeof(float);
+    if (batch <= 1) {
+        /* ── small seq: fused warp-shuffle kernel ──────────────── */
+        auto X_view = X_2d.reshape({(int)batch, col_width, z_col})
+                          .to(torch::kFloat32).contiguous();
 
-    #define LAUNCH(NI, K8M) \
-        bqq_forward_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
-            yp, zp, xp, ap, bp, cp, dp, op, \
-            row_width, col_width, bit_width, y_row, z_col, k8, \
-            col_splits)
+        constexpr int NW = 4;
+        int sm_count = 56;
+        int col_splits = max(1, (48 * sm_count + row_width * NW - 1)
+                                / (row_width * NW));
+        col_splits = min(col_splits, col_width);
+        while (col_splits > 1 && col_width % col_splits != 0) col_splits--;
 
-    if (ni == 1) {
-        if      (k8 <= 4)  LAUNCH(1, 4);
-        else if (k8 <= 8)  LAUNCH(1, 8);
-        else               LAUNCH(1, 16);
-    } else if (ni <= 2) {
-        if      (k8 <= 8)  LAUNCH(2, 8);
-        else               LAUNCH(2, 16);
+        auto out = torch::zeros({(int)batch, row_width, y_row},
+            torch::dtype(torch::kFloat32).device(X.device()));
+
+        dim3 grid(row_width * col_splits, batch);
+        dim3 block(NW * 32);
+        int smem = NW * 32 * sizeof(float);
+
+        #define LAUNCH(NI, K8M) \
+            bqq_forward_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
+                Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                X_view.data_ptr<float>(), \
+                a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
+                c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                out.data_ptr<float>(), \
+                row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+
+        if (ni == 1) {
+            if      (k8 <= 4)  LAUNCH(1, 4);
+            else if (k8 <= 8)  LAUNCH(1, 8);
+            else               LAUNCH(1, 16);
+        } else if (ni <= 2) {
+            if      (k8 <= 8)  LAUNCH(2, 8);
+            else               LAUNCH(2, 16);
+        } else { LAUNCH(4, 16); }
+        #undef LAUNCH
+
+        result = out.reshape({(int)batch, out_f});
+
     } else {
-        LAUNCH(4, 16);
-    }
-    #undef LAUNCH
+        /* ── large seq: reconstruct W (popcount) + cuBLAS FP16 ── */
+        auto W_half = torch::empty({out_f, in_f},
+            torch::dtype(torch::kFloat16).device(X.device()));
 
-    return out;
+        dim3 rblock(16, 16);
+        dim3 rgrid((out_f + 15) / 16, (in_f + 15) / 16);
+
+        reconstruct_W_kernel<<<rgrid, rblock>>>(
+            Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(),
+            a_flat.data_ptr<float>(), b_flat.data_ptr<float>(),
+            c_flat.data_ptr<float>(), d_flat.data_ptr<float>(),
+            reinterpret_cast<__half*>(W_half.data_ptr<at::Half>()),
+            row_width, col_width, bit_width, y_row, z_col, k8);
+
+        result = torch::mm(X_2d.to(torch::kFloat16), W_half.t());
+    }
+
+    /* ── bias ──────────────────────────────────────────────── */
+    if (bias.numel() > 0)
+        result = result + bias.to(result.dtype()).to(result.device());
+
+    /* ── restore original leading shape ────────────────────── */
+    auto out_shape = X_shape;
+    out_shape.back() = out_f;
+    return result.reshape(out_shape).to(X.dtype());
 }
 
 
@@ -393,15 +450,11 @@ void reset_l2_persistence() {
 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("bqq_forward_cuda", &bqq_forward_cuda,
-          "BQQ fused forward CUDA kernel",
+    m.def("bqq_forward", &bqq_forward,
+          "BQQ forward: one call, no Python tensor manipulation",
           py::arg("Y_packed"), py::arg("Z_packed"), py::arg("X"),
           py::arg("a"), py::arg("b"), py::arg("c"), py::arg("d"),
-          py::arg("batch"), py::arg("row_width"), py::arg("col_width"),
-          py::arg("bit_width"), py::arg("y_row"), py::arg("z_col"),
-          py::arg("k8"), py::arg("mode") = 0);
-    m.def("reconstruct_W", &reconstruct_W,
-          "Reconstruct W matrix via AND+popcount (returns FP16)");
+          py::arg("bias"));
     m.def("prefetch_tensors_to_l2", &prefetch_tensors_to_l2,
           "Prefetch weight tensors into L2 cache");
     m.def("set_l2_persistence", &set_l2_persistence,
