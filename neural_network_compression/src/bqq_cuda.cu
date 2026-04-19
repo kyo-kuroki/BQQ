@@ -23,6 +23,7 @@
  */
 
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
@@ -871,6 +872,80 @@ torch::Tensor bqq_forward_cuda(
 }
 
 
+/* ═══════════════════════════════════════════════════════════════════
+ * L2 cache prefetch kernel
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Reads all bytes of a tensor to bring them into L2 cache.
+ * Launched on a separate CUDA stream to overlap with compute.
+ *
+ * Pipeline:  [compute layer N]  ←──── current stream
+ *            [prefetch layer N+1] ←── prefetch stream (concurrent)
+ *
+ * When layer N finishes, layer N+1's data is already in L2.
+ * Layer N+1's kernel then runs at L2 speed (~3us vs ~49us from DRAM).
+ */
+
+__global__ void prefetch_l2_kernel(const char* __restrict__ ptr, size_t nbytes) {
+    const size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
+    const size_t stride = (size_t)blockDim.x * gridDim.x;
+
+    /* read 16 bytes per step (one float4 = one 128-bit load) */
+    for (size_t i = tid * 16; i < nbytes; i += stride * 16) {
+        if (i + 16 <= nbytes) {
+            float4 v = *reinterpret_cast<const float4*>(ptr + i);
+            /* prevent dead code elimination */
+            asm volatile("" :: "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
+        }
+    }
+}
+
+void prefetch_tensors_to_l2(
+    torch::Tensor Y_packed,
+    torch::Tensor Z_packed,
+    torch::Tensor a, torch::Tensor b,
+    torch::Tensor c, torch::Tensor d)
+{
+    /* launch on the CURRENT stream — caller should set stream */
+    auto launch = [](const void* ptr, size_t nbytes) {
+        if (nbytes == 0) return;
+        int threads = 256;
+        int blocks = min((int)((nbytes + threads * 16 - 1) / (threads * 16)), 256);
+        prefetch_l2_kernel<<<blocks, threads>>>(
+            static_cast<const char*>(ptr), nbytes);
+    };
+
+    launch(Y_packed.data_ptr(), Y_packed.nbytes());
+    launch(Z_packed.data_ptr(), Z_packed.nbytes());
+    launch(a.data_ptr(), a.nbytes());
+    launch(b.data_ptr(), b.nbytes());
+    launch(c.data_ptr(), c.nbytes());
+    launch(d.data_ptr(), d.nbytes());
+}
+
+/* ── L2 cache residency control (Ampere+) ──────────────────────── */
+
+void set_l2_persistence(torch::Tensor tensor, float hit_ratio) {
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = tensor.data_ptr();
+    attr.accessPolicyWindow.num_bytes = tensor.nbytes();
+    attr.accessPolicyWindow.hitRatio  = hit_ratio;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(
+        at::cuda::getCurrentCUDAStream(),
+        cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+void reset_l2_persistence() {
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.num_bytes = 0;
+    cudaStreamSetAttribute(
+        at::cuda::getCurrentCUDAStream(),
+        cudaStreamAttributeAccessPolicyWindow, &attr);
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bqq_forward_cuda", &bqq_forward_cuda,
           "BQQ fused forward CUDA kernel",
@@ -879,4 +954,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("batch"), py::arg("row_width"), py::arg("col_width"),
           py::arg("bit_width"), py::arg("y_row"), py::arg("z_col"),
           py::arg("k8"), py::arg("mode") = 0);
+    m.def("prefetch_tensors_to_l2", &prefetch_tensors_to_l2,
+          "Prefetch Y/Z/coeff tensors into L2 cache");
+    m.def("set_l2_persistence", &set_l2_persistence,
+          "Pin tensor in L2 cache (Ampere+)",
+          py::arg("tensor"), py::arg("hit_ratio") = 1.0f);
+    m.def("reset_l2_persistence", &reset_l2_persistence,
+          "Remove L2 persistence policy");
 }
