@@ -225,8 +225,9 @@ class PackedBinaryQuadratic(nn.Module):
     #   "recon"  — W-reconstruction + cuBLAS (fallback)
     #   "auto"   — try cuda → triton → recon
     zy_x_kernel: str = "auto"
-    # Batch threshold: above this, W-reconstruction is used
-    zy_x_recon_threshold: int = 64
+    # Batch/seq_len threshold: above this, W-reconstruction + cuBLAS is faster
+    # (cuBLAS Tensor Core amortises W rebuild cost; BQQ kernel scales linearly)
+    zy_x_recon_threshold: int = 32
 
     def _forward_zy_x(self, X: torch.Tensor) -> torch.Tensor:
         """Auto-select fastest kernel."""

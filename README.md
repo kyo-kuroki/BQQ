@@ -182,27 +182,31 @@ BQQ models use `PackedBinaryQuadratic` layers where Y, Z are stored as packed ui
 
 Auto-selection in `PackedBinaryQuadratic.forward()`:
 - `use_zy_x_kernel = True`: tries CUDA → Triton → W-reconstruction
-- Batch > `zy_x_recon_threshold` (default 64): always W-reconstruction
+- seq_len > `zy_x_recon_threshold` (default 32): W-reconstruction + cuBLAS
 
 ### CUDA kernel modes
 
 ```python
 from bqq_cuda_ext import cuda_bqq_forward
 
-# mode=0 (auto=3), mode=1 (single-warp shuffle), mode=3 (multi-warp shuffle)
-out = cuda_bqq_forward(Y_packed, Z_packed, X, a, b, c, d, mode=3)
+# mode=0 (auto=5), mode=1 (1-warp shuffle), mode=3 (multi-warp shuffle),
+# mode=5 (grid-split + uint32), mode=6 (SRAM-tiled)
+out = cuda_bqq_forward(Y_packed, Z_packed, X, a, b, c, d, mode=5)
 ```
 
-### Performance (1536x1536, 4-bit, gs=32, RTX 4500 Ada)
+### Performance (2048x2048, 4-bit, gs=32, RTX 4500 Ada)
 
-| batch | FP16 cuBLAS | CUDA v3 (default) | W-reconstruction |
-|-------|-------------|-------------------|------------------|
-| 1     | 0.034ms     | 0.061ms           | 0.777ms          |
-| 4     | 0.037ms     | 0.123ms           | 0.777ms          |
-| 16    | 0.037ms     | 0.381ms           | 0.783ms          |
-| 64    | 0.037ms     | 1.489ms           | 0.794ms          |
+| seq_len | FP16 cuBLAS | Best BQQ kernel | Kernel | FP16 ratio |
+|---------|-------------|-----------------|--------|------------|
+| 1       | 33 us       | 47 us           | CUDA v5 | 1.4x      |
+| 4       | 36 us       | 169 us          | CUDA v5 | 4.7x      |
+| 16      | 36 us       | 682 us          | CUDA v5 | 19x       |
+| 64      | 35 us       | 1,621 us        | W-recon | 46x       |
+| 256     | 40 us       | 1,715 us        | W-recon | 43x       |
 
-The CUDA kernel is 1.8x slower than FP16 cuBLAS at batch=1 due to the lack of 1-bit x float Tensor Core instructions. BQQ's primary value is **16x model size reduction**, not inference speed.
+At seq_len=1 (autoregressive decode), BQQ is only 1.4x slower than FP16.
+At seq_len≥32, W-reconstruction + cuBLAS Tensor Core becomes faster.
+BQQ's primary value is **2-4x model size reduction**, enabling larger models on smaller GPUs.
 
 ## `quantizer.py`
 
