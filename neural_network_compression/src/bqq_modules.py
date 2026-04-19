@@ -155,12 +155,8 @@ class PackedBinaryQuadratic(nn.Module):
     # ------------------------------------------------------------------
     use_packed_kernel: bool = False
 
-    # ------------------------------------------------------------------
-    # ZYX kernel flag.
-    # When True, forward uses Y@(Z@X) via Triton binary-float kernels
-    # (avoids materialising W_core; two binary-masked float accumulations).
-    # Registered automatically when bqq_triton_kernel is imported.
-    # ------------------------------------------------------------------
+    # When True, forward uses the CUDA fused kernel instead of
+    # W-reconstruction + cuBLAS.
     use_zy_x_kernel: bool = False
 
     def _unpack_to_bool(self, packed: torch.Tensor, n_bits: int) -> torch.Tensor:
@@ -219,50 +215,14 @@ class PackedBinaryQuadratic(nn.Module):
             return self._matmul_via_packed_kernel(dtype)
         return self._matmul_via_unpack(dtype)
 
-    # Kernel selection:
-    #   "cuda"   — warp-level CUDA kernel (fastest, requires compilation)
-    #   "triton" — Triton fused kernel (v1/v2 auto-selected)
-    #   "recon"  — W-reconstruction + cuBLAS (fallback)
-    #   "auto"   — try cuda → triton → recon
-    zy_x_kernel: str = "auto"
-    # Batch/seq_len threshold: above this, W-reconstruction + cuBLAS is faster
-    # (cuBLAS Tensor Core amortises W rebuild cost; BQQ kernel scales linearly)
-    zy_x_recon_threshold: int = 32
-
     def _forward_zy_x(self, X: torch.Tensor) -> torch.Tensor:
-        """Auto-select fastest kernel."""
-        batch = X.reshape(-1, X.shape[-1]).shape[0]
-        kernel = self.zy_x_kernel
-
-        if kernel == "recon" or (kernel == "auto" and batch > self.zy_x_recon_threshold):
-            return self._forward_w_recon(X)
-
-        if kernel in ("cuda", "auto"):
-            try:
-                from bqq_cuda_ext import cuda_bqq_forward
-                return cuda_bqq_forward(
-                    self.Y_packed, self.Z_packed,
-                    X.to(self.Y_packed.device),
-                    self.a, self.b, self.c, self.d,
-                    bias=self.bias,
-                )
-            except Exception:
-                if kernel == "cuda":
-                    raise
-
-        # Triton fallback
-        if kernel in ("triton", "auto"):
-            from bqq_triton_kernel import fused_bqq_forward
-            version = 1 if batch <= 1 else 2
-            return fused_bqq_forward(
-                self.Y_packed, self.Z_packed,
-                X.to(self.Y_packed.device),
-                self.a, self.b, self.c, self.d,
-                bias=self.bias,
-                kernel_version=version,
-            )
-
-        return self._forward_w_recon(X)
+        from bqq_cuda_ext import cuda_bqq_forward
+        return cuda_bqq_forward(
+            self.Y_packed, self.Z_packed,
+            X.to(self.Y_packed.device),
+            self.a, self.b, self.c, self.d,
+            bias=self.bias,
+        )
 
     def _forward_w_recon(self, X: torch.Tensor) -> torch.Tensor:
         """W-reconstruction forward: build W then use cuBLAS for X @ W.T."""
