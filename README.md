@@ -170,6 +170,40 @@ Jobs killed by walltime can be resubmitted without redundant computation.
 - Walltime (`h_rt`) is **per task**, not per array job.
 - Effective worker count is capped at `min(mp.cpu_count(), workers_per_gpu)`.
 
+## Inference kernels
+
+BQQ models use `PackedBinaryQuadratic` layers where Y, Z are stored as packed uint8 (8x smaller than bool). Three inference backends are available:
+
+| Backend | Kernel | Description |
+|---------|--------|-------------|
+| **CUDA** (default) | `bqq_cuda.cu` mode=3 | Multi-warp shuffle: 4 warps split `col_width`, conditional-add inner loop. Compiled on first import via `torch.utils.cpp_extension`. |
+| **Triton** | `bqq_triton_kernel.py` v1/v2 | Fused kernel with `t_aug = a*t + b*xsum` optimisation. v2 parallelises `bit_width` via 2D tensor ops. |
+| **W-reconstruction** | `bqq_modules.py` | Unpack Y/Z → cuBLAS matmul for W, then `X @ W.T`. Fallback for large batch. |
+
+Auto-selection in `PackedBinaryQuadratic.forward()`:
+- `use_zy_x_kernel = True`: tries CUDA → Triton → W-reconstruction
+- Batch > `zy_x_recon_threshold` (default 64): always W-reconstruction
+
+### CUDA kernel modes
+
+```python
+from bqq_cuda_ext import cuda_bqq_forward
+
+# mode=0 (auto=3), mode=1 (single-warp shuffle), mode=3 (multi-warp shuffle)
+out = cuda_bqq_forward(Y_packed, Z_packed, X, a, b, c, d, mode=3)
+```
+
+### Performance (1536x1536, 4-bit, gs=32, RTX 4500 Ada)
+
+| batch | FP16 cuBLAS | CUDA v3 (default) | W-reconstruction |
+|-------|-------------|-------------------|------------------|
+| 1     | 0.034ms     | 0.061ms           | 0.777ms          |
+| 4     | 0.037ms     | 0.123ms           | 0.777ms          |
+| 16    | 0.037ms     | 0.381ms           | 0.783ms          |
+| 64    | 0.037ms     | 1.489ms           | 0.794ms          |
+
+The CUDA kernel is 1.8x slower than FP16 cuBLAS at batch=1 due to the lack of 1-bit x float Tensor Core instructions. BQQ's primary value is **16x model size reduction**, not inference speed.
+
 ## `quantizer.py`
 
 | Class | Description |
