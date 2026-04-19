@@ -532,6 +532,168 @@ __global__ void bqq_forward_popcount_multiw_kernel(
 
 
 /* ═══════════════════════════════════════════════════════════════════
+ * v5: grid-split + uint32 bulk loads + preloaded registers
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Three orthogonal optimisations for bandwidth utilisation:
+ *
+ *   1. Grid splitting over col_width → col_splits × more blocks
+ *      → warps/SM jumps from 3.4 to 20+
+ *      → memory latency hidden by interleaving warp execution
+ *      → atomicAdd to accumulate partial results
+ *
+ *   2. uint32 bulk loads for Z/Y bytes
+ *      → k8=4 bytes loaded in 1 instruction instead of 4
+ *      → 32 threads × 4 bytes = 128 bytes = 1 cache line (perfect coalescing)
+ *
+ *   3. All Z/Y data preloaded to registers before bit loop
+ *      → hardware pipelines loads while compute runs
+ *      → no load-use stalls in the inner loop
+ *
+ * Grid: (row_width × col_splits, batch)
+ * Block: N_WARPS × 32 threads
+ * Output: pre-zeroed, accumulated via atomicAdd
+ */
+
+template <int N_WARPS, int N_I_TILES, int K8_MAX>
+__global__ void bqq_forward_v5_kernel(
+    const uint8_t* __restrict__ Y,
+    const uint8_t* __restrict__ Z,
+    const float*   __restrict__ X,
+    const float*   __restrict__ a_ptr,
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,
+    float*         __restrict__ out,        /* PRE-ZEROED */
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8,
+    int col_splits)
+{
+    const int combined = blockIdx.x;
+    const int r  = combined / col_splits;
+    const int cs = combined % col_splits;
+    const int n  = blockIdx.y;
+    const int warp_id = threadIdx.x >> 5;
+    const int lane    = threadIdx.x & 31;
+
+    /* c-range for this block */
+    const int c_per_split = (col_width + col_splits - 1) / col_splits;
+    const int c_block_start = cs * c_per_split;
+    const int c_block_end   = min(c_block_start + c_per_split, col_width);
+
+    __shared__ float warp_acc[N_WARPS * 32];
+
+    float acc[N_I_TILES];
+    #pragma unroll
+    for (int it = 0; it < N_I_TILES; it++) acc[it] = 0.0f;
+
+    /* distribute c within block across warps */
+    for (int ci = c_block_start + warp_id; ci < c_block_end; ci += N_WARPS) {
+        const int rc     = r * col_width + ci;
+        const int x_base = n * col_width * z_col + ci * z_col;
+
+        const float x_val = (lane < z_col) ? X[x_base + lane] : 0.0f;
+        float xsum = warp_reduce_sum(x_val);
+        xsum = __shfl_sync(0xffffffff, xsum, 0);
+
+        for (int p = 0; p < bit_width; p++) {
+            const int   B_idx = p * row_width * col_width + rc;
+            const float a_val = a_ptr[B_idx];
+            const float b_val = b_ptr[B_idx];
+            const float c_val = c_ptr[B_idx];
+            float t_sum = 0.0f;
+
+            /* ── uint32 bulk load: Z[B_idx, lane, 0..k8-1] ────── */
+            /*    k8 contiguous bytes per thread → k8/4 uint32's   */
+            /*    32 threads × k8 bytes = coalesced cache line(s)  */
+            constexpr int N_WORDS = (K8_MAX + 3) / 4;
+            uint32_t z_words[N_WORDS];
+            if (lane < z_col) {
+                auto zp = reinterpret_cast<const uint32_t*>(
+                    Z + (size_t)B_idx * z_col * k8 + lane * k8);
+                #pragma unroll
+                for (int w = 0; w < N_WORDS; w++)
+                    z_words[w] = (w * 4 < k8) ? zp[w] : 0;
+            } else {
+                #pragma unroll
+                for (int w = 0; w < N_WORDS; w++) z_words[w] = 0;
+            }
+
+            /* ── uint32 bulk load: Y[B_idx, i_tile, 0..k8-1] ──── */
+            uint32_t y_words[N_I_TILES][N_WORDS];
+            #pragma unroll
+            for (int it = 0; it < N_I_TILES; it++) {
+                int i = it * 32 + lane;
+                if (i < y_row) {
+                    auto yp = reinterpret_cast<const uint32_t*>(
+                        Y + (size_t)B_idx * y_row * k8 + i * k8);
+                    #pragma unroll
+                    for (int w = 0; w < N_WORDS; w++)
+                        y_words[it][w] = (w * 4 < k8) ? yp[w] : 0;
+                } else {
+                    #pragma unroll
+                    for (int w = 0; w < N_WORDS; w++) y_words[it][w] = 0;
+                }
+            }
+
+            /* ── inner loop: all data in registers ─────────────── */
+            #pragma unroll
+            for (int bk = 0; bk < K8_MAX; bk++) {
+                if (bk >= k8) break;
+                const int w_idx = bk >> 2;           /* bk / 4 */
+                const int b_shift = (bk & 3) << 3;   /* (bk % 4) * 8 */
+                const uint8_t zb = (z_words[w_idx] >> b_shift) & 0xFF;
+
+                #pragma unroll
+                for (int bit = 0; bit < 8; bit++) {
+                    const int shift = 7 - bit;
+                    float t_k = warp_reduce_sum(
+                        ((zb >> shift) & 1) ? x_val : 0.0f);
+                    t_k = __shfl_sync(0xffffffff, t_k, 0);
+                    const float t_aug = a_val * t_k + b_val * xsum;
+
+                    #pragma unroll
+                    for (int it = 0; it < N_I_TILES; it++) {
+                        const uint8_t yb =
+                            (y_words[it][w_idx] >> b_shift) & 0xFF;
+                        if ((yb >> shift) & 1) acc[it] += t_aug;
+                    }
+                    t_sum += t_k;
+                }
+            }
+
+            const float c_term = c_val * t_sum;
+            #pragma unroll
+            for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
+        }
+
+        const float d_term = d_ptr[rc] * xsum;
+        #pragma unroll
+        for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
+    }
+
+    /* ── cross-warp reduction + atomicAdd ────────────────────── */
+    #pragma unroll
+    for (int it = 0; it < N_I_TILES; it++) {
+        warp_acc[warp_id * 32 + lane] = acc[it];
+        __syncthreads();
+        if (warp_id == 0) {
+            float total = warp_acc[lane];
+            #pragma unroll
+            for (int w = 1; w < N_WARPS; w++)
+                total += warp_acc[w * 32 + lane];
+            int i = it * 32 + lane;
+            if (i < y_row)
+                atomicAdd(
+                    &out[(size_t)n * row_width * y_row + r * y_row + i],
+                    total);
+        }
+        __syncthreads();
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
  * dispatch
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -543,7 +705,7 @@ torch::Tensor bqq_forward_cuda(
     torch::Tensor c, torch::Tensor d,
     int batch, int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
-    int mode)     /* 0=auto, 1=warp-shfl, 2=popcount-1w, 3=multi-w-shfl, 4=multi-w-popcount */
+    int mode)     /* 0=auto, 1=shfl, 2=popc-1w, 3=mw-shfl, 4=mw-popc, 5=grid-split */
 {
     auto out = torch::empty({batch, row_width, y_row},
         torch::dtype(torch::kFloat32).device(X.device()));
@@ -560,7 +722,48 @@ torch::Tensor bqq_forward_cuda(
     int nj = (z_col + 31) / 32;
     int ni = (y_row + 31) / 32;
 
-    if (mode == 0) mode = 3;   /* default = multi-warp shuffle (fastest) */
+    if (mode == 0) mode = 5;   /* default = grid-split + uint32 + preload */
+
+    if (mode == 5) {
+        /* ── v5: grid-split + uint32 bulk loads ────────────────── */
+        constexpr int NW = 4;
+        /* auto-tune col_splits for ~20 warps/SM */
+        int sm_count = 56;  /* TODO: query at runtime */
+        int col_splits = max(1, (20 * sm_count + row_width * NW - 1)
+                                / (row_width * NW));
+        col_splits = min(col_splits, col_width);
+        /* prefer divisors of col_width for even distribution */
+        while (col_splits > 1 && col_width % col_splits != 0)
+            col_splits--;
+
+        /* pre-zero output (atomicAdd accumulates into it) */
+        out = torch::zeros({batch, row_width, y_row},
+            torch::dtype(torch::kFloat32).device(X.device()));
+        op = out.data_ptr<float>();   /* update pointer! */
+
+        dim3 grid(row_width * col_splits, batch);
+        dim3 block(NW * 32);
+        int smem = NW * 32 * sizeof(float);
+
+        #define LAUNCH_V5(NI, K8M) \
+            bqq_forward_v5_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
+                yp, zp, xp, ap, bp, cp, dp, op, \
+                row_width, col_width, bit_width, y_row, z_col, k8, \
+                col_splits)
+
+        if (ni == 1) {
+            if      (k8 <= 4)  LAUNCH_V5(1, 4);
+            else if (k8 <= 8)  LAUNCH_V5(1, 8);
+            else               LAUNCH_V5(1, 16);
+        } else if (ni <= 2) {
+            if      (k8 <= 8)  LAUNCH_V5(2, 8);
+            else               LAUNCH_V5(2, 16);
+        } else {
+            LAUNCH_V5(4, 16);
+        }
+        #undef LAUNCH_V5
+
+    } else
 
     if (mode == 4) {
         /* ── popcount + multi-warp i-split ─────────────────────── */
