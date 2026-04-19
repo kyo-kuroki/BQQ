@@ -38,8 +38,9 @@ def cuda_bqq_forward(
     c: torch.Tensor,
     d: torch.Tensor,
     bias: torch.Tensor | None = None,
+    mode: int = 0,
 ) -> torch.Tensor:
-    """BQQ forward via warp-level CUDA kernel.
+    """BQQ forward via CUDA kernel.
 
     Parameters
     ----------
@@ -49,6 +50,7 @@ def cuda_bqq_forward(
     a, b, c  : [bit, row, col, 1, 1]
     d        : [row, col, 1, 1]
     bias     : [out_features] or None
+    mode     : 0=auto(popcount), 1=warp-shuffle, 2=popcount
     """
     ext = _get_ext()
 
@@ -76,7 +78,7 @@ def cuda_bqq_forward(
         Y_flat, Z_flat, X_view,
         a_flat, b_flat, c_flat, d_flat,
         batch, row_width, col_width, bit_width,
-        y_row, z_col, k8,
+        y_row, z_col, k8, mode,
     )
 
     out = out.reshape(batch, row_width * y_row)
