@@ -21,3 +21,6 @@ neural_network_compression/cv/quantized_bqq_model/
 neural_network_compression/cv/blockwise_output/
 neural_network_compression/cv/results/
 neural_network_compression/cv/cache/
+
+# Matrix compression results
+matrix_compression/results/

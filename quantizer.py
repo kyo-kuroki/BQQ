@@ -20,8 +20,9 @@ import io
 
 class BinaryQuadraticQuantization():
 
-    def __init__(self, x, rank=None, rank_scale=1):
+    def __init__(self, x, rank=None, rank_scale=1, num_stack=1):
         self.rank_scale=rank_scale
+        self.num_stack = num_stack
         if isinstance(x, torch.Tensor):
         # GPU上に存在する場合はCPUに移動
             if x.is_cuda:
@@ -448,6 +449,397 @@ class BinaryQuadraticQuantization():
         a = compute_a(y, z)
 
         return y, z, maximum.squeeze(-1) * a  # y: (B,n,rank), z: (B,rank,m), a: (B,4)
+
+
+    def run_multibqq_compile(self, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000,
+                              device_id=0, seed=1, output_type='torch',
+                              compile_mode="reduce-overhead"):
+        """
+        Joint multi-stack BQQ optimization (torch.compile-accelerated).
+
+        Model:
+            W ≈ Σ_n ( a[n,0] · y[n] @ z[n]
+                    + a[n,1] · y[n].sum(axis=-1, keepdim=True)
+                    + a[n,2] · z[n].sum(axis=-2, keepdim=True)
+                    + a[n,3] )
+        with y[n] ∈ {0,1}^(Nrow × rank), z[n] ∈ {0,1}^(rank × Ncol),
+             a[n] ∈ R^4, n = 0, ..., num_stack - 1.
+
+        The y, z energy gradient uses the binary identity y^k = y, z^k = z
+        (same substitution as run_bqq_compile). The scaling coefficients A are
+        jointly optimized by Newton step over a 4N × 4N linear system, where
+        diagonal 4×4 blocks use the y^k=y substituted formulas and off-diagonal
+        blocks use raw inner products between independent stacks.
+
+        Returns:
+            y: (num_stack, Nrow, rank) binary
+            z: (num_stack, rank, Ncol) binary
+            a: (num_stack, 4)  -- already multiplied by `maximum = max(x)-min(x)`
+        """
+        torch.set_float32_matmul_precision('medium')
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+        N = self.num_stack
+        n, m = self.Nrow, self.Ncol
+        rank = self.rank
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+
+        torch.manual_seed(seed)
+        yb = torch.rand((N, n, rank), device=device)
+        zb = torch.rand((N, rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+
+        x = torch.from_numpy(self.x).float().to(device)
+        maximum = (x.max() - x.min())
+        x = x / maximum
+
+        W_row_sum = x.sum(dim=1)           # (n,)
+        W_col_sum = x.sum(dim=0)           # (m,)
+        W_total = x.sum()                  # scalar (0-dim tensor)
+        num_element = float(n * m)
+
+        # Precomputed identity & masks (compile-time constants for fixed N)
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device)
+        damping_eye = 1e-6 * torch.eye(4 * N, device=device, dtype=x.dtype)
+
+        def compute_A(y, z):
+            """Solve 4N × 4N linear system for A: (N, 4) (compile-friendly)."""
+            yz = torch.bmm(y, z)                                # (N, n, m)
+            sigma_y = y.sum(dim=2)                              # (N, n)
+            sigma_z = z.sum(dim=1)                              # (N, m)
+
+            y2 = y * y
+            z2 = z * z
+            y2z = torch.bmm(y2, z)
+            yz2_mat = torch.bmm(y, z2)
+            y2z2 = torch.bmm(y2, z2)
+
+            # Diagonal entries (within-stack, y^k=y substituted)
+            diag_00 = (yz*yz + yz - y2z2).sum(dim=(1, 2))
+            diag_01 = ((sigma_y.unsqueeze(2) + 1) * yz - y2z).sum(dim=(1, 2))
+            diag_02 = ((1 + sigma_z.unsqueeze(1)) * yz - yz2_mat).sum(dim=(1, 2))
+            diag_11 = (sigma_y*sigma_y + sigma_y - y2.sum(dim=2)).sum(dim=1) * m
+            diag_22 = (sigma_z*sigma_z + sigma_z - z2.sum(dim=1)).sum(dim=1) * n
+
+            # Cross-stack inner products (no substitution)
+            sigma_y_total = sigma_y.sum(dim=1)                  # (N,)
+            sigma_z_total = sigma_z.sum(dim=1)                  # (N,)
+
+            F00_cross = torch.einsum('nij,oij->no', yz, yz)
+            F01_cross = torch.einsum('ni,oi->no', yz.sum(dim=2), sigma_y)
+            F02_cross = torch.einsum('nj,oj->no', yz.sum(dim=1), sigma_z)
+            F03_full = yz.sum(dim=(1, 2)).unsqueeze(1).expand(N, N)
+            F11_cross = torch.einsum('ni,oi->no', sigma_y, sigma_y) * m
+            F12_full = torch.outer(sigma_y_total, sigma_z_total)
+            F13_full = (sigma_y_total * m).unsqueeze(1).expand(N, N)
+            F22_cross = torch.einsum('nj,oj->no', sigma_z, sigma_z) * n
+            F23_full = (sigma_z_total * n).unsqueeze(1).expand(N, N)
+            F33_full = torch.full((N, N), num_element, device=device, dtype=y.dtype)
+
+            # Splice diagonals (use torch.where for compile-friendliness)
+            F00 = torch.where(diag_mask, diag_00.unsqueeze(0).expand(N, N), F00_cross)
+            F01 = torch.where(diag_mask, diag_01.unsqueeze(0).expand(N, N), F01_cross)
+            F02 = torch.where(diag_mask, diag_02.unsqueeze(0).expand(N, N), F02_cross)
+            F11 = torch.where(diag_mask, diag_11.unsqueeze(0).expand(N, N), F11_cross)
+            F22 = torch.where(diag_mask, diag_22.unsqueeze(0).expand(N, N), F22_cross)
+            # F03, F12, F13, F23, F33: diagonal already matches substituted form
+
+            # Assemble 4N × 4N Hessian:  H[(n,i),(n',j)] = 2 · <F_i[n], F_j[n']>
+            row0 = torch.stack([F00, F01, F02, F03_full], dim=-1)             # (N, N, 4)
+            row1 = torch.stack([F01.t(), F11, F12_full, F13_full], dim=-1)
+            row2 = torch.stack([F02.t(), F12_full.t(), F22, F23_full], dim=-1)
+            row3 = torch.stack([F03_full.t(), F13_full.t(), F23_full.t(), F33_full], dim=-1)
+            H4 = torch.stack([row0, row1, row2, row3], dim=-2)                # (N, N, 4, 4)
+
+            H_full = 2 * H4.permute(0, 2, 1, 3).reshape(4 * N, 4 * N)
+
+            # Vector: v[n, i] = -2 · <W, F_i[n]>
+            v0 = -2 * (x * yz).sum(dim=(1, 2))
+            v1 = -2 * (W_row_sum.unsqueeze(0) * sigma_y).sum(dim=1)
+            v2 = -2 * (W_col_sum.unsqueeze(0) * sigma_z).sum(dim=1)
+            v3 = (-2 * W_total).expand(N)
+            v_full = torch.stack([v0, v1, v2, v3], dim=1).reshape(4 * N)
+
+            # Tikhonov damping handles the null-space (a3 redundancy across stacks)
+            scale = H_full.diagonal().abs().max()
+            H_reg = H_full + scale * damping_eye
+            A_flat = -torch.linalg.solve(H_reg, v_full)
+            return A_flat.view(N, 4)
+
+        a = compute_A(y, z)
+
+        def _loop_fn(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+                a0 = a[:, 0].view(N, 1, 1)
+                a1 = a[:, 1].view(N, 1, 1)
+                a2 = a[:, 2].view(N, 1, 1)
+                a3 = a[:, 3].view(N, 1, 1)
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+
+                yz = torch.bmm(yf, zf)
+                sigma_yf = yf.sum(dim=2, keepdim=True)   # (N, n, 1)
+                sigma_zf = zf.sum(dim=1, keepdim=True)   # (N, 1, m)
+
+                M_per = a0 * yz + a1 * sigma_yf + a2 * sigma_zf + a3   # (N, n, m)
+                total_M = M_per.sum(dim=0)                              # (n, m)
+                part = (x - total_M).unsqueeze(0).expand(N, n, m)       # (N, n, m)
+
+                # Y energy gradient (per stack)
+                kernel_y = (a0 * zf + a1).transpose(1, 2)               # (N, m, rank)
+                linear_y = -2 * torch.bmm(part, kernel_y)               # (N, n, rank)
+                zf_sum1 = zf.sum(dim=2).unsqueeze(1)                    # (N, 1, rank)
+                zf2_sum1 = (zf*zf).sum(dim=2).unsqueeze(1)
+                y_energy_grad = (
+                    linear_y
+                    + (a0*a0 + 2*a0*a1*(1 - 2*yf) + 2*a0*a2) * zf_sum1
+                    - 2 * (a0*a2 + a0*a0 * yf) * zf2_sum1
+                    + (a1*a1) * (1 - 2 * yf) * m
+                )
+
+                # Z energy gradient
+                kernel_z = (a0 * yf + a2).transpose(1, 2)               # (N, rank, n)
+                linear_z = -2 * torch.bmm(kernel_z, part)               # (N, rank, m)
+                yf_sum0 = yf.sum(dim=1).unsqueeze(2)                    # (N, rank, 1)
+                yf2_sum0 = (yf*yf).sum(dim=1).unsqueeze(2)
+                z_energy_grad = (
+                    linear_z
+                    + (a0*a0 + 2*a0*a1 + 2*a0*a2*(1 - 2*zf)) * yf_sum0
+                    - 2 * (a0*a0 * zf + a0*a1) * yf2_sum0
+                    + (a2*a2) * (1 - 2 * zf) * n
+                )
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(
+                    torch.where((y < 0.0) | (y > 1.0),
+                                2*y - yb - eta * y_entropy_grad,
+                                2*y - yb - eta * (y_energy_grad + y_entropy_grad)),
+                    0, 1)
+                za = torch.clamp(
+                    torch.where((z < 0.0) | (z > 1.0),
+                                2*z - zb - eta * z_entropy_grad,
+                                2*z - zb - eta * (z_energy_grad + z_entropy_grad)),
+                    0, 1)
+
+                a_new = compute_A(ya, za)
+            return ya, za, y, z, a_new
+
+        loop_body = torch.compile(_loop_fn, mode=compile_mode)
+
+        temp = torch.tensor(Tinit, device=device)
+        delta_temp_t = torch.tensor(delta_temp, device=device)
+
+        for _ in range(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp = temp - delta_temp_t
+
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_A(y, z)
+
+        if output_type == 'torch':
+            return y, z, maximum * a
+        else:
+            return (y.detach().cpu().numpy(),
+                    z.detach().cpu().numpy(),
+                    (maximum * a).detach().cpu().numpy())
+
+
+    def run_multibqq_compile_batched(self, x, num_stack=1, rank_scale=1,
+                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       Nstep=50000, device_id=0, seed=1,
+                                       compile_mode="reduce-overhead"):
+        """
+        Batched joint multi-stack BQQ.
+
+        Input:
+            x: (B, n, m) -- batch of matrices to factorize
+
+        Returns:
+            y: (B, num_stack, n, rank)  binary
+            z: (B, num_stack, rank, m)  binary
+            a: (B, num_stack, 4)        with per-matrix `maximum` pre-applied
+        """
+        torch.set_float32_matmul_precision('medium')
+        torch.manual_seed(seed)
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+        if x.ndim != 3:
+            raise ValueError('Input must be 3-D (B, n, m)')
+        B, n, m = x.shape
+        N = num_stack
+        rank = round(rank_scale * (n * m) / (n + m))
+
+        x = x.to(device).float()
+        maximum = (x.amax(dim=(1, 2)) - x.amin(dim=(1, 2))).view(B, 1, 1)  # (B,1,1)
+        x = x / maximum
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+
+        yb = torch.rand((B, N, n, rank), device=device)
+        zb = torch.rand((B, N, rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+
+        W_row_sum = x.sum(dim=2)           # (B, n)
+        W_col_sum = x.sum(dim=1)           # (B, m)
+        W_total = x.sum(dim=(1, 2))        # (B,)
+        num_element = float(n * m)
+
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)   # (1, N, N)
+        damping_eye = (1e-6 * torch.eye(4 * N, device=device, dtype=x.dtype)).unsqueeze(0)  # (1, 4N, 4N)
+
+        def compute_A(y, z):
+            """Solve B parallel 4N×4N linear systems; returns A: (B, N, 4)."""
+            yz = torch.einsum('bnik,bnkj->bnij', y, z)        # (B, N, n, m)
+            sigma_y = y.sum(dim=3)                            # (B, N, n)
+            sigma_z = z.sum(dim=2)                            # (B, N, m)
+
+            y2 = y * y
+            z2 = z * z
+            y2z = torch.einsum('bnik,bnkj->bnij', y2, z)
+            yz2_mat = torch.einsum('bnik,bnkj->bnij', y, z2)
+            y2z2 = torch.einsum('bnik,bnkj->bnij', y2, z2)
+
+            diag_00 = (yz*yz + yz - y2z2).sum(dim=(2, 3))                                 # (B, N)
+            diag_01 = ((sigma_y.unsqueeze(3) + 1) * yz - y2z).sum(dim=(2, 3))
+            diag_02 = ((1 + sigma_z.unsqueeze(2)) * yz - yz2_mat).sum(dim=(2, 3))
+            diag_11 = (sigma_y*sigma_y + sigma_y - y2.sum(dim=3)).sum(dim=2) * m
+            diag_22 = (sigma_z*sigma_z + sigma_z - z2.sum(dim=2)).sum(dim=2) * n
+
+            sigma_y_total = sigma_y.sum(dim=2)        # (B, N)
+            sigma_z_total = sigma_z.sum(dim=2)        # (B, N)
+
+            F00_c = torch.einsum('bnij,boij->bno', yz, yz)
+            F01_c = torch.einsum('bni,boi->bno', yz.sum(dim=3), sigma_y)
+            F02_c = torch.einsum('bnj,boj->bno', yz.sum(dim=2), sigma_z)
+            F03_f = yz.sum(dim=(2, 3)).unsqueeze(2).expand(B, N, N)
+            F11_c = torch.einsum('bni,boi->bno', sigma_y, sigma_y) * m
+            F12_f = torch.einsum('bn,bo->bno', sigma_y_total, sigma_z_total)
+            F13_f = (sigma_y_total * m).unsqueeze(2).expand(B, N, N)
+            F22_c = torch.einsum('bnj,boj->bno', sigma_z, sigma_z) * n
+            F23_f = (sigma_z_total * n).unsqueeze(2).expand(B, N, N)
+            F33_f = torch.full((B, N, N), num_element, device=device, dtype=y.dtype)
+
+            F00 = torch.where(diag_mask, diag_00.unsqueeze(2).expand(B, N, N), F00_c)
+            F01 = torch.where(diag_mask, diag_01.unsqueeze(2).expand(B, N, N), F01_c)
+            F02 = torch.where(diag_mask, diag_02.unsqueeze(2).expand(B, N, N), F02_c)
+            F11 = torch.where(diag_mask, diag_11.unsqueeze(2).expand(B, N, N), F11_c)
+            F22 = torch.where(diag_mask, diag_22.unsqueeze(2).expand(B, N, N), F22_c)
+
+            row0 = torch.stack([F00, F01, F02, F03_f], dim=-1)
+            row1 = torch.stack([F01.transpose(-1, -2), F11, F12_f, F13_f], dim=-1)
+            row2 = torch.stack([F02.transpose(-1, -2), F12_f.transpose(-1, -2), F22, F23_f], dim=-1)
+            row3 = torch.stack([F03_f.transpose(-1, -2), F13_f.transpose(-1, -2), F23_f.transpose(-1, -2), F33_f], dim=-1)
+            H4 = torch.stack([row0, row1, row2, row3], dim=-2)         # (B, N, N, 4, 4)
+            H_full = 2 * H4.permute(0, 1, 3, 2, 4).reshape(B, 4 * N, 4 * N)
+
+            v0 = -2 * (x.unsqueeze(1) * yz).sum(dim=(2, 3))            # (B, N)
+            v1 = -2 * (W_row_sum.unsqueeze(1) * sigma_y).sum(dim=2)
+            v2 = -2 * (W_col_sum.unsqueeze(1) * sigma_z).sum(dim=2)
+            v3 = (-2 * W_total).unsqueeze(1).expand(B, N)
+            v_full = torch.stack([v0, v1, v2, v3], dim=2).reshape(B, 4 * N)
+
+            scale = H_full.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1).view(B, 1, 1)
+            H_reg = H_full + scale * damping_eye
+            A_flat = -torch.linalg.solve(H_reg, v_full.unsqueeze(-1)).squeeze(-1)
+            return A_flat.view(B, N, 4)
+
+        a = compute_A(y, z)
+
+        def _loop_fn(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+                a0 = a[:, :, 0].view(B, N, 1, 1)
+                a1 = a[:, :, 1].view(B, N, 1, 1)
+                a2 = a[:, :, 2].view(B, N, 1, 1)
+                a3 = a[:, :, 3].view(B, N, 1, 1)
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+
+                yz = torch.einsum('bnik,bnkj->bnij', yf, zf)
+                sigma_yf = yf.sum(dim=3, keepdim=True)   # (B, N, n, 1)
+                sigma_zf = zf.sum(dim=2, keepdim=True)   # (B, N, 1, m)
+
+                M_per = a0 * yz + a1 * sigma_yf + a2 * sigma_zf + a3   # (B, N, n, m)
+                total_M = M_per.sum(dim=1)                              # (B, n, m)
+                part = (x - total_M).unsqueeze(1).expand(B, N, n, m)    # (B, N, n, m)
+
+                # Y energy gradient
+                kernel_y = (a0 * zf + a1).transpose(-1, -2)             # (B, N, m, rank)
+                linear_y = -2 * torch.einsum('bnij,bnjk->bnik', part, kernel_y)
+
+                zf_sum1 = zf.sum(dim=3).unsqueeze(2)                    # (B, N, 1, rank)
+                zf2_sum1 = (zf*zf).sum(dim=3).unsqueeze(2)
+
+                y_energy_grad = (
+                    linear_y
+                    + (a0*a0 + 2*a0*a1*(1 - 2*yf) + 2*a0*a2) * zf_sum1
+                    - 2 * (a0*a2 + a0*a0 * yf) * zf2_sum1
+                    + (a1*a1) * (1 - 2 * yf) * m
+                )
+
+                # Z energy gradient
+                kernel_z = (a0 * yf + a2).transpose(-1, -2)             # (B, N, rank, n)
+                linear_z = -2 * torch.einsum('bnij,bnjk->bnik', kernel_z, part)
+
+                yf_sum0 = yf.sum(dim=2).unsqueeze(3)                    # (B, N, rank, 1)
+                yf2_sum0 = (yf*yf).sum(dim=2).unsqueeze(3)
+
+                z_energy_grad = (
+                    linear_z
+                    + (a0*a0 + 2*a0*a1 + 2*a0*a2*(1 - 2*zf)) * yf_sum0
+                    - 2 * (a0*a0 * zf + a0*a1) * yf2_sum0
+                    + (a2*a2) * (1 - 2 * zf) * n
+                )
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(
+                    torch.where((y < 0.0) | (y > 1.0),
+                                2*y - yb - eta * y_entropy_grad,
+                                2*y - yb - eta * (y_energy_grad + y_entropy_grad)),
+                    0, 1)
+                za = torch.clamp(
+                    torch.where((z < 0.0) | (z > 1.0),
+                                2*z - zb - eta * z_entropy_grad,
+                                2*z - zb - eta * (z_energy_grad + z_entropy_grad)),
+                    0, 1)
+
+                a_new = compute_A(ya, za)
+            return ya, za, y, z, a_new
+
+        loop_body = torch.compile(_loop_fn, mode=compile_mode)
+
+        temp = torch.tensor(Tinit, device=device)
+        delta_temp_t = torch.tensor(delta_temp, device=device)
+
+        for _ in range(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp = temp - delta_temp_t
+
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_A(y, z)
+
+        # maximum: (B, 1, 1); a: (B, N, 4). Broadcast to apply per-matrix scaling.
+        return y, z, maximum * a
 
 
     def patchify(self, tensor, max_patch_size):
