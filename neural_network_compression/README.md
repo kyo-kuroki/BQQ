@@ -24,125 +24,230 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 
 ## LM workflow
 
-### Step 1 — prepare cache
+### Recommended pipeline
 
-Load the model once and save quantization-target weights to disk.
+The default LM pipeline is now:
 
-```bash
-cd neural_network_compression/lm
+1. `blockwise_quant.py`
+2. `fine_tuning.py`
 
-python weight_aware_quant_cached.py prepare-cache \
-    --model_name Qwen/Qwen3.5-2B \
-    --layer_threshold 4 \
-    --cache_dir cache/Qwen3.5-2B-layer4
-```
+In standard mode, `blockwise_quant.py` uses layerwise BQQ results as initialization, then optimizes each transformer block by block-output MSE. If the required layerwise results for the target block do not exist yet, it automatically runs the corresponding block-level layerwise quantization internally and then continues to block tuning.
 
-`--layer_threshold N` skips layers whose index is below N (e.g. embedding layers).
-
-### Step 2 — quantize (N-bit)
-
-Each `quantize-target` call quantizes one weight tensor by splitting it into patches and running BQQ in parallel.
-
-```bash
-python weight_aware_quant_cached.py quantize-target \
-    --cache_dir  cache/Qwen3.5-2B-layer4 \
-    --save_dir   bqq_compressed_data/Qwen3.5-2B-32gs-10000step \
-    --target_name model.layers.4.mlp.down_proj.weight \
-    --bit_width  2 \
-    --group_size 32 \
-    --num_steps  10000 \
-    --workers_per_gpu 384
-```
-
-Output files per target:
-
-- `{save_dir}/{target_name}.pth` — reconstructed tensor (float)
-- `{save_dir}/{target_name}_row{i}_col{j}.pth` — per-patch BQQ decomposition (list of bit-layer dicts)
-
-### Step 3 — extend to higher bit-depth (optional)
-
-Given a completed N-bit result, optimise the residual to produce an (N+k)-bit result without re-running the earlier bits.
-
-```bash
-python weight_aware_quant_cached.py extend-target \
-    --cache_dir  cache/Qwen3.5-2B-layer4 \
-    --source_dir bqq_compressed_data/Qwen3.5-2B-32gs-10000step \
-    --save_dir   bqq_compressed_data/Qwen3.5-2B-32gs-10000step-3bit \
-    --target_name model.layers.4.mlp.down_proj.weight \
-    --extra_bits 1 \
-    --group_size 32 \
-    --num_steps  10000 \
-    --workers_per_gpu 384
-```
-
-The saved patch files in `--save_dir` contain all N + k bit-layer entries, so the format is identical to a native (N+k)-bit run.
-Existing output files are skipped automatically, so interrupted jobs can be safely resubmitted.
-
-### Step 2b — block-wise quantization (alternative)
-
-Block-wise quantization optimizes all continuous parameters in a transformer block (BQQ scale factors + unquantized Linear weights + LayerNorm) to minimize the block output error against the pretrained model. Each block is independent and can be processed in parallel.
+So in normal use, you usually only need to run:
 
 ```bash
 cd neural_network_compression/lm
 
-# Quantize a single block
 python blockwise_quant.py \
     --model_name Qwen/Qwen3-2B \
     --block_idx 0 \
     --bit_width 2 \
-    --group_size 32 \
-    --num_steps 20000 \
+    --group_size 64 \
+    --num_steps 10000 \
     --dataset c4 \
     --nsamples 128 \
     --seqlen 2048 \
-    --epochs 10 \
+    --epochs 5 \
     --lr 1e-5 \
     --device cuda:0 \
     --save_dir blockwise_output/Qwen3-2B
 ```
 
-Output: `blockwise_output/Qwen3-2B/block_0.pth` (full module with optimized parameters).
+This does the following:
 
-For each Linear weight in the block, the pipeline:
-1. BQQ quantizes the weight → replaces Linear with BinaryQuadratic (Y, Z fixed as buffers)
-2. Optimizes **all** continuous params in the block (BQQ a,b,c,d + remaining unquantized weights + norms) via AdamW to minimize `||block(input) - pretrained_output||²`
-3. Moves to the next weight
+1. Cache block input/output activations for the target block
+2. Check whether layerwise quantization outputs for that block already exist
+3. If missing, run internal `layerwise_quantize_block(...)`
+4. Load the block as STE-trainable BQQ layers
+5. Optimize the block by minimizing block output MSE
+6. Save `block_{idx}.pth`
+7. Assemble the current full quantized model automatically
 
-As quantization progresses, the number of free parameters decreases (large Linear weights are replaced by small a,b,c,d scale factors).
+Default outputs:
 
-**Parallel execution** across blocks:
+- Layerwise patch data: `lm/src/bqq_compressed_data/<model>-<gs>gs-<steps>step/`
+- Blockwise block file: `blockwise_output/Qwen3-2B/block_0.pth`
+- Assembled full model: `lm/src/quantized_models/Qwen3-2B/Qwen3-2B-2bit-64gs-blockwise.pth`
+
+Use `--no_assemble_full_model` if you want to skip the final reconstruction, or `--assembled_output_dir` to change the full-model output directory.
+
+The default mode is the layerwise-initialize + blockwise-tune mode.
+Use `--progressive` only if you explicitly want progressive patch-wise quantization.
+
+### Fine-tuning after blockwise quantization
+
+`blockwise_quant.py` now assembles the full model automatically by default, so the usual next step is just fine-tuning:
 
 ```bash
-for i in $(seq 0 23); do
-    python blockwise_quant.py --model_name Qwen/Qwen3-2B \
-        --block_idx $i --save_dir blockwise_output/Qwen3-2B \
-        --device cuda:$((i % 4)) &
-done
-wait
-```
-
-**Assemble full model from blocks:**
-
-```bash
-python build_bqq_model.py \
+python fine_tuning.py \
     --model_name Qwen/Qwen3-2B \
-    --block_dir blockwise_output/Qwen3-2B
+    --model_path src/quantized_models/Qwen3-2B/Qwen3-2B-2bit-64gs-blockwise.pth \
+    --num_train_epochs 3 \
+    --learning_rate 2e-5
 ```
 
-Blocks that are missing will be kept as pretrained (partial quantization is supported).
+If you omit `--model_path`, `fine_tuning.py` also looks in `src/quantized_models/<model>/` by default.
 
-### Other commands
+By default, `fine_tuning.py` converts BQQ layers to STE-trainable modules and optimizes:
+
+- binary factors `Y/Z`
+- thresholds `theta`
+- coefficients `a,b,c,d`
+- bias
+
+If you want coefficient-only tuning:
 
 ```bash
-# List all quantization targets in a cache
-python weight_aware_quant_cached.py list-targets --cache_dir cache/Qwen3.5-2B-layer4
-
-# List patches for a target (useful for fine-grained parallelism)
-python weight_aware_quant_cached.py list-patches \
-    --cache_dir cache/Qwen3.5-2B-layer4 --group_size 32
+python fine_tuning.py \
+    --model_name Qwen/Qwen3-2B \
+    --model_path /path/to/model.pth \
+    --refine_coeffs_only \
+    --fix_theta
 ```
 
----
+### Blockwise quantization modes
+
+#### Standard mode
+
+Standard mode is recommended.
+
+```bash
+python blockwise_quant.py \
+    --model_name Qwen/Qwen3-2B \
+    --block_idx 0 \
+    --save_dir blockwise_output/Qwen3-2B
+```
+
+Options:
+
+- `--layerwise_dir`: use an existing layerwise output directory explicitly
+- `--refine_coeffs_only`: freeze binary factors during blockwise optimization
+- `--fix_theta`: keep STE thresholds fixed at `0.5`
+
+#### Progressive mode
+
+Use this only when you explicitly want patch-wise progressive quantization instead of the standard layerwise-initialize flow.
+
+```bash
+python blockwise_quant.py \
+    --model_name Qwen/Qwen3-2B \
+    --block_idx 0 \
+    --progressive \
+    --bit_width 2 \
+    --group_size 64 \
+    --num_rounds 4 \
+    --schedule geometric \
+    --save_dir blockwise_output/Qwen3-2B-progressive
+```
+
+### Layerwise quantization
+
+You can still run layerwise quantization directly when you want standalone layerwise outputs.
+
+```bash
+python layerwise_quant.py \
+    --model_name Qwen/Qwen3-2B \
+    --block_idx 0 \
+    --bit_width 2 \
+    --group_size 64 \
+    --num_steps 10000 \
+    --dataset c4 \
+    --nsamples 128 \
+    --seqlen 2048 \
+    --save_dir bqq_compressed_data/Qwen3-2B-64gs-10000step
+```
+
+This mode already includes:
+
+- intra-layer Hessian-aware quantization
+- optional multibqq joint bit optimization
+- STE refinement on `Y/Z/theta/coeff`
+- automatic full-model reconstruction by default
+
+Default outputs:
+
+- Patch data: `lm/src/bqq_compressed_data/<model>-<gs>gs-<steps>step/`
+- Assembled full model: `lm/src/quantized_models/<model>/<model>-<bit>bit-<gs>gs.pth`
+
+In normal use you do not need to run this manually before `blockwise_quant.py`, because blockwise mode will generate missing block results automatically.
+
+### Legacy cache-first weight quantization
+
+`weight_aware_quant_cached.py` still exists, but it is no longer the main recommended LM pipeline.
+It is useful mainly for:
+
+- target-wise or patch-wise weight quantization jobs
+- legacy experiments
+- auxiliary comparisons with older workflows
+
+Example:
+
+```bash
+python weight_aware_quant_cached.py prepare-cache     --model_name Qwen/Qwen3.5-2B     --layer_threshold 4     --cache_dir cache/Qwen3.5-2B-layer4
+```
+
+Then:
+
+```bash
+python weight_aware_quant_cached.py quantize-target     --cache_dir  cache/Qwen3.5-2B-layer4     --save_dir   bqq_compressed_data/Qwen3.5-2B-32gs-10000step     --target_name model.layers.4.mlp.down_proj.weight     --bit_width  2     --group_size 32     --num_steps  10000
+```
+
+#### About bit-depth extension
+
+The older `extend-target` flow is now best viewed as an auxiliary / reference workflow rather than a standard pipeline.
+
+Because the current implementation directly optimizes for the requested `bit_width` in:
+
+- `layerwise_quant.py`
+- `blockwise_quant.py`
+- `fine_tuning.py`
+
+there is usually no need to first build an N-bit result and then extend it to N+k bits.
+
+`extend-target` is still useful when you specifically want to:
+
+- reuse an existing lower-bit result
+- run legacy residual-extension experiments
+- compare direct N-bit optimization against incremental extension
+
+### Fine-tuning / KL distillation
+
+`fine_tuning.py` supports three modes:
+
+| Mode | Command | Loss |
+|------|---------|------|
+| `SFT only` | default | Cross-entropy |
+| `SFT + KL` | `--teacher_model_name ...` | `ce_alpha * CE + kl_alpha * KL` |
+| `KL only` | `--teacher_model_name ... --ce_alpha 0` | `kl_alpha * KL` |
+
+```bash
+python fine_tuning.py \
+    --model_name Qwen/Qwen3-2B \
+    --model_path /path/to/model.pth \
+    --teacher_model_name Qwen/Qwen3-2B \
+    --kl_alpha 1.0 \
+    --kl_temperature 2.0
+```
+
+### Output examples
+
+Typical directories:
+
+```text
+neural_network_compression/lm/
+├── src/
+│   ├── bqq_compressed_data/<model>-<gs>gs-<steps>step>/
+│   │   └── _consolidated/<full_layer_name>.pth
+│   └── quantized_models/<model>/
+│       ├── <model>-<bit>bit-<gs>gs.pth
+│       └── <model>-<bit>bit-<gs>gs-blockwise.pth
+├── blockwise_output/<model>/
+│   ├── block_0.pth
+│   ├── block_1.pth
+│   └── ...
+└── fine_tuned_models/<model>/
+    └── <model>-...-finetuned.pth
+```
 
 ## TSUBAME4 SGE workflow
 
@@ -248,14 +353,14 @@ cd neural_network_compression/lm
 # Standard SFT
 python fine_tuning.py \
     --model_name Qwen/Qwen3-2B \
-    --model_path quantized_model.pth \
+    --model_path src/quantized_models/Qwen3-2B/Qwen3-2B-2bit-64gs-blockwise.pth \
     --num_train_epochs 3 \
     --learning_rate 2e-5
 
 # SFT + KL distillation (pretrained as teacher)
 python fine_tuning.py \
     --model_name Qwen/Qwen3-2B \
-    --model_path quantized_model.pth \
+    --model_path src/quantized_models/Qwen3-2B/Qwen3-2B-2bit-64gs-blockwise.pth \
     --teacher_model_name Qwen/Qwen3-2B \
     --kl_alpha 1.0 \
     --kl_temperature 2.0
@@ -263,7 +368,7 @@ python fine_tuning.py \
 # KL distillation only (no CE)
 python fine_tuning.py \
     --model_name Qwen/Qwen3-2B \
-    --model_path quantized_model.pth \
+    --model_path src/quantized_models/Qwen3-2B/Qwen3-2B-2bit-64gs-blockwise.pth \
     --teacher_model_name Qwen/Qwen3-2B \
     --ce_alpha 0 \
     --kl_alpha 1.0
@@ -278,7 +383,7 @@ python fine_tuning.py \
 | `--max_seq_length` | 512 | Maximum sequence length |
 | `--gradient_accumulation_steps` | 4 | Gradient accumulation steps |
 
-Output: `{output_dir}/trained_model.pth`
+Default fine-tuning output: `lm/fine_tuned_models/<model>/` unless `--output_dir` is specified.
 
 ---
 
