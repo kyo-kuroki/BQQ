@@ -27,8 +27,8 @@ from tqdm import tqdm
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from bqq_modules import (  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
+from neural_network_compression.bqqkernel.bqq_modules import (  # noqa: F401
     BinaryQuadratic,
     BQQLinear,
     get_matrices,

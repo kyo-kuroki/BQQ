@@ -21,10 +21,10 @@ except ImportError:
     from datautils import get_wikitext2_testloader, get_c4_testloader
 
 # Ensure bqq_modules is importable (needed for torch.load of BQQ models)
-_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src')
+_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'bqqkernel')
 if _src_dir not in sys.path:
     sys.path.insert(0, _src_dir)
-import bqq_modules  # noqa: F401
+import neural_network_compression.bqqkernel.bqq_modules as bqq_modules  # noqa: F401
 from build_bqq_model import dequantize_bqq_model, load_bqq_as_fp
 
 

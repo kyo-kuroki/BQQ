@@ -11,9 +11,9 @@ from torch.multiprocessing import Process, Queue, set_start_method
 from transformers import AutoModelForCausalLM
 
 try:
-    from .compressed_data import default_compressed_data_dir, ensure_bqq_root_on_path
+    from .src.compressed_data import default_compressed_data_dir, ensure_bqq_root_on_path
 except ImportError:
-    from compressed_data import default_compressed_data_dir, ensure_bqq_root_on_path
+    from neural_network_compression.lm.src.compressed_data import default_compressed_data_dir, ensure_bqq_root_on_path
 
 
 ensure_bqq_root_on_path()

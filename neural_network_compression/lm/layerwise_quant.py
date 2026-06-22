@@ -39,13 +39,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from quantizer import BinaryQuadraticQuantization
 
 try:
-    from .model_loader import load_causal_lm
-    from .datautils import get_loaders
-    from .compressed_data import default_compressed_data_dir
+    from .src.model_loader import load_causal_lm
+    from .src.datautils import get_loaders
+    from .src.compressed_data import default_compressed_data_dir
+    from .src.build_bqq_model import save_bqq_model
 except ImportError:
-    from model_loader import load_causal_lm
-    from datautils import get_loaders
-    from compressed_data import default_compressed_data_dir
+    from neural_network_compression.lm.src.model_loader import load_causal_lm
+    from neural_network_compression.lm.src.datautils import get_loaders
+    from neural_network_compression.lm.src.compressed_data import default_compressed_data_dir
+    from neural_network_compression.lm.src.build_bqq_model import save_bqq_model
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +570,12 @@ def main():
     # Device / output
     parser.add_argument('--main_gpu_id', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default=None)
+    parser.add_argument('--assemble_full_model', dest='assemble_full_model', action='store_true', default=True,
+                        help='Assemble a full quantized model after layerwise quantization (default: enabled)')
+    parser.add_argument('--no_assemble_full_model', dest='assemble_full_model', action='store_false',
+                        help='Skip full-model assembly after layerwise quantization')
+    parser.add_argument('--assembled_output_dir', type=str, default=None,
+                        help='Output directory for the assembled full model')
 
     # Mode: per-target parallel (original)
     parser.add_argument('--target_idx', type=int, default=None,
@@ -638,6 +646,16 @@ def main():
             use_multibqq=args.use_multibqq,
             calibration_loader=train_loader,
         )
+        if args.assemble_full_model:
+            save_bqq_model(
+                model_name=args.model_name,
+                compressed_data_dir=save_dir,
+                bit_width=args.bit_width,
+                group_size=args.group_size,
+                num_steps=args.num_steps,
+                device='cpu',
+                output_dir=args.assembled_output_dir,
+            )
         return
 
     # Default: per-target mode (all targets or single --target_idx)
@@ -664,6 +682,17 @@ def main():
         layer_threshold=args.layer_threshold,
         target_idx=args.target_idx,
     )
+
+    if args.assemble_full_model:
+        save_bqq_model(
+            model_name=args.model_name,
+            compressed_data_dir=save_dir,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            device='cpu',
+            output_dir=args.assembled_output_dir,
+        )
 
 
 if __name__ == '__main__':

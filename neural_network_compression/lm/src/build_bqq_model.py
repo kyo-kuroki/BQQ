@@ -53,8 +53,8 @@ except ImportError:
         model_basename,
     )
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from bqq_modules import (  # noqa: F401
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
+from neural_network_compression.bqqkernel.bqq_modules import (  # noqa: F401
     BinaryQuadratic,
     PackedBinaryQuadratic,
     PartialBQQLinear,

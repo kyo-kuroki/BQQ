@@ -35,11 +35,18 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-from build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, convert_ste_model_to_binaryquadratic
-from compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
-from datautils import get_loaders
-from model_loader import load_causal_lm
-from layerwise_quant import layerwise_quantize_block
+try:
+    from .src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from .src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
+    from .src.datautils import get_loaders
+    from .src.model_loader import load_causal_lm
+    from .layerwise_quant import layerwise_quantize_block
+except ImportError:
+    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
+    from neural_network_compression.lm.src.datautils import get_loaders
+    from neural_network_compression.lm.src.model_loader import load_causal_lm
+    from neural_network_compression.lm.layerwise_quant import layerwise_quantize_block
 
 
 # ---------------------------------------------------------------------------
@@ -787,6 +794,12 @@ def main():
     # Device / output
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--save_dir', type=str, required=True)
+    parser.add_argument('--assemble_full_model', dest='assemble_full_model', action='store_true', default=True,
+                        help='Assemble a full quantized model after blockwise quantization (default: enabled)')
+    parser.add_argument('--no_assemble_full_model', dest='assemble_full_model', action='store_false',
+                        help='Skip full-model assembly after blockwise quantization')
+    parser.add_argument('--assembled_output_dir', type=str, default=None,
+                        help='Output directory for the assembled full model')
 
     args = parser.parse_args()
 
@@ -837,6 +850,15 @@ def main():
             layerwise_dir=layerwise_dir,
             refine_coeffs_only=args.refine_coeffs_only,
             fix_theta=args.fix_theta,
+        )
+
+    if args.assemble_full_model:
+        assemble_from_blocks(
+            model_name=args.model_name,
+            block_dir=args.save_dir,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            output_dir=args.assembled_output_dir,
         )
 
 

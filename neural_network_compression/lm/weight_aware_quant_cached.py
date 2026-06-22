@@ -14,7 +14,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 try:
-    from .compressed_data import (
+    from .src.compressed_data import (
         consolidate_target_patches,
         default_compressed_data_dir,
         ensure_bqq_root_on_path,
@@ -23,7 +23,7 @@ try:
         model_basename,
     )
 except ImportError:
-    from compressed_data import (
+    from neural_network_compression.lm.src.compressed_data import (
         consolidate_target_patches,
         default_compressed_data_dir,
         ensure_bqq_root_on_path,

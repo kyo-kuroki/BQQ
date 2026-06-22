@@ -30,7 +30,7 @@ def default_compressed_data_dir(model_name: str, group_size: int, num_steps: int
 
 
 def default_quantized_model_dir(model_name: str) -> Path:
-    return LM_DIR / "quantized_model_data" / model_basename(model_name)
+    return LM_DIR / "quantized_models" / model_basename(model_name)
 
 
 def default_results_dir() -> Path:

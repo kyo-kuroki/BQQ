@@ -46,13 +46,13 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
-    from .build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
-    from .compressed_data import default_compressed_data_dir, model_basename
-    from .datautils import get_loaders
+    from .src.build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
+    from .src.compressed_data import default_compressed_data_dir, model_basename
+    from .src.datautils import get_loaders
 except ImportError:
-    from build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
-    from compressed_data import default_compressed_data_dir, model_basename
-    from datautils import get_loaders
+    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, replace_linear_with_bqq
+    from neural_network_compression.lm.src.compressed_data import default_compressed_data_dir, model_basename
+    from neural_network_compression.lm.src.datautils import get_loaders
 
 
 # ---------------------------------------------------------------------------

@@ -24,8 +24,8 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-from bqq_modules import BinaryQuadratic
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
+from neural_network_compression.bqqkernel.bqq_modules import BinaryQuadratic
 
 from build_model import get_model
 from build_dataset import get_imagenet

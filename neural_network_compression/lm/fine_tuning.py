@@ -29,11 +29,11 @@ from transformers.data.data_collator import _torch_collate_batch, pad_without_fa
 from trl import SFTConfig, SFTTrainer
 
 try:
-    from .compressed_data import default_quantized_model_dir, model_basename
-    from .build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
+    from .src.compressed_data import default_quantized_model_dir, model_basename
+    from .src.build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
 except ImportError:
-    from compressed_data import default_quantized_model_dir, model_basename
-    from build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
+    from neural_network_compression.lm.src.compressed_data import default_quantized_model_dir, model_basename
+    from neural_network_compression.lm.src.build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
 
 
 # ---------------------------------------------------------------------------
