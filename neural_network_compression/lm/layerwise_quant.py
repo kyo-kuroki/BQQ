@@ -219,9 +219,18 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             seed=common['seed'],
             main_gpu_id=gpu_id,
             H=H,
-            hessian_mode='intra-layer',
-            scale_refine=common['scale_refine'],
             damping=common['damping'],
+            hessian_mode='intra-layer-ste',
+            scale_refine=common['scale_refine'],
+            use_multibqq=common['use_multibqq'],
+            ste_refine_steps=common['ste_refine_steps'],
+            ste_refine_lr=common['ste_refine_lr'],
+            ste_refine_weight_decay=common['ste_refine_weight_decay'],
+            ste_refine_optimize_factors=not common['refine_coeffs_only'],
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not common['fix_theta'],
+            ste_refine_row_group_batch_size=common['row_group_batch_size'],
+            ste_refine_log_interval=common['ste_refine_log_interval'],
         )
         torch.save(reconstructed.cpu(), tensor_path)
         print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] Saved: {tensor_path}")
@@ -256,6 +265,14 @@ def layerwise_quantize(
     main_gpu_id: int,
     scale_refine: bool,
     damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
     calibration_loader,
     layer_threshold: int = 0,
     target_idx: Optional[int] = None,
@@ -340,9 +357,18 @@ def layerwise_quantize(
             seed=seed,
             main_gpu_id=main_gpu_id,
             H=H,
-            hessian_mode='intra-layer',
-            scale_refine=scale_refine,
             damping=damping,
+            hessian_mode='intra-layer-ste',
+            scale_refine=scale_refine,
+            use_multibqq=use_multibqq,
+            ste_refine_steps=ste_refine_steps,
+            ste_refine_lr=ste_refine_lr,
+            ste_refine_weight_decay=ste_refine_weight_decay,
+            ste_refine_optimize_factors=not refine_coeffs_only,
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not fix_theta,
+            ste_refine_row_group_batch_size=row_group_batch_size,
+            ste_refine_log_interval=ste_refine_log_interval,
         )
 
         torch.save(reconstructed.cpu(), tensor_path)
@@ -369,6 +395,14 @@ def layerwise_quantize_block(
     seed: int,
     scale_refine: bool,
     damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
     calibration_loader,
 ):
     """
@@ -469,6 +503,14 @@ def layerwise_quantize_block(
         seed=seed,
         scale_refine=scale_refine,
         damping=damping,
+        ste_refine_steps=ste_refine_steps,
+        ste_refine_lr=ste_refine_lr,
+        ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_log_interval=ste_refine_log_interval,
+        refine_coeffs_only=refine_coeffs_only,
+        fix_theta=fix_theta,
+        row_group_batch_size=row_group_batch_size,
+        use_multibqq=use_multibqq,
     )
 
     if n_gpus == 1:
@@ -493,8 +535,8 @@ def main():
 
     # BQQ params
     parser.add_argument('--bit_width', type=int, default=2)
-    parser.add_argument('--group_size', type=int, default=32)
-    parser.add_argument('--num_steps', type=int, default=20000)
+    parser.add_argument('--group_size', type=int, default=64)
+    parser.add_argument('--num_steps', type=int, default=10000)
     parser.add_argument('--rank_scale', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=0)
 
@@ -502,6 +544,20 @@ def main():
     parser.add_argument('--scale_refine', action='store_true',
                         help='Apply inter-bit scale refinement after intra-layer compensation')
     parser.add_argument('--damping', type=float, default=1e-6)
+    parser.add_argument('--use_multibqq', action='store_true',
+                        help='Jointly optimize all bits per column group with run_multibqq_compile_batched')
+
+    # STE refinement
+    parser.add_argument('--ste_refine_steps', type=int, default=1000)
+    parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
+    parser.add_argument('--ste_refine_weight_decay', type=float, default=0.0)
+    parser.add_argument('--ste_refine_log_interval', type=int, default=20)
+    parser.add_argument('--refine_coeffs_only', action='store_true',
+                        help='Only refine coefficients; keep binary factors fixed')
+    parser.add_argument('--fix_theta', action='store_true',
+                        help='Keep STE threshold theta fixed at 0.5')
+    parser.add_argument('--row_group_batch_size', type=int, default=None,
+                        help='Batch size over independent row groups during STE refinement')
 
     # Dataset
     parser.add_argument('--dataset', type=str, default='wikitext2',
@@ -572,6 +628,14 @@ def main():
             seed=args.seed,
             scale_refine=args.scale_refine,
             damping=args.damping,
+            ste_refine_steps=args.ste_refine_steps,
+            ste_refine_lr=args.ste_refine_lr,
+            ste_refine_weight_decay=args.ste_refine_weight_decay,
+            ste_refine_log_interval=args.ste_refine_log_interval,
+            refine_coeffs_only=args.refine_coeffs_only,
+            fix_theta=args.fix_theta,
+            row_group_batch_size=args.row_group_batch_size,
+            use_multibqq=args.use_multibqq,
             calibration_loader=train_loader,
         )
         return
@@ -588,6 +652,14 @@ def main():
         main_gpu_id=args.main_gpu_id,
         scale_refine=args.scale_refine,
         damping=args.damping,
+        ste_refine_steps=args.ste_refine_steps,
+        ste_refine_lr=args.ste_refine_lr,
+        ste_refine_weight_decay=args.ste_refine_weight_decay,
+        ste_refine_log_interval=args.ste_refine_log_interval,
+        refine_coeffs_only=args.refine_coeffs_only,
+        fix_theta=args.fix_theta,
+        row_group_batch_size=args.row_group_batch_size,
+        use_multibqq=args.use_multibqq,
         calibration_loader=train_loader,
         layer_threshold=args.layer_threshold,
         target_idx=args.target_idx,

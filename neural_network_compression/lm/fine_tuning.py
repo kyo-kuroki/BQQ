@@ -30,8 +30,10 @@ from trl import SFTConfig, SFTTrainer
 
 try:
     from .compressed_data import default_quantized_model_dir, model_basename
+    from .build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
 except ImportError:
     from compressed_data import default_quantized_model_dir, model_basename
+    from build_bqq_model import convert_binaryquadratic_model_to_ste, convert_ste_model_to_binaryquadratic
 
 
 # ---------------------------------------------------------------------------
@@ -134,8 +136,17 @@ def train(
     ce_alpha: float = 1.0,
     kl_alpha: float = 1.0,
     kl_temperature: float = 2.0,
+    optimize_bqq_factors: bool = True,
+    optimize_bqq_coeffs: bool = True,
+    optimize_bqq_theta: bool = True,
 ):
     model = torch.load(model_path, weights_only=False, map_location="cpu")
+    model = convert_binaryquadratic_model_to_ste(
+        model,
+        optimize_factors=optimize_bqq_factors,
+        optimize_coeffs=optimize_bqq_coeffs,
+        optimize_theta=optimize_bqq_theta,
+    )
 
     training_args = SFTConfig(
         output_dir=output_dir,
@@ -192,10 +203,7 @@ def train(
 
     # Save — reload original structure and apply trained state_dict
     trainer.save_model(output_dir)
-    state_dict = trainer.model.state_dict()
-
-    _model = torch.load(model_path, weights_only=False, map_location="cpu")
-    _model.load_state_dict(state_dict)
+    trained_model = convert_ste_model_to_binaryquadratic(trainer.model.cpu())
 
     # Derive output name from input: {stem}-finetuned.pth or {stem}-distilled.pth
     input_stem = Path(model_path).stem
@@ -206,7 +214,7 @@ def train(
     else:
         suffix = "finetuned"
     output_path = Path(output_dir) / f"{input_stem}-{suffix}.pth"
-    torch.save(_model, output_path)
+    torch.save(trained_model, output_path)
 
     print(f"Training complete! Saved model to {output_path}")
 
@@ -237,6 +245,10 @@ def main():
                         help="Weight for KL distillation loss")
     parser.add_argument("--kl_temperature", type=float, default=2.0,
                         help="Temperature for softmax in KL distillation")
+    parser.add_argument("--refine_coeffs_only", action="store_true",
+                        help="Freeze BQQ binary factors and only optimize coefficients/bias")
+    parser.add_argument("--fix_theta", action="store_true",
+                        help="Keep BQQ STE thresholds fixed at 0.5 during fine-tuning")
 
     args = parser.parse_args()
 
@@ -271,6 +283,9 @@ def main():
         ce_alpha=args.ce_alpha,
         kl_alpha=args.kl_alpha,
         kl_temperature=args.kl_temperature,
+        optimize_bqq_factors=not args.refine_coeffs_only,
+        optimize_bqq_coeffs=True,
+        optimize_bqq_theta=not args.fix_theta,
     )
 
 

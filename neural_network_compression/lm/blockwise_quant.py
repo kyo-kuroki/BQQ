@@ -35,10 +35,11 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-from build_bqq_model import BinaryQuadratic, PartialBQQLinear
-from compressed_data import get_bqq_matrices
+from build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, convert_ste_model_to_binaryquadratic
+from compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
 from datautils import get_loaders
 from model_loader import load_causal_lm
+from layerwise_quant import layerwise_quantize_block
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +145,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
             main_gpu_id=device_id,
         )
         if H is not None:
-            kwargs.update(H=H, hessian_mode='intra-layer',
+            kwargs.update(H=H, hessian_mode='intra-layer-ste',
                           scale_refine=scale_refine, damping=damping)
 
         quantizer.bqq_large_matrix_multi_worker(**kwargs)
@@ -152,6 +153,99 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
 
     A, Y, Z = get_bqq_matrices(patches, bit_width)
     return A, Y, Z
+
+
+
+
+def ensure_layerwise_block_available(
+    block,
+    *,
+    model_name,
+    block_idx,
+    layerwise_dir,
+    bit_width,
+    group_size,
+    num_steps,
+    rank_scale,
+    seed,
+    scale_refine,
+    damping,
+    dataloader,
+    device,
+    refine_coeffs_only=False,
+    fix_theta=False,
+):
+    """Generate missing layerwise quantization results for a block on demand."""
+    layerwise_dir = Path(layerwise_dir)
+    patch_index = build_consolidated_index(layerwise_dir)
+    linear_names = get_quantizable_linears(block)
+    missing = []
+    for linear_name in linear_names:
+        full_name = f"model.layers.{block_idx}.{linear_name}.weight"
+        if full_name not in patch_index:
+            missing.append(full_name)
+    if not missing:
+        return
+
+    print(f'Missing {len(missing)} layerwise target(s) for block {block_idx}; running internal layerwise quantization ...')
+    layerwise_quantize_block(
+        model_name=model_name,
+        save_dir=layerwise_dir,
+        block_idx=block_idx,
+        bit_width=bit_width,
+        group_size=group_size,
+        num_steps=num_steps,
+        rank_scale=rank_scale,
+        seed=seed,
+        scale_refine=scale_refine,
+        damping=damping,
+        ste_refine_steps=200,
+        ste_refine_lr=1e-3,
+        ste_refine_weight_decay=0.0,
+        ste_refine_log_interval=20,
+        refine_coeffs_only=refine_coeffs_only,
+        fix_theta=fix_theta,
+        row_group_batch_size=None,
+        use_multibqq=True,
+        calibration_loader=dataloader,
+    )
+
+
+def load_layerwise_block_from_patches(
+    block,
+    *,
+    block_idx,
+    layerwise_dir,
+    bit_width,
+    trainable_ste=True,
+    optimize_factors=True,
+    optimize_coeffs=True,
+    optimize_theta=True,
+):
+    """Replace all Linear layers in a block from precomputed layerwise BQQ patches."""
+    patch_index = build_consolidated_index(layerwise_dir)
+    if not patch_index:
+        raise FileNotFoundError(f'No consolidated layerwise patches found in {layerwise_dir}')
+
+    linear_names = get_quantizable_linears(block)
+    for linear_name in linear_names:
+        full_name = f"model.layers.{block_idx}.{linear_name}.weight"
+        patch_list = load_layer_patches(full_name, patch_index, map_location='cpu')
+        if not patch_list:
+            raise FileNotFoundError(f'Missing layerwise patches for {full_name} in {layerwise_dir}')
+        A, Y, Z = get_bqq_matrices(patch_list, bit_width)
+        lin = _get_submodule(block, linear_name)
+        bias = lin.bias.data.clone().float() if lin.bias is not None else None
+        replace_linear_in_block(
+            block, linear_name, A, Y, Z, bias=bias,
+            trainable_ste=trainable_ste,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+        )
+        print(f'  Loaded layerwise BQQ: {full_name}')
+
+    return linear_names
 
 
 def _get_submodule(module, dotted_name):
@@ -170,9 +264,17 @@ def _set_submodule(module, dotted_name, new_child):
     setattr(parent, parts[-1], new_child)
 
 
-def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None):
-    """Replace a specific Linear in block with BinaryQuadratic module."""
-    bqq_module = BinaryQuadratic(Y, Z, A, bias=bias)
+def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True):
+    """Replace a specific Linear in block with a BQQ module."""
+    if trainable_ste:
+        bqq_module = TrainableSTEBinaryQuadratic(
+            Y, Z, A, bias=bias,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+        )
+    else:
+        bqq_module = BinaryQuadratic(Y, Z, A, bias=bias)
     _set_submodule(block, linear_name, bqq_module)
 
 
@@ -327,28 +429,16 @@ def quantize_block(
     reverse=True,
     device,
     save_dir,
+    layerwise_dir,
+    refine_coeffs_only=False,
+    fix_theta=False,
 ):
     """
-    Quantize all Linear weights in a single transformer block.
-
-    Steps:
-      1. Cache block I/O from pretrained model
-      2. For each Linear (in REVERSE order, last -> first):
-         a. Collect H = X^T X for this layer from current block state
-            (reflects previously quantized + fine-tuned layers behind it)
-         b. BQQ quantize weight using that fresh H
-         c. Replace Linear -> BinaryQuadratic
-         d. Optimize all continuous params via block output MSE
-      3. Save result
-
-    Reverse order + just-in-time Hessian: each H is collected after all
-    layers downstream have already been quantized and fine-tuned, so X
-    accurately reflects the input distribution the layer will actually see.
+    Load a block from precomputed layerwise BQQ patches, then optimize the
+    whole block output error with STE-trainable BQQ layers.
     """
     dev = torch.device(device)
-    device_id = dev.index if dev.type == 'cuda' else 0
 
-    # --- 1. Cache block I/O ---
     print(f'Loading model: {model_name}')
     model = load_causal_lm(model_name)
 
@@ -356,80 +446,63 @@ def quantize_block(
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
-    # Deep-copy target block and free the full model
-    # Convert to float32 to avoid dtype mismatch when mixing
-    # BinaryQuadratic (float32) with remaining bfloat16 Linears
     block = copy.deepcopy(model.model.layers[block_idx]).float()
+    ensure_layerwise_block_available(
+        block,
+        model_name=model_name,
+        block_idx=block_idx,
+        layerwise_dir=layerwise_dir,
+        bit_width=bit_width,
+        group_size=group_size,
+        num_steps=num_steps,
+        rank_scale=rank_scale,
+        seed=seed,
+        scale_refine=scale_refine,
+        damping=damping,
+        dataloader=dataloader,
+        device=dev,
+        refine_coeffs_only=refine_coeffs_only,
+        fix_theta=fix_theta,
+    )
     del model
     torch.cuda.empty_cache()
 
-    # --- 2. Sequential quantize-optimize (just-in-time Hessian) ---
-    linear_names = get_quantizable_linears(block)
-    ordered_names = list(reversed(linear_names)) if reverse else list(linear_names)
-    n = len(linear_names)
-    direction = 'back-to-front' if reverse else 'front-to-back'
+    print(f'Loading layerwise BQQ patches from: {layerwise_dir}')
+    linear_names = load_layerwise_block_from_patches(
+        block,
+        block_idx=block_idx,
+        layerwise_dir=layerwise_dir,
+        bit_width=bit_width,
+        trainable_ste=True,
+        optimize_factors=not refine_coeffs_only,
+        optimize_coeffs=True,
+        optimize_theta=not fix_theta,
+    )
 
-    print(f'\nBlock {block_idx} quantization targets ({n}), processing {direction}:')
-    for name in ordered_names:
-        lin = _get_submodule(block, name)
-        print(f'  {name}: {tuple(lin.weight.shape)}')
-
-    # Initial block MSE (before any quantization)
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
-    print(f'\nInitial block MSE (pretrained): {init_mse:.6f}')
+    print(f'\nBlock MSE after loading layerwise BQQ: {init_mse:.6f}')
 
-    for i, linear_name in enumerate(ordered_names):
-        orig_idx = (n - 1 - i) if reverse else i  # position in forward order (for display)
-        linear = _get_submodule(block, linear_name)
-        weight = linear.weight.data.clone().float()
-        bias = linear.bias.data.clone().float() if linear.bias is not None else None
+    optimize_block_params(
+        block, inputs_cache, targets_cache,
+        epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+    )
 
-        print(f'\n--- [{i + 1}/{n}] {linear_name} {tuple(weight.shape)} ---')
+    final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
+    print(f'Block MSE after blockwise optimization: {final_mse:.6f} (Δ={final_mse - init_mse:+.6f})')
 
-        # a. Collect Hessian just-in-time from current block state.
-        #    All layers downstream (indices > orig_idx) are already quantized
-        #    and fine-tuned, so X accurately reflects this layer's real input.
-        H = None
-        if use_hessian:
-            print('  Collecting Hessian (just-in-time)...')
-            H = collect_single_hessian(block, linear_name, inputs_cache, dev)
+    for lname in linear_names:
+        layer = _get_submodule(block, lname)
+        if isinstance(layer, TrainableSTEBinaryQuadratic):
+            _set_submodule(block, lname, layer.to_binaryquadratic())
 
-        # b. BQQ quantize
-        A, Y, Z = quantize_weight_to_bqq(
-            weight, bit_width=bit_width, group_size=group_size,
-            num_steps=num_steps, rank_scale=rank_scale, seed=seed,
-            device_id=device_id, H=H, scale_refine=scale_refine,
-            damping=damping,
-        )
-
-        # c. Replace Linear -> BinaryQuadratic
-        replace_linear_in_block(block, linear_name, A, Y, Z, bias=bias)
-
-        # MSE after quantization (before optimization)
-        mse_before = compute_block_mse(block, inputs_cache, targets_cache, dev)
-        print(f'  Block MSE after quant: {mse_before:.6f}')
-
-        # d. Optimize continuous params
-        optimize_block_params(
-            block, inputs_cache, targets_cache,
-            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
-        )
-
-        mse_after = compute_block_mse(block, inputs_cache, targets_cache, dev)
-        print(f'  Block MSE after optim: {mse_after:.6f} '
-              f'(recovered {(mse_before - mse_after) / (mse_before - init_mse + 1e-12) * 100:.1f}%)')
-
-    # --- 3. Save (モジュール丸ごと保存 — 最適化済み連続パラメータを含む) ---
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(block.cpu(), save_path)
 
-    final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\n=== Block {block_idx} done ===')
-    print(f'  Initial MSE: {init_mse:.6f}')
-    print(f'  Final MSE:   {final_mse:.6f}')
+    print(f'  Initial loaded MSE: {init_mse:.6f}')
+    print(f'  Final MSE:          {final_mse:.6f}')
     print(f'  Saved to: {save_path}')
-
     return block
 
 
@@ -680,21 +753,24 @@ def main():
                         help='Max gradient norm for clipping (0 to disable)')
 
     # Mode
-    parser.add_argument('--mode', type=str, default='sequential',
-                        choices=['sequential', 'progressive'],
-                        help=('"sequential": existing layer-by-layer approach (default); '
-                              '"progressive": patch-wise stochastic quantization '
-                              '(no Hessian, random patch batches + fine-tuning)'))
+    parser.add_argument('--progressive', action='store_true',
+                        help='Use progressive patch-wise quantization instead of loading layerwise results')
+    parser.add_argument('--layerwise_dir', type=str, default=None,
+                        help='Directory containing layerwise quantization outputs. Defaults to the standard layerwise output path.')
+    parser.add_argument('--refine_coeffs_only', action='store_true',
+                        help='Freeze BQQ binary factors during blockwise optimization')
+    parser.add_argument('--fix_theta', action='store_true',
+                        help='Keep STE thresholds fixed at 0.5 during blockwise optimization')
 
-    # Hessian-aware (sequential mode only)
+    # Legacy/on-the-fly quantization args (used by progressive mode)
     parser.add_argument('--no_hessian', action='store_true',
-                        help='[sequential] Disable Hessian-aware quantization')
+                        help='[progressive legacy] Disable Hessian-aware quantization')
     parser.add_argument('--no_reverse', action='store_true',
-                        help='[sequential] Process layers front-to-back instead of back-to-front')
+                        help='[progressive legacy] Process layers front-to-back instead of back-to-front')
     parser.add_argument('--hessian_cache_dir', type=str, default=None,
-                        help='[sequential] Directory to cache/load Hessian matrices')
+                        help='[legacy] Directory to cache/load Hessian matrices')
     parser.add_argument('--no_scale_refine', action='store_true',
-                        help='[sequential] Disable Hessian-aware scale refinement')
+                        help='[legacy] Disable Hessian-aware scale refinement')
     parser.add_argument('--damping', type=float, default=1e-6)
 
     # Progressive mode only
@@ -742,7 +818,11 @@ def main():
         save_dir=args.save_dir,
     )
 
-    if args.mode == 'progressive':
+    layerwise_dir = args.layerwise_dir
+    if layerwise_dir is None:
+        layerwise_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
+
+    if args.progressive:
         quantize_block_progressive(**common_kwargs,
                                    num_rounds=args.num_rounds,
                                    schedule=args.schedule)
@@ -754,6 +834,9 @@ def main():
             scale_refine=not args.no_scale_refine,
             damping=args.damping,
             reverse=not args.no_reverse,
+            layerwise_dir=layerwise_dir,
+            refine_coeffs_only=args.refine_coeffs_only,
+            fix_theta=args.fix_theta,
         )
 
 

@@ -58,6 +58,9 @@ from bqq_modules import (  # noqa: F401
     BinaryQuadratic,
     PackedBinaryQuadratic,
     PartialBQQLinear,
+    TrainableSTEBinaryQuadratic,
+    convert_binaryquadratic_model_to_ste,
+    convert_ste_model_to_binaryquadratic,
     get_matrices,
     merge_binary_quadratic,
     merge_binaryquadratic_recursive,
@@ -119,7 +122,7 @@ def dequantize_bqq_model(model: nn.Module, dtype: torch.dtype = torch.bfloat16) 
     Safe to call on non-BQQ models (no-op if no BQQ layers are found).
     """
     for child_name, child_module in list(model.named_children()):
-        if isinstance(child_module, (BinaryQuadratic, PackedBinaryQuadratic)):
+        if isinstance(child_module, (BinaryQuadratic, PackedBinaryQuadratic, TrainableSTEBinaryQuadratic)):
             W = child_module.get_weight(dtype=dtype)          # [out, in]
             has_bias = child_module.bias is not None
             linear = nn.Linear(

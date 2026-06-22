@@ -55,6 +55,137 @@ class BinaryQuadratic(nn.Module):
         return W
 
 
+class BinarySTE01(Function):
+    """Binary {0,1} quantization with learnable threshold and tanh STE."""
+
+    @staticmethod
+    def forward(ctx, input, theta):
+        centered = input - theta
+        output = (centered > 0).to(input.dtype)
+        ctx.save_for_backward(centered)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (centered,) = ctx.saved_tensors
+        surrogate = 1.0 - torch.tanh(centered).pow(2)
+        grad_common = grad_output * surrogate
+        return grad_common, -grad_common
+
+
+class TrainableSTEBinaryQuadratic(nn.Module):
+    """BQQ layer whose binary factors are optimized with elementwise-threshold STE."""
+
+    def __init__(
+        self,
+        Y,
+        Z,
+        A,
+        bias=None,
+        *,
+        optimize_factors=True,
+        optimize_coeffs=True,
+        optimize_theta=True,
+        init_theta=0.5,
+    ):
+        super().__init__()
+        self.bit_width, self.row_width, self.col_width, self.y_row, self.inter_dimension = Y.shape
+        _, _, _, _, self.z_col = Z.shape
+
+        y_init = Y.clone().float()
+        z_init = Z.clone().float()
+        a_init = A[..., 0].unsqueeze(-1).unsqueeze(-1).clone().float()
+        b_init = A[..., 1].unsqueeze(-1).unsqueeze(-1).clone().float()
+        c_init = A[..., 2].unsqueeze(-1).unsqueeze(-1).clone().float()
+        d_init = A[..., 3].unsqueeze(-1).unsqueeze(-1).sum(dim=0).clone().float()
+
+        self.Y_fp = nn.Parameter(y_init, requires_grad=optimize_factors)
+        self.Z_fp = nn.Parameter(z_init, requires_grad=optimize_factors)
+        self.Y_theta = nn.Parameter(torch.full_like(y_init, float(init_theta)), requires_grad=optimize_theta)
+        self.Z_theta = nn.Parameter(torch.full_like(z_init, float(init_theta)), requires_grad=optimize_theta)
+        self.a = nn.Parameter(a_init, requires_grad=optimize_coeffs)
+        self.b = nn.Parameter(b_init, requires_grad=optimize_coeffs)
+        self.c = nn.Parameter(c_init, requires_grad=optimize_coeffs)
+        self.d = nn.Parameter(d_init, requires_grad=optimize_coeffs)
+        self.bias = nn.Parameter(bias.clone().float(), requires_grad=optimize_coeffs) if bias is not None else None
+
+    @classmethod
+    def from_binaryquadratic(
+        cls,
+        layer: 'BinaryQuadratic',
+        *,
+        optimize_factors=True,
+        optimize_coeffs=True,
+        optimize_theta=True,
+        init_theta=0.5,
+    ) -> 'TrainableSTEBinaryQuadratic':
+        d_terms = torch.zeros(
+            layer.bit_width, layer.row_width, layer.col_width, 1,
+            dtype=layer.d.dtype, device=layer.d.device,
+        )
+        d_terms[0] = layer.d.detach()[..., 0, 0].unsqueeze(-1)
+        A = torch.cat([
+            layer.a.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            layer.b.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            layer.c.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            d_terms,
+        ], dim=-1)
+        bias = layer.bias.detach().clone() if layer.bias is not None else None
+        return cls(
+            layer.Y.detach().float(),
+            layer.Z.detach().float(),
+            A,
+            bias=bias,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+            init_theta=init_theta,
+        )
+
+    def _quantized_factors(self, dtype):
+        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta).to(dtype)
+        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta).to(dtype)
+        return Y_q, Z_q
+
+    def get_weight(self, dtype=torch.float32):
+        Y_q, Z_q = self._quantized_factors(dtype)
+        W_core = torch.matmul(Y_q, Z_q)
+        Y_sum = Y_q.sum(dim=-1, keepdim=True)
+        Z_sum = Z_q.sum(dim=-2, keepdim=True)
+        W = self.a.to(dtype) * W_core + self.b.to(dtype) * Y_sum + self.c.to(dtype) * Z_sum
+        W = W.sum(dim=0) + self.d.to(dtype)
+        return W.permute(0, 2, 1, 3).reshape(self.row_width * self.y_row, self.col_width * self.z_col)
+
+    def forward(self, X):
+        dtype = X.dtype
+        device = self.Y_fp.device
+        W = self.get_weight(dtype=dtype)
+        out = X.to(device) @ W.T
+        if self.bias is not None:
+            out = out + self.bias.to(dtype=dtype, device=device)
+        return out
+
+    def to_binaryquadratic(self) -> 'BinaryQuadratic':
+        with torch.no_grad():
+            Y_q = (self.Y_fp > self.Y_theta).bool()
+            Z_q = (self.Z_fp > self.Z_theta).bool()
+            d_terms = torch.zeros(
+                self.bit_width, self.row_width, self.col_width, 1,
+                dtype=self.d.dtype, device=self.d.device,
+            )
+            d_terms[0] = self.d.detach()[..., 0, 0].unsqueeze(-1)
+            A = torch.cat([
+                self.a.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                self.b.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                self.c.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                d_terms,
+            ], dim=-1)
+            bias = self.bias.detach().clone() if self.bias is not None else None
+            return BinaryQuadratic(Y_q.float(), Z_q.float(), A, bias=bias)
+
+
+
+
 # ---------------------------------------------------------------------------
 # Packed BQQ module (bit-packed Y/Z for 8x memory reduction)
 # ---------------------------------------------------------------------------
@@ -247,60 +378,55 @@ class PartialBQQLinear(nn.Module):
     """Mixed-precision linear layer for progressive patch-wise quantization.
 
     Patches are quantized incrementally:
-      - Quantized patches: Y, Z stored as bool buffers (frozen);
-        a, b, c, d are nn.Parameters (trainable).
+      - Quantized patches: Y/Z are trainable via STE with elementwise theta;
+        a, b, c, d are nn.Parameters.
       - Unquantized patches: represented by float_weight (trainable nn.Parameter).
 
     Forward assembles W via::
 
         W = torch.where(mask_full, W_bqq, float_weight)
 
-    so gradients automatically flow to a/b/c/d for quantized patches and to
-    float_weight for unquantized patches — no manual gradient masking needed.
-
-    Workflow
-    --------
-    1. Create from an nn.Linear.
-    2. Repeatedly call quantize_patch(i, j, A_ij, Y_ij, Z_ij) for batches of
-       patches, interleaved with block-level MSE fine-tuning.
-    3. When all patches are done, call to_binaryquadratic() to obtain a
-       standard BinaryQuadratic module (float_weight is discarded).
+    so gradients automatically flow to BQQ parameters for quantized patches and to
+    float_weight for unquantized patches.
     """
 
-    def __init__(self, weight: torch.Tensor, bias, group_size: int, bit_width: int):
+    def __init__(
+        self,
+        weight: torch.Tensor,
+        bias,
+        group_size: int,
+        bit_width: int,
+        *,
+        optimize_factors: bool = True,
+        optimize_coeffs: bool = True,
+        optimize_theta: bool = True,
+        init_theta: float = 0.5,
+    ):
         super().__init__()
         out_features, in_features = weight.shape
 
-        # dim must be exactly divisible by group_size.
-        # (dim == group_size is the degenerate case: 1 patch of size gs×gs.)
         def _patch_dims(dim, gs, name):
             if dim % gs != 0:
-                raise ValueError(
-                    f"{name}={dim} is not divisible by group_size={gs}."
-                )
+                raise ValueError(f"{name}={dim} is not divisible by group_size={gs}.")
             return dim // gs, gs
 
         self.group_size = group_size
         self.bit_width = bit_width
         self.row_width, self.y_row = _patch_dims(out_features, group_size, 'out_features')
-        self.col_width, self.z_col = _patch_dims(in_features,  group_size, 'in_features')
-        self.inter_dimension = None  # set lazily on first quantize_patch call
+        self.col_width, self.z_col = _patch_dims(in_features, group_size, 'in_features')
+        self.inter_dimension = None
+        self.optimize_factors = optimize_factors
+        self.optimize_coeffs = optimize_coeffs
+        self.optimize_theta = optimize_theta
+        self.init_theta = float(init_theta)
 
-        # Full float weight — trainable for unquantized patches
         self.float_weight = nn.Parameter(weight.clone().float())
         self.bias_param = nn.Parameter(bias.clone().float()) if bias is not None else None
 
-        # quantized_mask[i, j] = True iff patch (i, j) has been BQQ-quantized
         self.register_buffer(
             'quantized_mask',
             torch.zeros(self.row_width, self.col_width, dtype=torch.bool),
         )
-        # Y, Z buffers and a/b/c/d params are registered lazily in _init_bqq_tensors()
-        # once inter_dimension is known from the first quantize_patch call.
-
-    # ------------------------------------------------------------------
-    # Lazy initialisation of BQQ tensors
-    # ------------------------------------------------------------------
 
     def _init_bqq_tensors(self, inter_dimension: int) -> None:
         bw = self.bit_width
@@ -309,20 +435,38 @@ class PartialBQQLinear(nn.Module):
         dev = self.float_weight.device
 
         self.inter_dimension = inter_dimension
-        self.register_buffer(
-            'Y', torch.zeros(bw, rw, cw, yr, inter_dimension, dtype=torch.bool, device=dev)
+        self.Y_fp = nn.Parameter(
+            torch.zeros(bw, rw, cw, yr, inter_dimension, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_factors,
         )
-        self.register_buffer(
-            'Z', torch.zeros(bw, rw, cw, inter_dimension, zc, dtype=torch.bool, device=dev)
+        self.Z_fp = nn.Parameter(
+            torch.zeros(bw, rw, cw, inter_dimension, zc, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_factors,
         )
-        self.a = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
-        self.b = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
-        self.c = nn.Parameter(torch.zeros(bw, rw, cw, 1, 1, device=dev))
-        self.d = nn.Parameter(torch.zeros(rw, cw, 1, 1, device=dev))
-
-    # ------------------------------------------------------------------
-    # Patch registration
-    # ------------------------------------------------------------------
+        self.Y_theta = nn.Parameter(
+            torch.full((bw, rw, cw, yr, inter_dimension), self.init_theta, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_theta,
+        )
+        self.Z_theta = nn.Parameter(
+            torch.full((bw, rw, cw, inter_dimension, zc), self.init_theta, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_theta,
+        )
+        self.a = nn.Parameter(
+            torch.zeros(bw, rw, cw, 1, 1, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_coeffs,
+        )
+        self.b = nn.Parameter(
+            torch.zeros(bw, rw, cw, 1, 1, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_coeffs,
+        )
+        self.c = nn.Parameter(
+            torch.zeros(bw, rw, cw, 1, 1, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_coeffs,
+        )
+        self.d = nn.Parameter(
+            torch.zeros(rw, cw, 1, 1, dtype=torch.float32, device=dev),
+            requires_grad=self.optimize_coeffs,
+        )
 
     def quantize_patch(
         self,
@@ -332,63 +476,45 @@ class PartialBQQLinear(nn.Module):
         Y_ij: torch.Tensor,
         Z_ij: torch.Tensor,
     ) -> None:
-        """Register a BQQ-quantized patch.
-
-        Parameters
-        ----------
-        i, j  : patch row / column indices
-        A_ij  : (bit_width, 4)             – BQQ coefficients from quantize_weight_to_bqq
-        Y_ij  : (bit_width, y_row, inter_dim) – binary factor matrix (already optimised)
-        Z_ij  : (bit_width, inter_dim, z_col)  – binary factor matrix (already optimised)
-        """
         inter_dim = Y_ij.shape[-1]
         if self.inter_dimension is None:
             self._init_bqq_tensors(inter_dim)
 
         dev = self.float_weight.device
         with torch.no_grad():
-            self.Y[:, i, j] = (Y_ij > 0.5).to(dev)
-            self.Z[:, i, j] = (Z_ij > 0.5).to(dev)
-            # A_ij[:, 0..2] → a, b, c per-patch; A_ij[:, 3].sum() → d (matches BinaryQuadratic)
+            self.Y_fp.data[:, i, j] = Y_ij.to(dev=dev, dtype=torch.float32)
+            self.Z_fp.data[:, i, j] = Z_ij.to(dev=dev, dtype=torch.float32)
+            self.Y_theta.data[:, i, j].fill_(self.init_theta)
+            self.Z_theta.data[:, i, j].fill_(self.init_theta)
             self.a.data[:, i, j, 0, 0] = A_ij[:, 0].to(dev)
             self.b.data[:, i, j, 0, 0] = A_ij[:, 1].to(dev)
             self.c.data[:, i, j, 0, 0] = A_ij[:, 2].to(dev)
             self.d.data[i, j, 0, 0] = A_ij[:, 3].sum().to(dev)
             self.quantized_mask[i, j] = True
 
-    # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
-
     def _bqq_weight(self, dtype: torch.dtype) -> torch.Tensor:
-        """Reconstruct full W from BQQ parameters (all patches, shape (out, in))."""
-        W_core = torch.matmul(self.Y.to(dtype), self.Z.to(dtype))
-        Y_sum = self.Y.sum(dim=-1, keepdim=True).to(dtype)
-        Z_sum = self.Z.sum(dim=-2, keepdim=True).to(dtype)
+        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta).to(dtype)
+        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta).to(dtype)
+        W_core = torch.matmul(Y_q, Z_q)
+        Y_sum = Y_q.sum(dim=-1, keepdim=True).to(dtype)
+        Z_sum = Z_q.sum(dim=-2, keepdim=True).to(dtype)
         W = (self.a.to(dtype) * W_core
              + self.b.to(dtype) * Y_sum
              + self.c.to(dtype) * Z_sum)
-        W = W.sum(dim=0) + self.d.to(dtype)  # (row_width, col_width, y_row, z_col)
-        W = W.permute(0, 2, 1, 3).reshape(
+        W = W.sum(dim=0) + self.d.to(dtype)
+        return W.permute(0, 2, 1, 3).reshape(
             self.row_width * self.y_row, self.col_width * self.z_col
         )
-        return W
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         dtype = X.dtype
         dev = self.float_weight.device
 
         if self.inter_dimension is None or not self.quantized_mask.any():
-            # No patches quantized yet — pure float forward
             W = self.float_weight.to(dtype)
         elif self.quantized_mask.all():
-            # All patches quantized — pure BQQ forward
             W = self._bqq_weight(dtype)
         else:
-            # Mixed: select quantized patches from BQQ, rest from float_weight.
-            # torch.where gradient routing:
-            #   - quantized positions → grad flows to a/b/c/d (via W_bqq); float_weight gets 0
-            #   - unquantized positions → grad flows to float_weight; a/b/c/d get 0
             W_bqq = self._bqq_weight(dtype)
             mask = (self.quantized_mask
                     .repeat_interleave(self.y_row, dim=0)
@@ -400,19 +526,12 @@ class PartialBQQLinear(nn.Module):
             result = result + self.bias_param.to(dtype=dtype, device=dev)
         return result
 
-    # ------------------------------------------------------------------
-    # Conversion
-    # ------------------------------------------------------------------
-
     def to_binaryquadratic(self) -> 'BinaryQuadratic':
-        """Convert to BinaryQuadratic. Raises if any patch is still unquantized."""
         if not self.quantized_mask.all():
             n = (~self.quantized_mask).sum().item()
             raise RuntimeError(
                 f"to_binaryquadratic() called but {n} patches are still unquantized"
             )
-        # Build BinaryQuadratic directly to avoid the constructor
-        # (which expects a packed A tensor; we already have decomposed a/b/c/d)
         bqq = BinaryQuadratic.__new__(BinaryQuadratic)
         nn.Module.__init__(bqq)
         bqq.bit_width = self.bit_width
@@ -421,8 +540,8 @@ class PartialBQQLinear(nn.Module):
         bqq.y_row = self.y_row
         bqq.inter_dimension = self.inter_dimension
         bqq.z_col = self.z_col
-        bqq.register_buffer('Y', self.Y.clone())
-        bqq.register_buffer('Z', self.Z.clone())
+        bqq.register_buffer('Y', (self.Y_fp.detach() > self.Y_theta.detach()))
+        bqq.register_buffer('Z', (self.Z_fp.detach() > self.Z_theta.detach()))
         bqq.a = nn.Parameter(self.a.data.clone())
         bqq.b = nn.Parameter(self.b.data.clone())
         bqq.c = nn.Parameter(self.c.data.clone())
@@ -430,6 +549,49 @@ class PartialBQQLinear(nn.Module):
         bqq.bias = (nn.Parameter(self.bias_param.data.clone())
                     if self.bias_param is not None else None)
         return bqq
+
+
+def convert_binaryquadratic_model_to_ste(
+    model: nn.Module,
+    *,
+    optimize_factors: bool = True,
+    optimize_coeffs: bool = True,
+    optimize_theta: bool = True,
+    init_theta: float = 0.5,
+) -> nn.Module:
+    """Recursively replace BinaryQuadratic layers with TrainableSTEBinaryQuadratic."""
+    for name, module in list(model.named_children()):
+        if isinstance(module, BinaryQuadratic):
+            setattr(
+                model,
+                name,
+                TrainableSTEBinaryQuadratic.from_binaryquadratic(
+                    module,
+                    optimize_factors=optimize_factors,
+                    optimize_coeffs=optimize_coeffs,
+                    optimize_theta=optimize_theta,
+                    init_theta=init_theta,
+                ),
+            )
+        else:
+            convert_binaryquadratic_model_to_ste(
+                module,
+                optimize_factors=optimize_factors,
+                optimize_coeffs=optimize_coeffs,
+                optimize_theta=optimize_theta,
+                init_theta=init_theta,
+            )
+    return model
+
+
+def convert_ste_model_to_binaryquadratic(model: nn.Module) -> nn.Module:
+    """Recursively replace TrainableSTEBinaryQuadratic layers with BinaryQuadratic."""
+    for name, module in list(model.named_children()):
+        if isinstance(module, TrainableSTEBinaryQuadratic):
+            setattr(model, name, module.to_binaryquadratic())
+        else:
+            convert_ste_model_to_binaryquadratic(module)
+    return model
 
 
 def pack_binaryquadratic_model(model: nn.Module) -> nn.Module:

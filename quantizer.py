@@ -1202,7 +1202,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1211,18 +1211,36 @@ class BinaryQuadraticQuantization():
             H: 入力相関行列 X^T X (in_features, in_features)。
             hessian_mode: 'inter' = inter-bit scale refinement,
                           'intra' = intra-bit column compensation (last bit only),
-                          'intra-layer' = column-wise N-bit BQQ + compensation.
+                          'intra-layer' = column-wise N-bit BQQ + compensation,
+                          'intra-layer-ste' = intra-layer後にSTE refinementまで実行。
             scale_refine: Trueの場合、最後にinter-bit hessian-aware scale refinementを実行。
             damping: Hessian-awareのTikhonov正則化。
         """
-        if H is not None and hessian_mode == 'intra-layer':
+        if H is not None and hessian_mode == 'intra-layer-ste':
+            initial_weight = self._intra_layer_hessian_aware_large_matrix_batched(
+                max_patch_size, bit_width, H, consolidated_path,
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq)
+            if ste_refine_steps > 0:
+                refined_weight, _, _ = self.refine_decomposition_with_ste(
+                    all_decomposed=consolidated_path,
+                    H=H,
+                    num_steps=ste_refine_steps,
+                    lr=ste_refine_lr,
+                    weight_decay=ste_refine_weight_decay,
+                    device_id=main_gpu_id,
+                    optimize_factors=ste_refine_optimize_factors,
+                    optimize_coeffs=ste_refine_optimize_coeffs,
+                    optimize_theta=ste_refine_optimize_theta,
+                    row_group_batch_size=ste_refine_row_group_batch_size,
+                    consolidated_path=consolidated_path,
+                    log_interval=ste_refine_log_interval,
+                )
+                return refined_weight
+            return initial_weight
+        elif H is not None and hessian_mode == 'intra-layer':
             return self._intra_layer_hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine)
-        elif H is not None and hessian_mode == 'intra':
-            return self._intra_bit_hessian_aware_large_matrix_batched(
-                max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -1471,7 +1489,7 @@ class BinaryQuadraticQuantization():
         self,
         all_decomposed,
         H,
-        num_steps=200,
+        num_steps=1000,
         lr=1e-3,
         weight_decay=0.0,
         device_id=0,
@@ -1679,7 +1697,7 @@ class BinaryQuadraticQuantization():
     def _intra_layer_hessian_aware_large_matrix_batched(
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6, scale_refine=False, use_multibqq=False,
+        damping=1e-6, scale_refine=True, use_multibqq=True,
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
