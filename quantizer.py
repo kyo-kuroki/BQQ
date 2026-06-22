@@ -3,6 +3,7 @@ from tqdm import tqdm, trange
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
+from torch.autograd import Function
 import copy
 import matplotlib.pyplot as plt
 import os
@@ -15,6 +16,152 @@ from scipy.fftpack import dct, idct
 from itertools import combinations
 from PIL import Image
 import io
+
+
+class BinarySTE01(Function):
+    """Binary {0,1} quantization with learnable threshold and STE."""
+
+    @staticmethod
+    def forward(ctx, input, theta):
+        centered = input - theta
+        output = (centered > 0).to(input.dtype)
+        ctx.save_for_backward(centered)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (centered,) = ctx.saved_tensors
+        surrogate = 1.0 - torch.tanh(centered).pow(2)
+        grad_common = grad_output * surrogate
+        grad_input = grad_common
+        grad_theta = -grad_common
+        return grad_input, grad_theta
+
+
+class _BQQSTERefinementModule(nn.Module):
+    def __init__(self, all_decomposed, weight_shape, optimize_factors=True, optimize_coeffs=True, optimize_theta=True):
+        super().__init__()
+        self.weight_shape = tuple(weight_shape)
+        self.entries = []
+
+        sorted_entries = sorted(
+            all_decomposed,
+            key=lambda e: (e['patch_row'], e['patch_col'], e['bit_idx'])
+        )
+
+        for idx, entry in enumerate(sorted_entries):
+            y_init = entry['mat1'].float().clone()
+            z_init = entry['mat2'].float().clone()
+            coeff_init = entry['coeff'].float().clone()
+            y_theta_init = torch.full_like(y_init, 0.5)
+            z_theta_init = torch.full_like(z_init, 0.5)
+
+            y_param = nn.Parameter(y_init, requires_grad=optimize_factors)
+            z_param = nn.Parameter(z_init, requires_grad=optimize_factors)
+            y_theta = nn.Parameter(y_theta_init, requires_grad=optimize_theta)
+            z_theta = nn.Parameter(z_theta_init, requires_grad=optimize_theta)
+            coeff_param = nn.Parameter(coeff_init, requires_grad=optimize_coeffs)
+
+            self.register_parameter(f'y_fp_{idx}', y_param)
+            self.register_parameter(f'z_fp_{idx}', z_param)
+            self.register_parameter(f'y_theta_{idx}', y_theta)
+            self.register_parameter(f'z_theta_{idx}', z_theta)
+            self.register_parameter(f'coeff_{idx}', coeff_param)
+
+            self.entries.append({
+                'row_start': entry['row_start'],
+                'row_end': entry['row_end'],
+                'col_start': entry['col_start'],
+                'col_end': entry['col_end'],
+                'patch_row': entry['patch_row'],
+                'patch_col': entry['patch_col'],
+                'bit_idx': entry['bit_idx'],
+                'y_name': f'y_fp_{idx}',
+                'z_name': f'z_fp_{idx}',
+                'y_theta_name': f'y_theta_{idx}',
+                'z_theta_name': f'z_theta_{idx}',
+                'coeff_name': f'coeff_{idx}',
+            })
+
+        self.entries_by_patch_row = {}
+        self.row_group_ranges = {}
+        self.patch_rows_by_height = {}
+        for entry in self.entries:
+            patch_row = entry['patch_row']
+            self.entries_by_patch_row.setdefault(patch_row, []).append(entry)
+            if patch_row not in self.row_group_ranges:
+                self.row_group_ranges[patch_row] = (entry['row_start'], entry['row_end'])
+        for patch_row, (r0, r1) in self.row_group_ranges.items():
+            self.patch_rows_by_height.setdefault(r1 - r0, []).append(patch_row)
+
+    def reconstruct_row_group_batch(self, patch_rows):
+        if len(patch_rows) == 0:
+            raise ValueError('patch_rows must not be empty')
+        first_param = next(self.parameters(), None)
+        device = first_param.device if first_param is not None else torch.device('cpu')
+        row_blocks = []
+        row_ranges = []
+        for patch_row in patch_rows:
+            r0, r1 = self.row_group_ranges[patch_row]
+            block = torch.zeros(r1 - r0, self.weight_shape[1], dtype=torch.float32, device=device)
+            for entry in self.entries_by_patch_row[patch_row]:
+                y_fp = getattr(self, entry['y_name'])
+                z_fp = getattr(self, entry['z_name'])
+                y_theta = getattr(self, entry['y_theta_name'])
+                z_theta = getattr(self, entry['z_theta_name'])
+                coeff = getattr(self, entry['coeff_name'])
+                Y_q = BinarySTE01.apply(y_fp, y_theta)
+                Z_q = BinarySTE01.apply(z_fp, z_theta)
+                patch = (coeff[0] * (Y_q @ Z_q)
+                        + coeff[1] * Y_q.sum(dim=1, keepdim=True)
+                        + coeff[2] * Z_q.sum(dim=0, keepdim=True)
+                        + coeff[3])
+                block[:, entry['col_start']:entry['col_end']] += patch
+            row_blocks.append(block)
+            row_ranges.append((r0, r1))
+        return torch.stack(row_blocks, dim=0), row_ranges
+
+    def reconstruct_weight(self):
+        first_param = next(self.parameters(), None)
+        device = first_param.device if first_param is not None else torch.device('cpu')
+        Wq = torch.zeros(self.weight_shape, dtype=torch.float32, device=device)
+        for entry in self.entries:
+            y_fp = getattr(self, entry['y_name'])
+            z_fp = getattr(self, entry['z_name'])
+            y_theta = getattr(self, entry['y_theta_name'])
+            z_theta = getattr(self, entry['z_theta_name'])
+            coeff = getattr(self, entry['coeff_name'])
+            Y_q = BinarySTE01.apply(y_fp, y_theta)
+            Z_q = BinarySTE01.apply(z_fp, z_theta)
+            patch = (coeff[0] * (Y_q @ Z_q)
+                    + coeff[1] * Y_q.sum(dim=1, keepdim=True)
+                    + coeff[2] * Z_q.sum(dim=0, keepdim=True)
+                    + coeff[3])
+            Wq[entry['row_start']:entry['row_end'], entry['col_start']:entry['col_end']] += patch
+        return Wq
+
+    def export_decomposition(self):
+        exported = []
+        for entry in self.entries:
+            y_fp = getattr(self, entry['y_name'])
+            z_fp = getattr(self, entry['z_name'])
+            y_theta = getattr(self, entry['y_theta_name'])
+            z_theta = getattr(self, entry['z_theta_name'])
+            coeff = getattr(self, entry['coeff_name'])
+            exported.append({
+                'patch_row': entry['patch_row'],
+                'patch_col': entry['patch_col'],
+                'row_start': entry['row_start'],
+                'row_end': entry['row_end'],
+                'col_start': entry['col_start'],
+                'col_end': entry['col_end'],
+                'coeff': coeff.detach().cpu().float(),
+                'mat1': (y_fp.detach().cpu() > y_theta.detach().cpu()).float(),
+                'mat2': (z_fp.detach().cpu() > z_theta.detach().cpu()).float(),
+                'bit_idx': entry['bit_idx'],
+            })
+        return exported
+
 
 
 
@@ -1076,10 +1223,6 @@ class BinaryQuadraticQuantization():
             return self._intra_bit_hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
-        elif H is not None:
-            return self._inter_bit_hessian_aware_large_matrix_batched(
-                max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -1311,269 +1454,155 @@ class BinaryQuadraticQuantization():
         return None
 
 
-    # ------------------------------------------------------------------
-    # Hessian-aware large matrix batched
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _resolve_hessian_matrix(H, in_features):
+        if isinstance(H, np.ndarray):
+            H = torch.from_numpy(H)
+        H = H.float()
+        if H.ndim != 2:
+            raise ValueError(f'H must be 2D, got shape {tuple(H.shape)}')
+        if H.shape != (in_features, in_features):
+            raise ValueError(
+                f'H shape {tuple(H.shape)} is incompatible with in_features={in_features}'
+            )
+        return H
 
-    def _inter_bit_hessian_aware_large_matrix_batched(
-        self, max_patch_size, bit_width, H,
-        consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6,
+    def refine_decomposition_with_ste(
+        self,
+        all_decomposed,
+        H,
+        num_steps=200,
+        lr=1e-3,
+        weight_decay=0.0,
+        device_id=0,
+        optimize_factors=True,
+        optimize_coeffs=True,
+        optimize_theta=True,
+        row_group_batch_size=None,
+        consolidated_path=None,
+        log_interval=20,
     ):
         """
-        Hessian-aware BQQ quantization.
-
-        Same patching and batched binary decomposition as _large_matrix_batched,
-        but after each bit, refines ALL scale coefficients (bits 0..current)
-        to minimise  tr((W - Wq) H (W - Wq)^T).
-
-        The refinement is done per-patch independently (row-group structure
-        makes patches on different rows fully independent).
+        Refine a saved BQQ decomposition by minimizing
+        tr((W - W') H (W - W')^T) with AdamW and a straight-through estimator
+        over binary Y/Z factors, where H = X X^T.
 
         Args:
-            H: Input correlation matrix (in_features, in_features), i.e. X^T X.
-               Must be on CPU; will be sliced per column-group.
+            all_decomposed: list of patch dicts or path to a torch-saved list.
+            H: Hessian / activation covariance matrix with shape
+               (in_features, in_features).
+        Returns:
+            refined_weight, refined_decomposition, history
         """
-        from collections import defaultdict
-        rank_scale_copy = copy.copy(self.rank_scale)
-        x_copy = copy.deepcopy(self.x)
-        original_h, original_w = x_copy.shape
+        if isinstance(all_decomposed, (str, os.PathLike)):
+            all_decomposed = torch.load(all_decomposed, map_location='cpu')
+        all_decomposed = copy.deepcopy(all_decomposed)
 
-        def get_max_divisor(num, max_value):
-            limit = max(int(math.sqrt(num)), max_value)
-            for i in range(limit, 0, -1):
-                if num % i == 0 and i <= max_value:
-                    return i
-            return 1
+        if len(all_decomposed) == 0:
+            raise ValueError('all_decomposed must not be empty')
 
-        def compute_patch_ranges(dim_size, max_ps):
-            divisor = get_max_divisor(dim_size, max_ps)
-            if divisor >= max_ps // 2:
-                n = dim_size // divisor
-                return [(i * divisor, (i + 1) * divisor) for i in range(n)]
-            else:
-                n_full = dim_size // max_ps
-                rem = dim_size - n_full * max_ps
-                if 0 < rem < max_ps // 2 and n_full > 0:
-                    n_full -= 1
-                ranges = [(i * max_ps, (i + 1) * max_ps) for i in range(n_full)]
-                if n_full * max_ps < dim_size:
-                    ranges.append((n_full * max_ps, dim_size))
-                return ranges
+        W_target = torch.as_tensor(copy.deepcopy(self.x)).float()
+        if W_target.ndim != 2:
+            raise ValueError(f'self.x must be 2D, got shape {tuple(W_target.shape)}')
 
-        h_ranges = compute_patch_ranges(original_h, max_patch_size)
-        w_ranges = compute_patch_ranges(original_w, max_patch_size)
+        H_mat = self._resolve_hessian_matrix(H, W_target.shape[1])
 
-        patch_specs = []
-        for i, (r0, r1) in enumerate(h_ranges):
-            for j, (c0, c1) in enumerate(w_ranges):
-                patch_specs.append({'i': i, 'j': j, 'r0': r0, 'r1': r1, 'c0': c0, 'c1': c1})
-        total_patches = len(patch_specs)
+        device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+        module = _BQQSTERefinementModule(
+            all_decomposed,
+            weight_shape=W_target.shape,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+        ).to(device)
+        W_target = W_target.to(device)
+        H_mat = H_mat.to(device)
 
-        size_counts = defaultdict(int)
-        for s in patch_specs:
-            size_counts[(s['r1'] - s['r0'], s['c1'] - s['c0'])] += 1
-        for (ph, pw), cnt in sorted(size_counts.items(), key=lambda x: -x[1]):
-            print(f'Patch Size:({ph}x{pw}), Count: {cnt}')
+        params = [p for p in module.parameters() if p.requires_grad]
+        if len(params) == 0:
+            raise ValueError('No trainable parameters selected for refinement')
 
-        x_tensor = torch.tensor(x_copy).float()
-        H = H.float()
-        dtype = torch.float32
+        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        history = []
+        best_loss = float('inf')
+        best_step = -1
+        best_state_dict = None
 
-        # --- Precompute Hessian-related quantities (shared across all bits) ---
-        S = self._cholesky_safe(H, damping)
-        if S is None:
-            raise RuntimeError('Cholesky decomposition of H failed even with damping')
+        grouped_patch_rows = []
+        for patch_height in sorted(module.patch_rows_by_height):
+            patch_rows = module.patch_rows_by_height[patch_height]
+            batch_size = len(patch_rows) if not row_group_batch_size or row_group_batch_size <= 0 else row_group_batch_size
+            for start in range(0, len(patch_rows), batch_size):
+                grouped_patch_rows.append(patch_rows[start:start + batch_size])
 
-        # S_j = S[c0:c1, :] for each column group, and col-sums
-        S_j_list = []
-        col_sum_S_list = []
-        for c0, c1 in w_ranges:
-            S_j = S[c0:c1, :]                              # (pw, full_w)
-            S_j_list.append(S_j)
-            col_sum_S_list.append(S_j.sum(dim=0, keepdim=True))  # (1, full_w)
+        for step in range(num_steps):
+            for patch_rows in grouped_patch_rows:
+                optimizer.zero_grad(set_to_none=True)
+                Wq_batch, row_ranges = module.reconstruct_row_group_batch(patch_rows)
+                target_batch = torch.stack([W_target[r0:r1, :] for r0, r1 in row_ranges], dim=0)
+                diff_batch = target_batch - Wq_batch
+                loss = torch.sum((diff_batch @ H_mat) * diff_batch)
+                loss.backward()
+                optimizer.step()
 
-        # R_S = W_row @ S for each row group (target, invariant across bits)
-        R_S_rows = []
-        for r0, r1 in h_ranges:
-            R_S_rows.append(x_tensor[r0:r1, :].to(dtype=dtype) @ S)  # (ph, full_w)
+            with torch.no_grad():
+                Wq_eval = module.reconstruct_weight()
+                diff_eval = W_target - Wq_eval
+                loss_value = torch.sum((diff_eval @ H_mat) * diff_eval).detach().cpu().item()
+            history.append(loss_value)
 
-        ones_col_ph = {}  # cache per patch height
+            if loss_value < best_loss:
+                best_loss = loss_value
+                best_step = step + 1
+                best_state_dict = {
+                    key: value.detach().cpu().clone()
+                    for key, value in module.state_dict().items()
+                }
 
-        # Per-patch binary data: binary_data[(i,j)] = [(Y_0, Z_0), (Y_1, Z_1), ...]
-        binary_data = defaultdict(list)
-        # Per-patch current coefficients: coeffs_data[(i,j)] = [coeff_0, coeff_1, ...]
-        coeffs_data = defaultdict(list)
-        # Reconstruction accumulator
-        reconst_accum = {}
-        for s in patch_specs:
-            reconst_accum[(s['i'], s['j'])] = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
+            if log_interval and (step == 0 or (step + 1) % log_interval == 0 or step + 1 == num_steps):
+                print(f'STE refine step {step + 1}/{num_steps}: loss={loss_value:.6e}, best={best_loss:.6e}')
 
-        for bit_idx in range(bit_width):
-            # --- 1. Compute residuals and run batched BQQ ---
-            size_groups = defaultdict(list)
-            for s in patch_specs:
-                key = (s['i'], s['j'])
-                ph, pw = s['r1'] - s['r0'], s['c1'] - s['c0']
-                original = x_tensor[s['r0']:s['r1'], s['c0']:s['c1']]
-                residual = original - reconst_accum[key]
-                size_groups[(ph, pw)].append((s, residual))
+        if best_state_dict is not None:
+            module.load_state_dict({
+                key: value.to(device)
+                for key, value in best_state_dict.items()
+            })
+            print(f'STE refine restored best step {best_step}/{num_steps}: best_loss={best_loss:.6e}')
 
-            for (ph, pw), group in size_groups.items():
-                specs = [g[0] for g in group]
-                residuals = [g[1] for g in group]
-                x_batch = torch.stack(residuals)
-                print(f'Bit {bit_idx}: decomposing {len(residuals)} patches of ({ph}x{pw})')
+        refined_weight = module.reconstruct_weight().detach().cpu()
+        refined_decomposition = module.export_decomposition()
 
-                y_b, z_b, a_b = self.run_bqq_compile_batched(
-                    x_batch, rank_scale=rank_scale_copy,
-                    zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
-                    Nstep=Nstep, device_id=main_gpu_id, seed=seed
-                )
-
-                for b, s in enumerate(specs):
-                    key = (s['i'], s['j'])
-                    binary_data[key].append((y_b[b].cpu(), z_b[b].cpu()))
-                    coeffs_data[key].append(a_b[b].cpu())
-
-            # --- 2. Hessian-aware scale refinement per row-group (batched solve) ---
-            # S, S_j_list, col_sum_S_list, R_S_rows are precomputed above (bit-invariant)
-            num_row_groups = len(h_ranges)
-            num_col_groups = len(w_ranges)
-            current_bits = bit_idx + 1
-            n_params = num_col_groups * (3 * current_bits + 1)
-            print(f'Bit {bit_idx}: refining scales for {num_row_groups} row-groups '
-                  f'({n_params} params each, batched solve)')
-
-            # Build PtP and Ptr per row (Phi is temporary, not stored)
-            PtP_list = []
-            Ptr_list = []
-
-            for i, (r0, r1) in enumerate(h_ranges):
-                ph = r1 - r0
-                R_S = R_S_rows[i]  # precomputed (ph, full_w)
-
-                if ph not in ones_col_ph:
-                    ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
-                ones_col = ones_col_ph[ph]
-
-                G_cols = []
-                for j in range(num_col_groups):
-                    for b_idx in range(current_bits):
-                        Y_b, Z_b = binary_data[(i, j)][b_idx]
-                        Y_b = Y_b.to(dtype=dtype)
-                        Z_b = Z_b.to(dtype=dtype)
-
-                        G_a = (Y_b @ Z_b) @ S_j_list[j]
-                        G_b = Y_b.sum(dim=-1, keepdim=True) @ col_sum_S_list[j]
-                        G_c = ones_col @ (Z_b.sum(dim=-2, keepdim=True) @ S_j_list[j])
-                        G_cols.extend([G_a.reshape(-1), G_b.reshape(-1), G_c.reshape(-1)])
-
-                    G_d = ones_col @ col_sum_S_list[j]
-                    G_cols.append(G_d.reshape(-1))
-
-                Phi = torch.stack(G_cols, dim=1)  # (ph*full_w, n_params)
-                rhs = R_S.reshape(-1, 1)
-                PtP_list.append(Phi.T @ Phi)
-                Ptr_list.append(Phi.T @ rhs)
-
-            # Batch solve: (R, P, P) x (R, P, 1)
-            PtP_batch = torch.stack(PtP_list)
-            Ptr_batch = torch.stack(Ptr_list)
-            mean_diag = PtP_batch.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
-            eye = torch.eye(n_params, dtype=dtype).unsqueeze(0)
-
-            theta_batch = None
-            for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
-                try:
-                    A = PtP_batch + reg * mean_diag * eye
-                    sol = torch.linalg.solve(A, Ptr_batch)
-                    if sol.isfinite().all():
-                        theta_batch = sol.squeeze(-1)
-                        break
-                except Exception:
-                    continue
-
-            if theta_batch is not None:
-                for i in range(num_row_groups):
-                    theta = theta_batch[i]
-                    p = 0
-                    for j in range(num_col_groups):
-                        coeffs = []
-                        for b_idx in range(current_bits):
-                            coeffs.append(torch.tensor([theta[p].item(), theta[p+1].item(), theta[p+2].item(), 0.0]))
-                            p += 3
-                        coeffs[0][3] = theta[p].item()
-                        p += 1
-                        coeffs_data[(i, j)] = coeffs
-                print(f'  Refined {num_row_groups} row-groups')
-            else:
-                print('  WARNING: batched solve failed')
-
-            # --- 3. Recompute reconst_accum from updated coefficients ---
-            for s in patch_specs:
-                key = (s['i'], s['j'])
-                accum = torch.zeros(s['r1'] - s['r0'], s['c1'] - s['c0'])
-                for (Y_b, Z_b), coeff in zip(binary_data[key], coeffs_data[key]):
-                    a0, a1, a2, a3 = coeff[0], coeff[1], coeff[2], coeff[3]
-                    accum += a0 * Y_b @ Z_b + a1 * Y_b.sum(dim=1, keepdim=True) \
-                           + a2 * Z_b.sum(dim=0, keepdim=True) + a3
-                reconst_accum[key] = accum
-
-        # --- Build all_decomposed for saving ---
-        all_decomposed = []
-        for s in patch_specs:
-            key = (s['i'], s['j'])
-            for bit_idx, ((Y_b, Z_b), coeff) in enumerate(
-                    zip(binary_data[key], coeffs_data[key])):
-                all_decomposed.append({
-                    'patch_row': s['i'], 'patch_col': s['j'],
-                    'row_start': s['r0'], 'row_end': s['r1'],
-                    'col_start': s['c0'], 'col_end': s['c1'],
-                    'coeff': coeff, 'mat1': Y_b, 'mat2': Z_b,
-                    'bit_idx': bit_idx,
-                })
-
-        if consolidated_path and all_decomposed:
+        if consolidated_path:
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
-            torch.save(all_decomposed, consolidated_path)
-            print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+            torch.save(refined_decomposition, consolidated_path)
+            print(f'Saved refined consolidated: {consolidated_path} ({len(refined_decomposition)} entries)')
 
-        reconstructed_tensor = torch.zeros(original_h, original_w)
-        for s in patch_specs:
-            reconstructed_tensor[s['r0']:s['r1'], s['c0']:s['c1']] = reconst_accum[(s['i'], s['j'])]
+        return refined_weight, refined_decomposition, history
 
-        self.x = copy.copy(x_copy)
-        return reconstructed_tensor
-
-
-
-
-    def _intra_bit_hessian_aware_large_matrix_batched(
-        self, max_patch_size, bit_width, H,
-        consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6,
+    def optimize_decomposition_from_scratch_with_ste(
+        self,
+        max_patch_size,
+        bit_width,
+        H,
+        num_steps=200,
+        lr=1e-3,
+        weight_decay=0.0,
+        device_id=0,
+        optimize_factors=True,
+        optimize_coeffs=True,
+        optimize_theta=True,
+        row_group_batch_size=None,
+        consolidated_path=None,
+        log_interval=20,
+        seed=0,
     ):
         """
-        Intra-bit Hessian-aware BQQ: GPTQ-style column compensation within each bit.
-
-        For each bit:
-          For each column group j (left to right):
-            1. BQQ decompose column j patches
-            2. Compensate remaining columns: W_work[:, c1:] += E_j @ H_12 @ H_22^{-1}
-               where E_j is the quantization error for column j
-
-        The compensation ensures that the Hessian-weighted error tr((W-Wq) H (W-Wq)^T)
-        is minimised by shifting remaining columns to absorb quantization errors.
-
-        NOTE: This does NOT include inter-bit scale refinement. Use
-        _hessian_aware_large_matrix_batched for that.
+        Optimize a BQQ decomposition from scratch with the same STE objective
+        used in refine_decomposition_with_ste.
         """
-        from collections import defaultdict
-        rank_scale_copy = copy.copy(self.rank_scale)
-        x_copy = copy.deepcopy(self.x)
-        original_h, original_w = x_copy.shape
-        dtype = torch.float32
+        W_target = torch.as_tensor(copy.deepcopy(self.x)).float()
+        if W_target.ndim != 2:
+            raise ValueError(f'self.x must be 2D, got shape {tuple(W_target.shape)}')
 
         def get_max_divisor(num, max_value):
             limit = max(int(math.sqrt(num)), max_value)
@@ -1587,108 +1616,70 @@ class BinaryQuadraticQuantization():
             if divisor >= max_ps // 2:
                 n = dim_size // divisor
                 return [(i * divisor, (i + 1) * divisor) for i in range(n)]
-            else:
-                n_full = dim_size // max_ps
-                rem = dim_size - n_full * max_ps
-                if 0 < rem < max_ps // 2 and n_full > 0:
-                    n_full -= 1
-                ranges = [(i * max_ps, (i + 1) * max_ps) for i in range(n_full)]
-                if n_full * max_ps < dim_size:
-                    ranges.append((n_full * max_ps, dim_size))
-                return ranges
+            n_full = dim_size // max_ps
+            rem = dim_size - n_full * max_ps
+            if 0 < rem < max_ps // 2 and n_full > 0:
+                n_full -= 1
+            ranges = [(i * max_ps, (i + 1) * max_ps) for i in range(n_full)]
+            if n_full * max_ps < dim_size:
+                ranges.append((n_full * max_ps, dim_size))
+            return ranges
 
-        h_ranges = compute_patch_ranges(original_h, max_patch_size)
-        w_ranges = compute_patch_ranges(original_w, max_patch_size)
+        h_ranges = compute_patch_ranges(W_target.shape[0], max_patch_size)
+        w_ranges = compute_patch_ranges(W_target.shape[1], max_patch_size)
 
-        patch_specs = []
-        for i, (r0, r1) in enumerate(h_ranges):
-            for j, (c0, c1) in enumerate(w_ranges):
-                patch_specs.append({'i': i, 'j': j, 'r0': r0, 'r1': r1, 'c0': c0, 'c1': c1})
-
-        x_tensor = torch.tensor(x_copy).float()
-        H = H.float()
-
+        generator = torch.Generator().manual_seed(seed)
         all_decomposed = []
-        num_col_groups = len(w_ranges)
-
-        Wq_total = torch.zeros(original_h, original_w, dtype=dtype)
-
-        for bit_idx in range(bit_width):
-            Wres = x_tensor - Wq_total
-
-            # Compensation only on last bit (earlier bits need clean residuals for BQQ)
-            use_compensation = (bit_idx == bit_width - 1)
-
-            # W_work: copy of Wres, modified by compensation WITHIN this bit
-            W_work = Wres.clone()
-
-            for j, (c0, c1) in enumerate(w_ranges):
+        for patch_row, (r0, r1) in enumerate(h_ranges):
+            ph = r1 - r0
+            for patch_col, (c0, c1) in enumerate(w_ranges):
                 pw = c1 - c0
-
-                # BQQ input = W_work[:, c0:c1] (compensated within this bit)
-                col_patches = []
-                for i, (r0, r1) in enumerate(h_ranges):
-                    col_patches.append(W_work[r0:r1, c0:c1].clone())
-
-                x_batch = torch.stack(col_patches)
-                print(f'Bit {bit_idx}, col {j}/{num_col_groups}: '
-                      f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
-
-                y_b, z_b, a_b = self.run_bqq_compile_batched(
-                    x_batch, rank_scale=rank_scale_copy,
-                    zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
-                    Nstep=Nstep, device_id=main_gpu_id, seed=seed
-                )
-
-                # Store BQQ results. Subtract compensation that was applied to this
-                # column's W_work, so Wq_total only contains the "clean" BQQ approx
-                # of the original Wres (not the compensated version).
-                # compensation_applied[:, c0:c1] = W_work[:, c0:c1] - Wres[:, c0:c1]
-                E_j = torch.zeros(original_h, pw, dtype=dtype)
-                for b_idx, (r0, r1) in enumerate(h_ranges):
-                    yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
-                    bit_reconst = (coeff[0] * yb @ zb
-                                  + coeff[1] * yb.sum(dim=1, keepdim=True)
-                                  + coeff[2] * zb.sum(dim=0, keepdim=True)
-                                  + coeff[3])
-                    Wq_total[r0:r1, c0:c1] += bit_reconst
-                    # Error for compensation: measured on compensated W_work
-                    E_j[r0:r1, :] = col_patches[b_idx] - bit_reconst
-
+                patch = W_target[r0:r1, c0:c1]
+                patch_mean = patch.mean().item()
+                patch_scale = patch.std().item()
+                rank = max(1, int(round(self.rank_scale * ph * pw / max(ph + pw, 1))))
+                coeff_base = torch.tensor([
+                    patch_scale / max(bit_width, 1),
+                    0.0,
+                    0.0,
+                    patch_mean / max(bit_width, 1),
+                ], dtype=torch.float32)
+                for bit_idx in range(bit_width):
                     all_decomposed.append({
-                        'patch_row': b_idx, 'patch_col': j,
-                        'row_start': r0, 'row_end': r1,
-                        'col_start': c0, 'col_end': c1,
-                        'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                        'patch_row': patch_row,
+                        'patch_col': patch_col,
+                        'row_start': r0,
+                        'row_end': r1,
+                        'col_start': c0,
+                        'col_end': c1,
+                        'coeff': coeff_base.clone(),
+                        'mat1': torch.rand(ph, rank, generator=generator),
+                        'mat2': torch.rand(rank, pw, generator=generator),
                         'bit_idx': bit_idx,
                     })
 
-                # Compensate remaining columns of W_work (last bit only)
-                if use_compensation and c1 < original_w:
-                    H_22 = H[c1:, c1:]
-                    H_21 = H[c1:, c0:c1]
-                    try:
-                        M = torch.linalg.solve(H_22, H_21)
-                        W_work[:, c1:] += E_j @ M.T
-                        print(f'  Compensated remaining {original_w - c1} columns')
-                    except Exception as e:
-                        print(f'  WARNING: compensation failed: {e}')
+        return self.refine_decomposition_with_ste(
+            all_decomposed=all_decomposed,
+            H=H,
+            num_steps=num_steps,
+            lr=lr,
+            weight_decay=weight_decay,
+            device_id=device_id,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+            row_group_batch_size=row_group_batch_size,
+            consolidated_path=consolidated_path,
+            log_interval=log_interval,
+        )
 
-            # W_work is discarded. Next bit starts fresh from x - Wq_total.
 
-        # Save
-        if consolidated_path and all_decomposed:
-            os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
-            torch.save(all_decomposed, consolidated_path)
-            print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
 
-        self.x = copy.copy(x_copy)
-        return Wq_total
 
     def _intra_layer_hessian_aware_large_matrix_batched(
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6, scale_refine=False,
+        damping=1e-6, scale_refine=False, use_multibqq=False,
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -1702,6 +1693,10 @@ class BinaryQuadraticQuantization():
 
         Unlike _intra_bit which processes bit-by-bit then column-by-column,
         this processes column-by-column with all bits at once.
+
+        If use_multibqq=True, each column group is optimized jointly with
+        run_multibqq_compile_batched(..., num_stack=bit_width) instead of
+        applying run_bqq_compile_batched sequentially per bit.
         """
         from collections import defaultdict
         rank_scale_copy = copy.copy(self.rank_scale)
@@ -1746,40 +1741,74 @@ class BinaryQuadraticQuantization():
             pw = c1 - c0
 
             # N-bit BQQ on this column group (all bits, batched across row groups)
-            # Residual decomposition: bit by bit on W_work[:, c0:c1]
-            col_residual = W_work[:, c0:c1].clone()
-
-            for bit_idx in range(bit_width):
+            if use_multibqq:
                 col_patches = []
                 for i, (r0, r1) in enumerate(h_ranges):
-                    col_patches.append(col_residual[r0:r1, :].clone())
+                    col_patches.append(W_work[r0:r1, c0:c1].clone())
 
                 x_batch = torch.stack(col_patches)
-                print(f'Col {j}/{num_col_groups}, bit {bit_idx}: '
-                      f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
+                print(f'Col {j}/{num_col_groups}: jointly decomposing {len(col_patches)} '
+                      f'patches of ({col_patches[0].shape[0]}x{pw}) with {bit_width} stacks')
 
-                y_b, z_b, a_b = self.run_bqq_compile_batched(
-                    x_batch, rank_scale=rank_scale_copy,
+                y_mb, z_mb, a_mb = self.run_multibqq_compile_batched(
+                    x_batch, num_stack=bit_width, rank_scale=rank_scale_copy,
                     zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                     Nstep=Nstep, device_id=main_gpu_id, seed=seed
                 )
 
                 for b_idx, (r0, r1) in enumerate(h_ranges):
-                    yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
-                    bit_reconst = (coeff[0] * yb @ zb
-                                  + coeff[1] * yb.sum(dim=1, keepdim=True)
-                                  + coeff[2] * zb.sum(dim=0, keepdim=True)
-                                  + coeff[3])
-                    Wq[r0:r1, c0:c1] += bit_reconst
-                    col_residual[r0:r1, :] -= bit_reconst
+                    for bit_idx in range(bit_width):
+                        yb = y_mb[b_idx, bit_idx].cpu()
+                        zb = z_mb[b_idx, bit_idx].cpu()
+                        coeff = a_mb[b_idx, bit_idx].cpu()
+                        bit_reconst = (coeff[0] * yb @ zb
+                                      + coeff[1] * yb.sum(dim=1, keepdim=True)
+                                      + coeff[2] * zb.sum(dim=0, keepdim=True)
+                                      + coeff[3])
+                        Wq[r0:r1, c0:c1] += bit_reconst
 
-                    all_decomposed.append({
-                        'patch_row': b_idx, 'patch_col': j,
-                        'row_start': r0, 'row_end': r1,
-                        'col_start': c0, 'col_end': c1,
-                        'coeff': coeff, 'mat1': yb, 'mat2': zb,
-                        'bit_idx': bit_idx,
-                    })
+                        all_decomposed.append({
+                            'patch_row': b_idx, 'patch_col': j,
+                            'row_start': r0, 'row_end': r1,
+                            'col_start': c0, 'col_end': c1,
+                            'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                            'bit_idx': bit_idx,
+                        })
+            else:
+                # Residual decomposition: bit by bit on W_work[:, c0:c1]
+                col_residual = W_work[:, c0:c1].clone()
+
+                for bit_idx in range(bit_width):
+                    col_patches = []
+                    for i, (r0, r1) in enumerate(h_ranges):
+                        col_patches.append(col_residual[r0:r1, :].clone())
+
+                    x_batch = torch.stack(col_patches)
+                    print(f'Col {j}/{num_col_groups}, bit {bit_idx}: '
+                          f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
+
+                    y_b, z_b, a_b = self.run_bqq_compile_batched(
+                        x_batch, rank_scale=rank_scale_copy,
+                        zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                        Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                    )
+
+                    for b_idx, (r0, r1) in enumerate(h_ranges):
+                        yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
+                        bit_reconst = (coeff[0] * yb @ zb
+                                      + coeff[1] * yb.sum(dim=1, keepdim=True)
+                                      + coeff[2] * zb.sum(dim=0, keepdim=True)
+                                      + coeff[3])
+                        Wq[r0:r1, c0:c1] += bit_reconst
+                        col_residual[r0:r1, :] -= bit_reconst
+
+                        all_decomposed.append({
+                            'patch_row': b_idx, 'patch_col': j,
+                            'row_start': r0, 'row_end': r1,
+                            'col_start': c0, 'col_end': c1,
+                            'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                            'bit_idx': bit_idx,
+                        })
 
             # Compensation: shift remaining columns
             if c1 < original_w:
@@ -1806,8 +1835,11 @@ class BinaryQuadraticQuantization():
                 col_sum_S_list = [sj.sum(dim=0, keepdim=True) for sj in S_j_list]
 
                 binary_by_patch = _dd(list)
+                entries_by_patch = _dd(list)
                 for p in sorted(all_decomposed, key=lambda pp: (pp['patch_row'], pp['patch_col'], pp['bit_idx'])):
-                    binary_by_patch[(p['patch_row'], p['patch_col'])].append((p['mat1'], p['mat2']))
+                    key = (p['patch_row'], p['patch_col'])
+                    binary_by_patch[key].append((p['mat1'], p['mat2']))
+                    entries_by_patch[key].append(p)
 
                 n_params = num_col_groups * (3 * bit_width + 1)
                 PtP_list, Ptr_list = [], []
@@ -1857,14 +1889,17 @@ class BinaryQuadraticQuantization():
                         theta = theta_batch[i]
                         p2 = 0
                         for j, (c0, c1) in enumerate(w_ranges):
+                            patch_entries = entries_by_patch[(i, j)]
                             for b_idx in range(bit_width):
                                 a_v, b_v, c_v = theta[p2].item(), theta[p2+1].item(), theta[p2+2].item()
                                 p2 += 3
                                 Y_b, Z_b = binary_by_patch[(i, j)][b_idx]
+                                patch_entries[b_idx]['coeff'] = torch.tensor([a_v, b_v, c_v, 0.0], dtype=dtype)
                                 Wq[r0:r1, c0:c1] += (a_v * Y_b.float() @ Z_b.float()
                                     + b_v * Y_b.float().sum(1, keepdim=True)
                                     + c_v * Z_b.float().sum(0, keepdim=True))
                             d_v = theta[p2].item(); p2 += 1
+                            patch_entries[0]['coeff'][3] = d_v
                             Wq[r0:r1, c0:c1] += d_v
                     print(f'  Scale refine done')
                 else:
