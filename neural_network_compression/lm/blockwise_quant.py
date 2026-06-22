@@ -749,7 +749,7 @@ def main():
 
     # Dataset
     parser.add_argument('--dataset', type=str, default='wikitext2',
-                        choices=['wikitext2', 'ptb', 'c4', 'redpajama1t'])
+                        choices=['wikitext2', 'ptb', 'c4', 'redpajama1t', 'slimpajama'])
     parser.add_argument('--nsamples', type=int, default=128)
     parser.add_argument('--seqlen', type=int, default=2048)
 

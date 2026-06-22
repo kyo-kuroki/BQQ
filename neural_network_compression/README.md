@@ -5,6 +5,32 @@ Supports weight-aware quantization, incremental bit-depth extension, model recon
 
 ---
 
+## Quick Start
+
+The standard LM workflow is:
+
+1. `run_blockwise_quant.sh`
+2. `run_fine_tuning.sh`
+
+Minimal example:
+
+```bash
+cd neural_network_compression
+
+MODEL_NAME=Qwen/Qwen3-2B BLOCK_IDX=0 BIT_WIDTH=2 GROUP_SIZE=64 ./run_blockwise_quant.sh
+
+MODEL_NAME=Qwen/Qwen3-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_fine_tuning.sh
+```
+
+Notes:
+
+- `run_blockwise_quant.sh` first runs layerwise quantization for the target block, then blockwise tuning, then assembles the full quantized model.
+- The default calibration dataset in the wrapper script is `slimpajama`.
+- The assembled quantized model is saved under `lm/src/quantized_models/<model>/`.
+- Fine-tuned outputs are saved under `lm/fine_tuned_models/<model>/`.
+
+---
+
 ## Contents
 
 | File | Description |

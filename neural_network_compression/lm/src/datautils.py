@@ -26,6 +26,101 @@ def _load_ptb_split(split):
 
 
 
+def _load_streaming_split(repo_ids, split_candidates):
+    if isinstance(repo_ids, str):
+        repo_ids = [repo_ids]
+    last_exc = None
+    for repo_id in repo_ids:
+        for split in split_candidates:
+            try:
+                return load_dataset(repo_id, split=split, streaming=True)
+            except Exception as exc:
+                last_exc = exc
+    raise RuntimeError(f"Failed to load any split from repos {repo_ids}: {split_candidates}") from last_exc
+
+
+def _extract_text_field(example):
+    for key in ("text", "raw_content", "content"):
+        value = example.get(key) if isinstance(example, dict) else None
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _build_streaming_loader_from_text_iter(
+    dataset_iter,
+    model,
+    *,
+    nsamples=None,
+    seed=0,
+    seqlen=2048,
+    tokenizer=None,
+    batch_size=1,
+    shuffle=True,
+    mask_labels=False,
+):
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
+
+    target_chunks = nsamples if nsamples is not None else 128
+    target_tokens = max(int(target_chunks), 1) * seqlen
+    ids_list = []
+    total_tokens = 0
+
+    for example in dataset_iter:
+        text = _extract_text_field(example)
+        if not text:
+            continue
+        out = tokenizer(text + "\n\n", add_special_tokens=False, return_attention_mask=False)
+        ids = out.get("input_ids", [])
+        if not ids:
+            continue
+        tensor_ids = torch.tensor(ids, dtype=torch.long)
+        ids_list.append(tensor_ids)
+        total_tokens += tensor_ids.numel()
+        if total_tokens >= target_tokens:
+            break
+
+    if not ids_list:
+        raise ValueError("Empty streamed dataset after filtering.")
+
+    input_ids = torch.cat(ids_list, dim=0)
+    num_chunks = input_ids.numel() // seqlen
+    if num_chunks == 0:
+        raise ValueError(f"Not enough streamed tokens to build one chunk of length {seqlen}.")
+
+    input_ids = input_ids[: num_chunks * seqlen]
+    input_ids = input_ids.view(num_chunks, seqlen)
+
+    if nsamples is not None and nsamples < num_chunks:
+        random.seed(seed)
+        indices = random.sample(range(num_chunks), nsamples)
+        input_ids = input_ids[indices]
+
+    tars = input_ids.clone()
+    if mask_labels:
+        tars[:, :-1] = -100
+
+    dataset = TensorDataset(input_ids, tars)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+
+
+def get_slimpajama_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
+    traindata = _load_streaming_split(["DKYoon/SlimPajama-6B", "cerebras/SlimPajama-627B", "MBZUAI-LLM/SlimPajama-627B-DC"], ["train"])
+    return _build_streaming_loader_from_text_iter(
+        traindata, model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+        tokenizer=tokenizer, batch_size=batch_size, shuffle=shuffle, mask_labels=mask_labels,
+    )
+
+
+def get_slimpajama_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1):
+    evaldata = _load_streaming_split(["DKYoon/SlimPajama-6B", "cerebras/SlimPajama-627B", "MBZUAI-LLM/SlimPajama-627B-DC"], ["validation", "test", "train"])
+    return _build_streaming_loader_from_text_iter(
+        evaldata, model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+        tokenizer=tokenizer, batch_size=batch_size, shuffle=False, mask_labels=False,
+    )
+
+
 
 def get_wikitext2_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
     traindata = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
@@ -364,4 +459,27 @@ def get_loaders(
             tokenizer=tokenizer, batch_size=batch_size,
         )
         return train_loader, test_loader
-    raise ValueError(f"Unknown dataset name: {name!r}. Use 'wikitext2', 'ptb', 'c4', or 'redpajama1t'.")
+    if "slimpajama" in name:
+        try:
+            train_loader = get_slimpajama_trainloader(
+                model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+                tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+            )
+            test_loader = get_slimpajama_testloader(
+                model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+                tokenizer=tokenizer, batch_size=batch_size,
+            )
+            return train_loader, test_loader
+        except Exception as exc:
+            print(f"[WARN] SlimPajama loader failed: {exc}")
+            print("[WARN] Falling back to C4.")
+            train_loader = get_c4_trainloader(
+                model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+                tokenizer=tokenizer, batch_size=batch_size, shuffle=True,
+            )
+            test_loader = get_c4_testloader(
+                model, nsamples=nsamples, seed=seed, seqlen=seqlen,
+                tokenizer=tokenizer, batch_size=batch_size,
+            )
+            return train_loader, test_loader
+    raise ValueError(f"Unknown dataset name: {name!r}. Use 'wikitext2', 'ptb', 'c4', 'redpajama1t', or 'slimpajama'.")
