@@ -185,11 +185,12 @@ def collect_block_hessians(
 def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
     """
     Worker spawned by mp.spawn.
-    Quantizes all tasks assigned to GPU `rank` (= cuda:{rank}).
-    gpu_tasks[rank] is the list of tasks for this worker.
+    Quantizes all tasks assigned to worker `rank`.
+    Multiple workers may share one GPU when workers_per_gpu > 1.
     """
     tasks = gpu_tasks[rank]
-    gpu_id = rank
+    n_gpus = common['n_gpus']
+    gpu_id = rank % n_gpus
 
     for task in tasks:
         module_name = task['module_name']
@@ -200,17 +201,17 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
         consolidated_path = Path(task['consolidated_path'])
 
         if tensor_path.exists():
-            print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name}: already exists, skip")
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: already exists, skip")
             continue
 
         weight = task['weight']   # CPU tensor (shared memory)
         H = task.get('H')         # CPU tensor (shared memory) or None
 
         if H is None:
-            print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name}: no Hessian, skip")
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: no Hessian, skip")
             continue
 
-        print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
+        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
 
         quantizer = BinaryQuadraticQuantization(weight, rank_scale=common['rank_scale'])
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
@@ -237,7 +238,7 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ste_refine_log_interval=common['ste_refine_log_interval'],
         )
         torch.save(reconstructed.cpu(), tensor_path)
-        print(f"[GPU{gpu_id}] [{display_idx}/{n_total}] Saved: {tensor_path}")
+        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved: {tensor_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +414,7 @@ def layerwise_quantize_block(
     fix_theta: bool,
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
+    workers_per_gpu: int,
     calibration_loader,
 ):
     """
@@ -448,7 +450,12 @@ def layerwise_quantize_block(
             linear_names.append(name)
     n_total = len(linear_names)
 
-    print(f"Block {block_idx}/{n_blocks-1}: {n_total} Linear targets, {n_gpus} GPU(s)")
+    workers_per_gpu = max(1, int(workers_per_gpu))
+    n_workers = n_gpus * workers_per_gpu
+    print(
+        f"Block {block_idx}/{n_blocks-1}: {n_total} Linear targets, {n_gpus} GPU(s), "
+        f"workers_per_gpu={workers_per_gpu}, total_workers={n_workers}"
+    )
 
     # Collect all Hessians in one forward pass (early exit after block)
     print("Collecting Hessians (single forward pass for all targets in block)...")
@@ -500,10 +507,10 @@ def layerwise_quantize_block(
         if task['H'] is not None:
             task['H'].share_memory_()
 
-    # Distribute tasks round-robin across GPUs
-    gpu_tasks: List[List[dict]] = [[] for _ in range(n_gpus)]
+    # Distribute tasks round-robin across worker slots.
+    gpu_tasks: List[List[dict]] = [[] for _ in range(n_workers)]
     for i, task in enumerate(todo):
-        gpu_tasks[i % n_gpus].append(task)
+        gpu_tasks[i % n_workers].append(task)
 
     common = dict(
         group_size=group_size,
@@ -523,12 +530,13 @@ def layerwise_quantize_block(
         fix_theta=fix_theta,
         row_group_batch_size=row_group_batch_size,
         use_multibqq=use_multibqq,
+        n_gpus=n_gpus,
     )
 
-    if n_gpus == 1:
+    if n_workers == 1:
         _quantize_block_worker(0, gpu_tasks, common)
     else:
-        mp.spawn(_quantize_block_worker, args=(gpu_tasks, common), nprocs=n_gpus, join=True)
+        mp.spawn(_quantize_block_worker, args=(gpu_tasks, common), nprocs=n_workers, join=True)
 
     print(f"\nDone. Block {block_idx} output: {save_dir}")
 
@@ -576,6 +584,8 @@ def main():
                         help='Keep STE threshold theta fixed at 0.5')
     parser.add_argument('--row_group_batch_size', type=int, default=None,
                         help='Batch size over independent row groups during STE refinement')
+    parser.add_argument('--workers_per_gpu', type=int, default=1,
+                        help='Number of parallel block-level quantization workers to launch per GPU')
 
     # Dataset
     parser.add_argument('--dataset', type=str, default='wikitext2',
@@ -662,6 +672,7 @@ def main():
             fix_theta=args.fix_theta,
             row_group_batch_size=args.row_group_batch_size,
             use_multibqq=args.use_multibqq,
+            workers_per_gpu=args.workers_per_gpu,
             calibration_loader=train_loader,
         )
         if args.assemble_full_model:
