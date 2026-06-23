@@ -20,12 +20,18 @@ except ImportError:
     from compressed_data import BQQ_ROOT, default_results_dir
     from datautils import get_wikitext2_testloader, get_c4_testloader
 
-# Ensure bqq_modules is importable (needed for torch.load of BQQ models)
-_src_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'bqqkernel')
-if _src_dir not in sys.path:
-    sys.path.insert(0, _src_dir)
+# Ensure repository root and bqqkernel are importable (needed for torch.load of BQQ models)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..', '..', '..'))
+_BQQKERNEL_DIR = os.path.join(_REPO_ROOT, 'neural_network_compression', 'bqqkernel')
+for _path in (_REPO_ROOT, _BQQKERNEL_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 import neural_network_compression.bqqkernel.bqq_modules as bqq_modules  # noqa: F401
-from build_bqq_model import dequantize_bqq_model, load_bqq_as_fp
+try:
+    from .build_bqq_model import dequantize_bqq_model, load_bqq_as_fp
+except ImportError:
+    from build_bqq_model import dequantize_bqq_model, load_bqq_as_fp
 
 
 WORKSPACE_ROOT = BQQ_ROOT.parent
@@ -247,11 +253,11 @@ def main():
         print("Loading model:", args.model_name)
         if args.model_path is None:
             model = AutoModelForCausalLM.from_pretrained(
-                args.model_name, device_map="auto", attn_implementation="flash_attention_2"
+                args.model_name, attn_implementation="flash_attention_2"
             )
         else:
             try:
-                model = load_bqq_as_fp(args.model_path, args.model_name)
+                model = load_bqq_as_fp(args.model_path, args.model_name, device_map=None)
             except Exception:
                 model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
         model.eval()
@@ -272,11 +278,11 @@ def main():
 
     if args.model_path is None:
         model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, device_map="auto", attn_implementation="flash_attention_2"
+            args.model_name, attn_implementation="flash_attention_2"
         )
     else:
         try:
-            model = load_bqq_as_fp(args.model_path, args.model_name)
+            model = load_bqq_as_fp(args.model_path, args.model_name, device_map=None)
         except Exception:
             model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 

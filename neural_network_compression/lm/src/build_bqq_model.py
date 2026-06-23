@@ -143,6 +143,7 @@ def load_bqq_as_fp(
     model_name: str,
     dtype: torch.dtype = torch.bfloat16,
     attn_implementation: str = "flash_attention_2",
+    device_map=None,
 ) -> nn.Module:
     """Load a BQQ .pth, dequantize to FP weights, and rebuild as a fresh HF model
     with the requested attn_implementation (e.g. flash_attention_2) for full-speed eval.
@@ -158,12 +159,23 @@ def load_bqq_as_fp(
     del src
     gc.collect()
 
-    fresh = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=dtype,
-        attn_implementation=attn_implementation,
-        device_map="auto",
-    )
+    try:
+        fresh = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+            device_map=device_map,
+        )
+    except Exception as exc:
+        if attn_implementation != "flash_attention_2":
+            raise
+        print(f"[load_bqq_as_fp] flash_attention_2 unavailable: {exc}")
+        print("[load_bqq_as_fp] Falling back to default attention implementation.")
+        fresh = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            device_map=device_map,
+        )
     missing, unexpected = fresh.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[load_bqq_as_fp] {len(missing)} missing keys (e.g. {missing[:3]})")
@@ -192,8 +204,8 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
     output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs.pth"
     torch.save(model, output_path)
 
-    for name, param in model.named_parameters():
-        print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
+    # for name, param in model.named_parameters():
+    #     print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
 
     print(f"Saved quantized model to {output_path}")
     return output_path

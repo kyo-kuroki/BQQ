@@ -181,6 +181,10 @@ def ensure_layerwise_block_available(
     device,
     refine_coeffs_only=False,
     fix_theta=False,
+    optimizer_name='adamw',
+    momentum=0.0,
+    binary_lr=None,
+    continuous_lr=None,
 ):
     """Generate missing layerwise quantization results for a block on demand."""
     layerwise_dir = Path(layerwise_dir)
@@ -318,7 +322,8 @@ def compute_block_mse(block, inputs_cache, targets_cache, device):
 
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
-                          epochs, lr, device, max_grad_norm=1.0):
+                          epochs, lr, device, max_grad_norm=1.0, optimizer_name='adamw', momentum=0.0,
+                          binary_lr=None, continuous_lr=None):
     """
     Optimize all trainable parameters in block to minimize
     ||block(cached_input) - pretrained_output||^2.
@@ -335,17 +340,35 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
     block.to(device)
     block.eval()  # keep eval mode (no dropout noise)
 
-    params = [p for p in block.parameters() if p.requires_grad]
+    named_params = [(name, p) for name, p in block.named_parameters() if p.requires_grad]
+    params = [p for _, p in named_params]
     n_params = sum(p.numel() for p in params)
+    binary_lr_value = lr if binary_lr is None else binary_lr
+    continuous_lr_value = lr if continuous_lr is None else continuous_lr
+    binary_params = [p for name, p in named_params if name.lower().endswith('y_fp') or name.lower().endswith('z_fp')]
+    continuous_params = [p for name, p in named_params if not (name.lower().endswith('y_fp') or name.lower().endswith('z_fp'))]
     print(f'    Optimizing {len(params)} param groups ({n_params:,} elements), '
-          f'lr={lr}, epochs={epochs}, max_grad_norm={max_grad_norm}')
+          f'optimizer={optimizer_name}, lr={lr}, binary_lr={binary_lr_value}, continuous_lr={continuous_lr_value}, '
+          f'momentum={momentum}, epochs={epochs}, max_grad_norm={max_grad_norm}')
 
-    optimizer = torch.optim.AdamW(params, lr=lr)
+    param_groups = []
+    if continuous_params:
+        param_groups.append({'params': continuous_params, 'lr': continuous_lr_value})
+    if binary_params:
+        param_groups.append({'params': binary_params, 'lr': binary_lr_value})
+
+    optimizer_name = optimizer_name.lower()
+    if optimizer_name == 'adamw':
+        optimizer = torch.optim.AdamW(param_groups)
+    elif optimizer_name == 'sgd':
+        optimizer = torch.optim.SGD(param_groups, momentum=momentum)
+    else:
+        raise ValueError(f'Unsupported optimizer_name={optimizer_name!r}. Use adamw or sgd.')
 
     best_mse = float('inf')
     best_state = None
 
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc='Blockwise optimization', unit='epoch'):
         total_loss = 0.0
         for inp, target in zip(inputs_cache, targets_cache):
             with torch.enable_grad():
@@ -439,6 +462,10 @@ def quantize_block(
     layerwise_dir,
     refine_coeffs_only=False,
     fix_theta=False,
+    optimizer_name='adamw',
+    momentum=0.0,
+    binary_lr=None,
+    continuous_lr=None,
 ):
     """
     Load a block from precomputed layerwise BQQ patches, then optimize the
@@ -492,6 +519,8 @@ def quantize_block(
     optimize_block_params(
         block, inputs_cache, targets_cache,
         epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+        optimizer_name=optimizer_name, momentum=momentum,
+        binary_lr=binary_lr, continuous_lr=continuous_lr,
     )
 
     final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
@@ -756,6 +785,14 @@ def main():
     # Optimization
     parser.add_argument('--epochs', type=int, default=5)
     parser.add_argument('--lr', type=float, default=1e-5)
+    parser.add_argument('--binary_lr', type=float, default=None,
+                        help='Learning rate for trainable binary factors Y/Z during blockwise tuning')
+    parser.add_argument('--continuous_lr', type=float, default=None,
+                        help='Learning rate for continuous parameters during blockwise tuning')
+    parser.add_argument('--optimizer', type=str, default='adamw', choices=['adamw', 'sgd'],
+                        help='Optimizer used for blockwise tuning')
+    parser.add_argument('--momentum', type=float, default=0.0,
+                        help='Momentum used when --optimizer sgd')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
 
@@ -826,6 +863,10 @@ def main():
         seed=args.seed,
         epochs=args.epochs,
         lr=args.lr,
+        binary_lr=args.binary_lr,
+        continuous_lr=args.continuous_lr,
+        optimizer_name=args.optimizer,
+        momentum=args.momentum,
         max_grad_norm=args.max_grad_norm,
         device=args.device,
         save_dir=args.save_dir,

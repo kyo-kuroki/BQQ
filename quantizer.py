@@ -1202,7 +1202,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1229,6 +1229,8 @@ class BinaryQuadraticQuantization():
                     weight_decay=ste_refine_weight_decay,
                     device_id=main_gpu_id,
                     optimize_factors=ste_refine_optimize_factors,
+                    factors_lr=ste_refine_binary_lr,
+                    continuous_lr=ste_refine_continuous_lr,
                     optimize_coeffs=ste_refine_optimize_coeffs,
                     optimize_theta=ste_refine_optimize_theta,
                     row_group_batch_size=ste_refine_row_group_batch_size,
@@ -1496,6 +1498,8 @@ class BinaryQuadraticQuantization():
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        factors_lr=None,
+        continuous_lr=None,
         row_group_batch_size=None,
         consolidated_path=None,
         log_interval=20,
@@ -1536,11 +1540,21 @@ class BinaryQuadraticQuantization():
         W_target = W_target.to(device)
         H_mat = H_mat.to(device)
 
-        params = [p for p in module.parameters() if p.requires_grad]
-        if len(params) == 0:
+        named_params = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
+        if len(named_params) == 0:
             raise ValueError('No trainable parameters selected for refinement')
 
-        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+        binary_lr = lr if factors_lr is None else factors_lr
+        continuous_lr_value = lr if continuous_lr is None else continuous_lr
+        binary_params = [p for name, p in named_params if name.startswith('y_fp_') or name.startswith('z_fp_')]
+        continuous_params = [p for name, p in named_params if not (name.startswith('y_fp_') or name.startswith('z_fp_'))]
+        param_groups = []
+        if continuous_params:
+            param_groups.append({'params': continuous_params, 'lr': continuous_lr_value, 'weight_decay': weight_decay})
+        if binary_params:
+            param_groups.append({'params': binary_params, 'lr': binary_lr, 'weight_decay': weight_decay})
+
+        optimizer = torch.optim.AdamW(param_groups)
         history = []
         best_loss = float('inf')
         best_step = -1
@@ -1559,14 +1573,14 @@ class BinaryQuadraticQuantization():
                 Wq_batch, row_ranges = module.reconstruct_row_group_batch(patch_rows)
                 target_batch = torch.stack([W_target[r0:r1, :] for r0, r1 in row_ranges], dim=0)
                 diff_batch = target_batch - Wq_batch
-                loss = torch.sum((diff_batch @ H_mat) * diff_batch)
+                loss = torch.sum((diff_batch @ H_mat) * diff_batch) / diff_batch.numel()
                 loss.backward()
                 optimizer.step()
 
             with torch.no_grad():
                 Wq_eval = module.reconstruct_weight()
                 diff_eval = W_target - Wq_eval
-                loss_value = torch.sum((diff_eval @ H_mat) * diff_eval).detach().cpu().item()
+                loss_value = (torch.sum((diff_eval @ H_mat) * diff_eval) / diff_eval.numel()).detach().cpu().item()
             history.append(loss_value)
 
             if loss_value < best_loss:
@@ -1609,6 +1623,8 @@ class BinaryQuadraticQuantization():
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        factors_lr=None,
+        continuous_lr=None,
         row_group_batch_size=None,
         consolidated_path=None,
         log_interval=20,
@@ -1686,6 +1702,8 @@ class BinaryQuadraticQuantization():
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            factors_lr=factors_lr,
+            continuous_lr=continuous_lr,
             row_group_batch_size=row_group_batch_size,
             consolidated_path=consolidated_path,
             log_interval=log_interval,
@@ -1748,7 +1766,8 @@ class BinaryQuadraticQuantization():
         w_ranges = compute_patch_ranges(original_w, max_patch_size)
 
         x_tensor = torch.tensor(x_copy).float()
-        H = H.float()
+        # Keep Hessian on the same device as W_work to avoid cpu/cuda mixing during compensation.
+        H = H.to(dtype=torch.float32, device=x_tensor.device)
         num_col_groups = len(w_ranges)
 
         all_decomposed = []

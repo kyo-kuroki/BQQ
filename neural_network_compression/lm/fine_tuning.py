@@ -27,6 +27,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 from transformers.data.data_collator import _torch_collate_batch, pad_without_fast_tokenizer_warning
 from trl import SFTConfig, SFTTrainer
+from transformers import Trainer
 
 try:
     from .src.compressed_data import default_quantized_model_dir, model_basename
@@ -73,7 +74,42 @@ class SafeDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
 # Distillation Trainer (SFT + KL)
 # ---------------------------------------------------------------------------
 
-class DistillationTrainer(SFTTrainer):
+class BQQLearningRateTrainer(SFTTrainer):
+    def __init__(self, *args, binary_learning_rate=None, continuous_learning_rate=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.binary_learning_rate = binary_learning_rate
+        self.continuous_learning_rate = continuous_learning_rate
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        named_params = [(name, p) for name, p in self.model.named_parameters() if p.requires_grad]
+        if not named_params:
+            return super().create_optimizer()
+
+        base_lr = self.args.learning_rate
+        binary_lr = base_lr if self.binary_learning_rate is None else self.binary_learning_rate
+        continuous_lr = base_lr if self.continuous_learning_rate is None else self.continuous_learning_rate
+        binary_params = [p for name, p in named_params if name.lower().endswith('y_fp') or name.lower().endswith('z_fp')]
+        continuous_params = [p for name, p in named_params if not (name.lower().endswith('y_fp') or name.lower().endswith('z_fp'))]
+        param_groups = []
+        if continuous_params:
+            param_groups.append({'params': continuous_params, 'lr': continuous_lr, 'weight_decay': self.args.weight_decay})
+        if binary_params:
+            param_groups.append({'params': binary_params, 'lr': binary_lr, 'weight_decay': self.args.weight_decay})
+
+        if hasattr(Trainer, 'get_optimizer_cls_and_kwargs'):
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+            optimizer_kwargs = dict(optimizer_kwargs)
+            optimizer_kwargs.pop('params', None)
+            self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+        else:
+            self.optimizer = torch.optim.AdamW(param_groups, lr=base_lr, weight_decay=self.args.weight_decay)
+        return self.optimizer
+
+
+class DistillationTrainer(BQQLearningRateTrainer):
     """SFTTrainer with optional KL distillation loss against a teacher model."""
 
     def __init__(self, teacher_model: Optional[nn.Module] = None,
@@ -139,6 +175,8 @@ def train(
     optimize_bqq_factors: bool = True,
     optimize_bqq_coeffs: bool = True,
     optimize_bqq_theta: bool = True,
+    binary_learning_rate: Optional[float] = None,
+    continuous_learning_rate: Optional[float] = None,
 ):
     model = torch.load(model_path, weights_only=False, map_location="cpu")
     model = convert_binaryquadratic_model_to_ste(
@@ -187,6 +225,8 @@ def train(
         eval_dataset=test_dataset,
         processing_class=tokenizer,
         data_collator=SafeDataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False),
+        binary_learning_rate=binary_learning_rate,
+        continuous_learning_rate=continuous_learning_rate,
     )
     if teacher_model is not None:
         trainer_kwargs.update(
@@ -233,6 +273,10 @@ def main():
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--binary_learning_rate", type=float, default=None,
+                        help="Learning rate for trainable binary factors Y/Z during fine-tuning")
+    parser.add_argument("--continuous_learning_rate", type=float, default=None,
+                        help="Learning rate for continuous parameters during fine-tuning")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=512)
     # Distillation
@@ -286,6 +330,8 @@ def main():
         optimize_bqq_factors=not args.refine_coeffs_only,
         optimize_bqq_coeffs=True,
         optimize_bqq_theta=not args.fix_theta,
+        binary_learning_rate=args.binary_learning_rate,
+        continuous_learning_rate=args.continuous_learning_rate,
     )
 
 

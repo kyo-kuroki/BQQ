@@ -228,6 +228,8 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ste_refine_steps=common['ste_refine_steps'],
             ste_refine_lr=common['ste_refine_lr'],
             ste_refine_weight_decay=common['ste_refine_weight_decay'],
+            ste_refine_binary_lr=common['ste_refine_binary_lr'],
+            ste_refine_continuous_lr=common['ste_refine_continuous_lr'],
             ste_refine_optimize_factors=not common['refine_coeffs_only'],
             ste_refine_optimize_coeffs=True,
             ste_refine_optimize_theta=not common['fix_theta'],
@@ -270,6 +272,8 @@ def layerwise_quantize(
     ste_refine_steps: int,
     ste_refine_lr: float,
     ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
     ste_refine_log_interval: int,
     refine_coeffs_only: bool,
     fix_theta: bool,
@@ -366,6 +370,8 @@ def layerwise_quantize(
             ste_refine_steps=ste_refine_steps,
             ste_refine_lr=ste_refine_lr,
             ste_refine_weight_decay=ste_refine_weight_decay,
+            ste_refine_binary_lr=ste_refine_binary_lr,
+            ste_refine_continuous_lr=ste_refine_continuous_lr,
             ste_refine_optimize_factors=not refine_coeffs_only,
             ste_refine_optimize_coeffs=True,
             ste_refine_optimize_theta=not fix_theta,
@@ -400,6 +406,8 @@ def layerwise_quantize_block(
     ste_refine_steps: int,
     ste_refine_lr: float,
     ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
     ste_refine_log_interval: int,
     refine_coeffs_only: bool,
     fix_theta: bool,
@@ -508,6 +516,8 @@ def layerwise_quantize_block(
         ste_refine_steps=ste_refine_steps,
         ste_refine_lr=ste_refine_lr,
         ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_binary_lr=ste_refine_binary_lr,
+        ste_refine_continuous_lr=ste_refine_continuous_lr,
         ste_refine_log_interval=ste_refine_log_interval,
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
@@ -546,12 +556,18 @@ def main():
     parser.add_argument('--scale_refine', action='store_true',
                         help='Apply inter-bit scale refinement after intra-layer compensation')
     parser.add_argument('--damping', type=float, default=1e-6)
-    parser.add_argument('--use_multibqq', action='store_true',
-                        help='Jointly optimize all bits per column group with run_multibqq_compile_batched')
+    parser.add_argument('--use_multibqq', dest='use_multibqq', action='store_true', default=True,
+                        help='Jointly optimize all bits per column group with run_multibqq_compile_batched (default: enabled)')
+    parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false',
+                        help='Disable joint multibqq optimization and quantize bits sequentially')
 
     # STE refinement
     parser.add_argument('--ste_refine_steps', type=int, default=1000)
     parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
+    parser.add_argument('--ste_refine_binary_lr', type=float, default=None,
+                        help='Learning rate for STE binary factors Y/Z during layerwise refinement')
+    parser.add_argument('--ste_refine_continuous_lr', type=float, default=None,
+                        help='Learning rate for continuous parameters (coeff/theta) during layerwise refinement')
     parser.add_argument('--ste_refine_weight_decay', type=float, default=0.0)
     parser.add_argument('--ste_refine_log_interval', type=int, default=20)
     parser.add_argument('--refine_coeffs_only', action='store_true',
@@ -639,6 +655,8 @@ def main():
             ste_refine_steps=args.ste_refine_steps,
             ste_refine_lr=args.ste_refine_lr,
             ste_refine_weight_decay=args.ste_refine_weight_decay,
+            ste_refine_binary_lr=args.ste_refine_binary_lr,
+            ste_refine_continuous_lr=args.ste_refine_continuous_lr,
             ste_refine_log_interval=args.ste_refine_log_interval,
             refine_coeffs_only=args.refine_coeffs_only,
             fix_theta=args.fix_theta,
@@ -673,6 +691,8 @@ def main():
         ste_refine_steps=args.ste_refine_steps,
         ste_refine_lr=args.ste_refine_lr,
         ste_refine_weight_decay=args.ste_refine_weight_decay,
+        ste_refine_binary_lr=args.ste_refine_binary_lr,
+        ste_refine_continuous_lr=args.ste_refine_continuous_lr,
         ste_refine_log_interval=args.ste_refine_log_interval,
         refine_coeffs_only=args.refine_coeffs_only,
         fix_theta=args.fix_theta,
