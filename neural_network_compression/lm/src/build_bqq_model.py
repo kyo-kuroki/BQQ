@@ -27,8 +27,14 @@ import os
 import sys
 from pathlib import Path
 
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..', '..', '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import torch
 import torch.nn as nn
+import dill
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM
 
@@ -52,6 +58,11 @@ except ImportError:
         load_layer_patches,
         model_basename,
     )
+
+try:
+    from .model_loader import get_decoder_num_layers, set_decoder_layer
+except ImportError:
+    from model_loader import get_decoder_num_layers, set_decoder_layer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
 from neural_network_compression.bqqkernel.bqq_modules import (  # noqa: F401
@@ -153,7 +164,7 @@ def load_bqq_as_fp(
     """
     import gc
 
-    src = torch.load(model_path, weights_only=False, map_location="cpu")
+    src = torch.load(model_path, weights_only=False, map_location="cpu", pickle_module=dill)
     src = dequantize_bqq_model(src, dtype=dtype)
     state_dict = src.state_dict()
     del src
@@ -202,7 +213,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
 
     model_id = model_basename(model_name)
     output_path = output_dir / f"{model_id}-{bit_width}bit-{group_size}gs.pth"
-    torch.save(model, output_path)
+    torch.save(model, output_path, pickle_module=dill)
 
     # for name, param in model.named_parameters():
     #     print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
@@ -224,15 +235,15 @@ def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None,
 
     print(f"Loading base model: {model_name}")
     model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto")
-    num_layers = len(model.model.layers)
+    num_layers = get_decoder_num_layers(model)
 
     replaced = 0
     for i in range(num_layers):
         block_path = block_dir / f"block_{i}.pth"
         if block_path.exists():
             print(f"  Loading block {i} from {block_path}")
-            block = torch.load(block_path, map_location="cpu", weights_only=False)
-            model.model.layers[i] = block
+            block = torch.load(block_path, map_location="cpu", weights_only=False, pickle_module=dill)
+            set_decoder_layer(model, i, block)
             replaced += 1
 
     if replaced == 0:
@@ -258,7 +269,7 @@ def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None,
     if pack:
         suffix += "-packed"
     output_path = output_dir / f"{model_id}{suffix}.pth"
-    torch.save(model, output_path)
+    torch.save(model, output_path, pickle_module=dill)
 
     for name, param in model.named_parameters():
         print(f"{name:40s} | shape: {tuple(param.shape)} | learnable: {param.requires_grad}")
@@ -280,12 +291,12 @@ def pack_existing_model(input_path, output_path=None):
     output_path = Path(output_path)
 
     print(f"Loading model from {input_path} ...")
-    model = torch.load(input_path, map_location="cpu", weights_only=False)
+    model = torch.load(input_path, map_location="cpu", weights_only=False, pickle_module=dill)
 
     print("Packing BinaryQuadratic layers ...")
     pack_binaryquadratic_model(model)
 
-    torch.save(model, output_path)
+    torch.save(model, output_path, pickle_module=dill)
     print(f"Saved packed model to {output_path}")
 
     size_in = input_path.stat().st_size / 1e9
@@ -303,7 +314,7 @@ def export_hf(bqq_model_path, model_name, output_dir=None):
     from export_hf import export_for_hf
 
     print(f"Loading BQQ model from {bqq_model_path}")
-    bqq_model = torch.load(bqq_model_path, map_location="cpu", weights_only=False)
+    bqq_model = torch.load(bqq_model_path, map_location="cpu", weights_only=False, pickle_module=dill)
     export_for_hf(bqq_model, model_name, output_dir)
 
 

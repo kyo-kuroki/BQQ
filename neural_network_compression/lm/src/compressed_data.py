@@ -36,6 +36,9 @@ def default_quantized_model_dir(model_name: str) -> Path:
 def default_results_dir() -> Path:
     return LM_DIR / "results"
 
+def default_block_io_cache_dir(model_name: str, dataset: str, seqlen: int, nsamples: int) -> Path:
+    return LM_DIR / "block_io_cache" / model_basename(model_name) / f"{dataset}_{seqlen}seqlen_{nsamples}samples"
+
 
 def build_patch_index(weights_dir: str | Path) -> dict[str, list[Path]]:
     weights_path = Path(weights_dir)

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import torch
 import torch.nn as nn
+import dill
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
@@ -175,15 +176,17 @@ def train(
     optimize_bqq_factors: bool = True,
     optimize_bqq_coeffs: bool = True,
     optimize_bqq_theta: bool = True,
+    optimize_bqq_beta: bool = True,
     binary_learning_rate: Optional[float] = None,
     continuous_learning_rate: Optional[float] = None,
 ):
-    model = torch.load(model_path, weights_only=False, map_location="cpu")
+    model = torch.load(model_path, weights_only=False, map_location="cpu", pickle_module=dill)
     model = convert_binaryquadratic_model_to_ste(
         model,
         optimize_factors=optimize_bqq_factors,
         optimize_coeffs=optimize_bqq_coeffs,
         optimize_theta=optimize_bqq_theta,
+        optimize_beta=optimize_bqq_beta,
     )
 
     training_args = SFTConfig(
@@ -254,7 +257,7 @@ def train(
     else:
         suffix = "finetuned"
     output_path = Path(output_dir) / f"{input_stem}-{suffix}.pth"
-    torch.save(trained_model, output_path)
+    torch.save(trained_model, output_path, pickle_module=dill)
 
     print(f"Training complete! Saved model to {output_path}")
 
@@ -293,6 +296,8 @@ def main():
                         help="Freeze BQQ binary factors and only optimize coefficients/bias")
     parser.add_argument("--fix_theta", action="store_true",
                         help="Keep BQQ STE thresholds fixed at 0.5 during fine-tuning")
+    parser.add_argument("--fix_beta", action="store_true",
+                        help="Keep BQQ STE sigmoid temperatures fixed during fine-tuning")
 
     args = parser.parse_args()
 
@@ -330,6 +335,7 @@ def main():
         optimize_bqq_factors=not args.refine_coeffs_only,
         optimize_bqq_coeffs=True,
         optimize_bqq_theta=not args.fix_theta,
+        optimize_bqq_beta=not args.fix_beta,
         binary_learning_rate=args.binary_learning_rate,
         continuous_learning_rate=args.continuous_learning_rate,
     )

@@ -14,9 +14,32 @@ FINETUNE_BINARY_LR="${FINETUNE_BINARY_LR:-1e-3}"
 FINETUNE_CONTINUOUS_LR="${FINETUNE_CONTINUOUS_LR:-1e-4}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 MAX_SEQ_LENGTH="${MAX_SEQ_LENGTH:-512}"
+FINETUNE_FIX_THETA="${FINETUNE_FIX_THETA:-0}"
+FINETUNE_FIX_BETA="${FINETUNE_FIX_BETA:-0}"
 
 MODEL_BASENAME="${MODEL_NAME##*/}"
 MODEL_PATH="${MODEL_PATH:-${LM_DIR}/src/quantized_models/${MODEL_BASENAME}/${MODEL_BASENAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-blockwise.pth}"
 OUTPUT_DIR="${OUTPUT_DIR:-${LM_DIR}/fine_tuned_models/${MODEL_BASENAME}}"
 
-python "${LM_DIR}/fine_tuning.py"     --model_name "${MODEL_NAME}"     --model_path "${MODEL_PATH}"     --bit_width "${BIT_WIDTH}"     --group_size "${GROUP_SIZE}"     --num_steps "${FINETUNE_NUM_STEPS}"     --output_dir "${OUTPUT_DIR}"     --num_train_epochs "${FINETUNE_EPOCHS}"     --learning_rate "${FINETUNE_LR}"     --binary_learning_rate "${FINETUNE_BINARY_LR}"     --continuous_learning_rate "${FINETUNE_CONTINUOUS_LR}"     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"     --max_seq_length "${MAX_SEQ_LENGTH}"     "$@"
+cmd=(python "${LM_DIR}/fine_tuning.py"
+  --model_name "${MODEL_NAME}"
+  --model_path "${MODEL_PATH}"
+  --bit_width "${BIT_WIDTH}"
+  --group_size "${GROUP_SIZE}"
+  --num_steps "${FINETUNE_NUM_STEPS}"
+  --output_dir "${OUTPUT_DIR}"
+  --num_train_epochs "${FINETUNE_EPOCHS}"
+  --learning_rate "${FINETUNE_LR}"
+  --binary_learning_rate "${FINETUNE_BINARY_LR}"
+  --continuous_learning_rate "${FINETUNE_CONTINUOUS_LR}"
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
+  --max_seq_length "${MAX_SEQ_LENGTH}")
+
+if [[ "${FINETUNE_FIX_THETA}" == "1" ]]; then
+  cmd+=(--fix_theta)
+fi
+if [[ "${FINETUNE_FIX_BETA}" == "1" ]]; then
+  cmd+=(--fix_beta)
+fi
+cmd+=("$@")
+"${cmd[@]}"

@@ -39,12 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from quantizer import BinaryQuadraticQuantization
 
 try:
-    from .src.model_loader import load_causal_lm
+    from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_layers, get_decoder_num_layers, get_decoder_block_prefix
     from .src.datautils import get_loaders
     from .src.compressed_data import default_compressed_data_dir
     from .src.build_bqq_model import save_bqq_model
 except ImportError:
-    from neural_network_compression.lm.src.model_loader import load_causal_lm
+    from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_layers, get_decoder_num_layers, get_decoder_block_prefix
     from neural_network_compression.lm.src.datautils import get_loaders
     from neural_network_compression.lm.src.compressed_data import default_compressed_data_dir
     from neural_network_compression.lm.src.build_bqq_model import save_bqq_model
@@ -128,8 +128,8 @@ def collect_block_hessians(
 
     Returns dict keyed by full module name (e.g. 'model.layers.3.self_attn.q_proj').
     """
-    block = model.model.layers[block_idx]
-    block_prefix = f"model.layers.{block_idx}"
+    block = get_decoder_layer(model, block_idx)
+    block_prefix = get_decoder_block_prefix(model, block_idx)
 
     H: Dict[str, Optional[torch.Tensor]] = {}
     handles = []
@@ -234,6 +234,7 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ste_refine_optimize_factors=not common['refine_coeffs_only'],
             ste_refine_optimize_coeffs=True,
             ste_refine_optimize_theta=not common['fix_theta'],
+            ste_refine_optimize_beta=not common['fix_beta'],
             ste_refine_row_group_batch_size=common['row_group_batch_size'],
             ste_refine_log_interval=common['ste_refine_log_interval'],
         )
@@ -278,6 +279,7 @@ def layerwise_quantize(
     ste_refine_log_interval: int,
     refine_coeffs_only: bool,
     fix_theta: bool,
+    fix_beta: bool,
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
     calibration_loader,
@@ -376,6 +378,7 @@ def layerwise_quantize(
             ste_refine_optimize_factors=not refine_coeffs_only,
             ste_refine_optimize_coeffs=True,
             ste_refine_optimize_theta=not fix_theta,
+            ste_refine_optimize_beta=not fix_beta,
             ste_refine_row_group_batch_size=row_group_batch_size,
             ste_refine_log_interval=ste_refine_log_interval,
         )
@@ -412,6 +415,7 @@ def layerwise_quantize_block(
     ste_refine_log_interval: int,
     refine_coeffs_only: bool,
     fix_theta: bool,
+    fix_beta: bool,
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
     workers_per_gpu: int,
@@ -436,12 +440,12 @@ def layerwise_quantize_block(
     print(f"Loading model: {model_name}")
     model = load_causal_lm(model_name)
 
-    n_blocks = len(model.model.layers)
+    n_blocks = get_decoder_num_layers(model)
     if block_idx >= n_blocks:
         raise ValueError(f"--block_idx {block_idx} >= n_blocks {n_blocks}")
 
-    block = model.model.layers[block_idx]
-    block_prefix = f"model.layers.{block_idx}"
+    block = get_decoder_layer(model, block_idx)
+    block_prefix = get_decoder_block_prefix(model, block_idx)
 
     # Enumerate quantization targets in this block
     linear_names = []
@@ -528,6 +532,7 @@ def layerwise_quantize_block(
         ste_refine_log_interval=ste_refine_log_interval,
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
+        fix_beta=fix_beta,
         row_group_batch_size=row_group_batch_size,
         use_multibqq=use_multibqq,
         n_gpus=n_gpus,
@@ -582,6 +587,8 @@ def main():
                         help='Only refine coefficients; keep binary factors fixed')
     parser.add_argument('--fix_theta', action='store_true',
                         help='Keep STE threshold theta fixed at 0.5')
+    parser.add_argument('--fix_beta', action='store_true',
+                        help='Keep STE sigmoid temperature beta fixed during layerwise refinement')
     parser.add_argument('--row_group_batch_size', type=int, default=None,
                         help='Batch size over independent row groups during STE refinement')
     parser.add_argument('--workers_per_gpu', type=int, default=1,
@@ -630,7 +637,7 @@ def main():
     # --list_blocks: print block count and exit (no GPU needed)
     if args.list_blocks:
         model = load_causal_lm(args.model_name)
-        print(len(model.model.layers))
+        print(get_decoder_num_layers(model))
         del model
         return
 
@@ -670,6 +677,7 @@ def main():
             ste_refine_log_interval=args.ste_refine_log_interval,
             refine_coeffs_only=args.refine_coeffs_only,
             fix_theta=args.fix_theta,
+            fix_beta=args.fix_beta,
             row_group_batch_size=args.row_group_batch_size,
             use_multibqq=args.use_multibqq,
             workers_per_gpu=args.workers_per_gpu,
@@ -707,6 +715,7 @@ def main():
         ste_refine_log_interval=args.ste_refine_log_interval,
         refine_coeffs_only=args.refine_coeffs_only,
         fix_theta=args.fix_theta,
+        fix_beta=args.fix_beta,
         row_group_batch_size=args.row_group_batch_size,
         use_multibqq=args.use_multibqq,
         calibration_loader=train_loader,

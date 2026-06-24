@@ -19,27 +19,32 @@ import io
 
 
 class BinarySTE01(Function):
-    """Binary {0,1} quantization with learnable threshold and STE."""
+    """Binary {0,1} quantization with learnable threshold and sigmoid STE."""
 
     @staticmethod
-    def forward(ctx, input, theta):
+    def forward(ctx, input, theta, beta):
         centered = input - theta
+        beta_clamped = torch.clamp(beta, min=1e-6)
         output = (centered > 0).to(input.dtype)
-        ctx.save_for_backward(centered)
+        ctx.save_for_backward(centered, beta_clamped)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        (centered,) = ctx.saved_tensors
-        surrogate = 1.0 - torch.tanh(centered).pow(2)
+        centered, beta = ctx.saved_tensors
+        scaled = beta * centered
+        sigma = torch.sigmoid(scaled)
+        sigma_grad = sigma * (1.0 - sigma)
+        surrogate = beta * sigma_grad
         grad_common = grad_output * surrogate
         grad_input = grad_common
         grad_theta = -grad_common
-        return grad_input, grad_theta
+        grad_beta = torch.sum(grad_output * centered * sigma_grad).reshape_as(beta)
+        return grad_input, grad_theta, grad_beta
 
 
 class _BQQSTERefinementModule(nn.Module):
-    def __init__(self, all_decomposed, weight_shape, optimize_factors=True, optimize_coeffs=True, optimize_theta=True):
+    def __init__(self, all_decomposed, weight_shape, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True):
         super().__init__()
         self.weight_shape = tuple(weight_shape)
         self.entries = []
@@ -53,19 +58,25 @@ class _BQQSTERefinementModule(nn.Module):
             y_init = entry['mat1'].float().clone()
             z_init = entry['mat2'].float().clone()
             coeff_init = entry['coeff'].float().clone()
-            y_theta_init = torch.full_like(y_init, 0.5)
-            z_theta_init = torch.full_like(z_init, 0.5)
+            y_theta_init = torch.tensor(0.5, dtype=torch.float32)
+            z_theta_init = torch.tensor(0.5, dtype=torch.float32)
+            y_beta_init = torch.tensor(4.0, dtype=torch.float32)
+            z_beta_init = torch.tensor(4.0, dtype=torch.float32)
 
             y_param = nn.Parameter(y_init, requires_grad=optimize_factors)
             z_param = nn.Parameter(z_init, requires_grad=optimize_factors)
             y_theta = nn.Parameter(y_theta_init, requires_grad=optimize_theta)
             z_theta = nn.Parameter(z_theta_init, requires_grad=optimize_theta)
+            y_beta = nn.Parameter(y_beta_init, requires_grad=optimize_beta)
+            z_beta = nn.Parameter(z_beta_init, requires_grad=optimize_beta)
             coeff_param = nn.Parameter(coeff_init, requires_grad=optimize_coeffs)
 
             self.register_parameter(f'y_fp_{idx}', y_param)
             self.register_parameter(f'z_fp_{idx}', z_param)
             self.register_parameter(f'y_theta_{idx}', y_theta)
             self.register_parameter(f'z_theta_{idx}', z_theta)
+            self.register_parameter(f'y_beta_{idx}', y_beta)
+            self.register_parameter(f'z_beta_{idx}', z_beta)
             self.register_parameter(f'coeff_{idx}', coeff_param)
 
             self.entries.append({
@@ -80,6 +91,8 @@ class _BQQSTERefinementModule(nn.Module):
                 'z_name': f'z_fp_{idx}',
                 'y_theta_name': f'y_theta_{idx}',
                 'z_theta_name': f'z_theta_{idx}',
+                'y_beta_name': f'y_beta_{idx}',
+                'z_beta_name': f'z_beta_{idx}',
                 'coeff_name': f'coeff_{idx}',
             })
 
@@ -109,9 +122,11 @@ class _BQQSTERefinementModule(nn.Module):
                 z_fp = getattr(self, entry['z_name'])
                 y_theta = getattr(self, entry['y_theta_name'])
                 z_theta = getattr(self, entry['z_theta_name'])
+                y_beta = getattr(self, entry['y_beta_name'])
+                z_beta = getattr(self, entry['z_beta_name'])
                 coeff = getattr(self, entry['coeff_name'])
-                Y_q = BinarySTE01.apply(y_fp, y_theta)
-                Z_q = BinarySTE01.apply(z_fp, z_theta)
+                Y_q = BinarySTE01.apply(y_fp, y_theta, y_beta)
+                Z_q = BinarySTE01.apply(z_fp, z_theta, z_beta)
                 patch = (coeff[0] * (Y_q @ Z_q)
                         + coeff[1] * Y_q.sum(dim=1, keepdim=True)
                         + coeff[2] * Z_q.sum(dim=0, keepdim=True)
@@ -130,9 +145,11 @@ class _BQQSTERefinementModule(nn.Module):
             z_fp = getattr(self, entry['z_name'])
             y_theta = getattr(self, entry['y_theta_name'])
             z_theta = getattr(self, entry['z_theta_name'])
+            y_beta = getattr(self, entry['y_beta_name'])
+            z_beta = getattr(self, entry['z_beta_name'])
             coeff = getattr(self, entry['coeff_name'])
-            Y_q = BinarySTE01.apply(y_fp, y_theta)
-            Z_q = BinarySTE01.apply(z_fp, z_theta)
+            Y_q = BinarySTE01.apply(y_fp, y_theta, y_beta)
+            Z_q = BinarySTE01.apply(z_fp, z_theta, z_beta)
             patch = (coeff[0] * (Y_q @ Z_q)
                     + coeff[1] * Y_q.sum(dim=1, keepdim=True)
                     + coeff[2] * Z_q.sum(dim=0, keepdim=True)
@@ -1202,7 +1219,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1233,6 +1250,7 @@ class BinaryQuadraticQuantization():
                     continuous_lr=ste_refine_continuous_lr,
                     optimize_coeffs=ste_refine_optimize_coeffs,
                     optimize_theta=ste_refine_optimize_theta,
+                    optimize_beta=ste_refine_optimize_beta,
                     row_group_batch_size=ste_refine_row_group_batch_size,
                     consolidated_path=consolidated_path,
                     log_interval=ste_refine_log_interval,
@@ -1498,6 +1516,7 @@ class BinaryQuadraticQuantization():
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        optimize_beta=True,
         factors_lr=None,
         continuous_lr=None,
         row_group_batch_size=None,
@@ -1536,6 +1555,7 @@ class BinaryQuadraticQuantization():
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
         ).to(device)
         W_target = W_target.to(device)
         H_mat = H_mat.to(device)
@@ -1623,6 +1643,7 @@ class BinaryQuadraticQuantization():
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        optimize_beta=True,
         factors_lr=None,
         continuous_lr=None,
         row_group_batch_size=None,
@@ -1702,6 +1723,7 @@ class BinaryQuadraticQuantization():
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
             factors_lr=factors_lr,
             continuous_lr=continuous_lr,
             row_group_batch_size=row_group_batch_size,

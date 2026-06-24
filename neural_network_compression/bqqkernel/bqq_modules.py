@@ -56,25 +56,30 @@ class BinaryQuadratic(nn.Module):
 
 
 class BinarySTE01(Function):
-    """Binary {0,1} quantization with learnable threshold and tanh STE."""
+    """Binary {0,1} quantization with learnable threshold and sigmoid STE."""
 
     @staticmethod
-    def forward(ctx, input, theta):
+    def forward(ctx, input, theta, beta):
         centered = input - theta
+        beta_clamped = torch.clamp(beta, min=1e-6)
         output = (centered > 0).to(input.dtype)
-        ctx.save_for_backward(centered)
+        ctx.save_for_backward(centered, beta_clamped)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
-        (centered,) = ctx.saved_tensors
-        surrogate = 1.0 - torch.tanh(centered).pow(2)
+        centered, beta = ctx.saved_tensors
+        scaled = beta * centered
+        sigma = torch.sigmoid(scaled)
+        sigma_grad = sigma * (1.0 - sigma)
+        surrogate = beta * sigma_grad
         grad_common = grad_output * surrogate
-        return grad_common, -grad_common
+        grad_beta = torch.sum(grad_output * centered * sigma_grad).reshape_as(beta)
+        return grad_common, -grad_common, grad_beta
 
 
 class TrainableSTEBinaryQuadratic(nn.Module):
-    """BQQ layer whose binary factors are optimized with elementwise-threshold STE."""
+    """BQQ layer whose binary factors are optimized with scalar-threshold STE."""
 
     def __init__(
         self,
@@ -86,6 +91,7 @@ class TrainableSTEBinaryQuadratic(nn.Module):
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        optimize_beta=True,
         init_theta=0.5,
     ):
         super().__init__()
@@ -101,8 +107,10 @@ class TrainableSTEBinaryQuadratic(nn.Module):
 
         self.Y_fp = nn.Parameter(y_init, requires_grad=optimize_factors)
         self.Z_fp = nn.Parameter(z_init, requires_grad=optimize_factors)
-        self.Y_theta = nn.Parameter(torch.full_like(y_init, float(init_theta)), requires_grad=optimize_theta)
-        self.Z_theta = nn.Parameter(torch.full_like(z_init, float(init_theta)), requires_grad=optimize_theta)
+        self.Y_theta = nn.Parameter(torch.tensor(float(init_theta), dtype=torch.float32), requires_grad=optimize_theta)
+        self.Z_theta = nn.Parameter(torch.tensor(float(init_theta), dtype=torch.float32), requires_grad=optimize_theta)
+        self.Y_beta = nn.Parameter(torch.tensor(4.0, dtype=torch.float32), requires_grad=optimize_beta)
+        self.Z_beta = nn.Parameter(torch.tensor(4.0, dtype=torch.float32), requires_grad=optimize_beta)
         self.a = nn.Parameter(a_init, requires_grad=optimize_coeffs)
         self.b = nn.Parameter(b_init, requires_grad=optimize_coeffs)
         self.c = nn.Parameter(c_init, requires_grad=optimize_coeffs)
@@ -117,6 +125,7 @@ class TrainableSTEBinaryQuadratic(nn.Module):
         optimize_factors=True,
         optimize_coeffs=True,
         optimize_theta=True,
+        optimize_beta=True,
         init_theta=0.5,
     ) -> 'TrainableSTEBinaryQuadratic':
         d_terms = torch.zeros(
@@ -139,12 +148,13 @@ class TrainableSTEBinaryQuadratic(nn.Module):
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
             init_theta=init_theta,
         )
 
     def _quantized_factors(self, dtype):
-        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta).to(dtype)
-        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta).to(dtype)
+        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta, self.Y_beta).to(dtype)
+        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta, self.Z_beta).to(dtype)
         return Y_q, Z_q
 
     def get_weight(self, dtype=torch.float32):
@@ -493,8 +503,8 @@ class PartialBQQLinear(nn.Module):
             self.quantized_mask[i, j] = True
 
     def _bqq_weight(self, dtype: torch.dtype) -> torch.Tensor:
-        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta).to(dtype)
-        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta).to(dtype)
+        Y_q = BinarySTE01.apply(self.Y_fp, self.Y_theta, self.Y_beta).to(dtype)
+        Z_q = BinarySTE01.apply(self.Z_fp, self.Z_theta, self.Z_beta).to(dtype)
         W_core = torch.matmul(Y_q, Z_q)
         Y_sum = Y_q.sum(dim=-1, keepdim=True).to(dtype)
         Z_sum = Z_q.sum(dim=-2, keepdim=True).to(dtype)
@@ -557,6 +567,7 @@ def convert_binaryquadratic_model_to_ste(
     optimize_factors: bool = True,
     optimize_coeffs: bool = True,
     optimize_theta: bool = True,
+    optimize_beta: bool = True,
     init_theta: float = 0.5,
 ) -> nn.Module:
     """Recursively replace BinaryQuadratic layers with TrainableSTEBinaryQuadratic."""
@@ -570,6 +581,7 @@ def convert_binaryquadratic_model_to_ste(
                     optimize_factors=optimize_factors,
                     optimize_coeffs=optimize_coeffs,
                     optimize_theta=optimize_theta,
+                    optimize_beta=optimize_beta,
                     init_theta=init_theta,
                 ),
             )
@@ -579,6 +591,7 @@ def convert_binaryquadratic_model_to_ste(
                 optimize_factors=optimize_factors,
                 optimize_coeffs=optimize_coeffs,
                 optimize_theta=optimize_theta,
+                optimize_beta=optimize_beta,
                 init_theta=init_theta,
             )
     return model
