@@ -484,7 +484,7 @@ def quantize_target(args) -> Path:
     model_name = args.model_name or metadata['model_name']
     save_dir = args.save_dir
     if save_dir is None:
-        save_dir = default_compressed_data_dir(model_name, args.group_size, args.num_steps)
+        save_dir = default_compressed_data_dir(model_name, args.bit_width, args.group_size, args.num_steps)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 

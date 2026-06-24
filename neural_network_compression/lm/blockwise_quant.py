@@ -1524,7 +1524,7 @@ def main():
 
     layerwise_dir = args.layerwise_dir
     if layerwise_dir is None:
-        layerwise_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
+        layerwise_dir = default_compressed_data_dir(args.model_name, args.bit_width, args.group_size, args.num_steps)
 
     if args.progressive:
         if args.progressive_mode == 'patch':

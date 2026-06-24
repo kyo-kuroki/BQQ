@@ -645,7 +645,7 @@ def main():
     save_dir = args.save_dir
     if save_dir is None:
         save_dir = default_compressed_data_dir(
-            args.model_name, args.group_size, args.num_steps)
+            args.model_name, args.bit_width, args.group_size, args.num_steps)
     save_dir = Path(save_dir)
 
     # Data

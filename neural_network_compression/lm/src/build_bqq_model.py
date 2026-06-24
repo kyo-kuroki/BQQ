@@ -383,11 +383,12 @@ def main():
             parser.print_help()
             return
         compressed_data_dir = args.compressed_data_dir
-        if compressed_data_dir is None:
-            compressed_data_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
         for bit_width in args.bit_widths:
+            effective_compressed_data_dir = compressed_data_dir
+            if effective_compressed_data_dir is None:
+                effective_compressed_data_dir = default_compressed_data_dir(args.model_name, bit_width, args.group_size, args.num_steps)
             save_bqq_model(
-                model_name=args.model_name, compressed_data_dir=compressed_data_dir,
+                model_name=args.model_name, compressed_data_dir=effective_compressed_data_dir,
                 bit_width=bit_width, group_size=args.group_size,
                 num_steps=args.num_steps, device=args.device, output_dir=args.output_dir,
             )

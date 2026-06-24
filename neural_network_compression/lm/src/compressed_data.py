@@ -25,8 +25,8 @@ def model_basename(model_name: str) -> str:
     return model_name.rstrip("/").split("/")[-1]
 
 
-def default_compressed_data_dir(model_name: str, group_size: int, num_steps: int) -> Path:
-    return LM_DIR / "bqq_compressed_data" / f"{model_basename(model_name)}-{group_size}gs-{num_steps}step"
+def default_compressed_data_dir(model_name: str, bit_width: int, group_size: int, num_steps: int) -> Path:
+    return LM_DIR / "bqq_compressed_data" / f"{model_basename(model_name)}-{bit_width}bit-{group_size}gs-{num_steps}step"
 
 
 def default_quantized_model_dir(model_name: str) -> Path:
