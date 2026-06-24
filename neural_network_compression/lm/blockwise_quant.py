@@ -27,6 +27,7 @@ import copy
 import os
 import sys
 import tempfile
+import dill
 import torch
 import torch.nn as nn
 from pathlib import Path
@@ -39,13 +40,13 @@ try:
     from .src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from .src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from .src.datautils import get_loaders
-    from .src.model_loader import load_causal_lm
+    from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix
     from .layerwise_quant import layerwise_quantize_block
 except ImportError:
     from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from neural_network_compression.lm.src.datautils import get_loaders
-    from neural_network_compression.lm.src.model_loader import load_causal_lm
+    from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix
     from neural_network_compression.lm.layerwise_quant import layerwise_quantize_block
 
 
@@ -88,7 +89,7 @@ def cache_block_io(model, block_idx, dataloader, device):
     model.eval()
     model.to(device)
 
-    block = model.model.layers[block_idx]
+    block = get_decoder_layer(model, block_idx)
     inputs_cache = []
     targets_cache = []
 
@@ -169,6 +170,7 @@ def ensure_layerwise_block_available(
     *,
     model_name,
     block_idx,
+    block_prefix,
     layerwise_dir,
     bit_width,
     group_size,
@@ -181,6 +183,7 @@ def ensure_layerwise_block_available(
     device,
     refine_coeffs_only=False,
     fix_theta=False,
+    fix_beta=False,
     optimizer_name='adamw',
     momentum=0.0,
     binary_lr=None,
@@ -192,7 +195,7 @@ def ensure_layerwise_block_available(
     linear_names = get_quantizable_linears(block)
     missing = []
     for linear_name in linear_names:
-        full_name = f"model.layers.{block_idx}.{linear_name}.weight"
+        full_name = f"{block_prefix}.{linear_name}.weight"
         if full_name not in patch_index:
             missing.append(full_name)
     if not missing:
@@ -213,11 +216,15 @@ def ensure_layerwise_block_available(
         ste_refine_steps=200,
         ste_refine_lr=1e-3,
         ste_refine_weight_decay=0.0,
+        ste_refine_binary_lr=None,
+        ste_refine_continuous_lr=None,
         ste_refine_log_interval=20,
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
+        fix_beta=fix_beta,
         row_group_batch_size=None,
         use_multibqq=True,
+        workers_per_gpu=1,
         calibration_loader=dataloader,
     )
 
@@ -226,12 +233,14 @@ def load_layerwise_block_from_patches(
     block,
     *,
     block_idx,
+    block_prefix,
     layerwise_dir,
     bit_width,
     trainable_ste=True,
     optimize_factors=True,
     optimize_coeffs=True,
     optimize_theta=True,
+    optimize_beta=True,
 ):
     """Replace all Linear layers in a block from precomputed layerwise BQQ patches."""
     patch_index = build_consolidated_index(layerwise_dir)
@@ -240,7 +249,7 @@ def load_layerwise_block_from_patches(
 
     linear_names = get_quantizable_linears(block)
     for linear_name in linear_names:
-        full_name = f"model.layers.{block_idx}.{linear_name}.weight"
+        full_name = f"{block_prefix}.{linear_name}.weight"
         patch_list = load_layer_patches(full_name, patch_index, map_location='cpu')
         if not patch_list:
             raise FileNotFoundError(f'Missing layerwise patches for {full_name} in {layerwise_dir}')
@@ -253,8 +262,9 @@ def load_layerwise_block_from_patches(
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
         )
-        print(f'  Loaded layerwise BQQ: {full_name}')
+        print(f' Loaded layerwise BQQ: {full_name}')
 
     return linear_names
 
@@ -275,7 +285,7 @@ def _set_submodule(module, dotted_name, new_child):
     setattr(parent, parts[-1], new_child)
 
 
-def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True):
+def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True):
     """Replace a specific Linear in block with a BQQ module."""
     if trainable_ste:
         bqq_module = TrainableSTEBinaryQuadratic(
@@ -283,6 +293,7 @@ def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
         )
     else:
         bqq_module = BinaryQuadratic(Y, Z, A, bias=bias)
@@ -439,6 +450,80 @@ def collect_single_hessian(block, linear_name, inputs_cache, device):
     return H.cpu() if H is not None else None
 
 
+@torch.no_grad()
+def collect_cross_hessians_for_linear(original_block, current_block, linear_name, inputs_cache, device):
+    """Collect X^T X' and X'^T X' for one layer under original/current block states."""
+    original_block.to(device).eval()
+    current_block.to(device).eval()
+
+    original_module = _get_submodule(original_block, linear_name)
+    current_module = _get_submodule(current_block, linear_name)
+
+    captured = {'orig': None, 'cur': None}
+    H_cross = None
+    H_current = None
+
+    def _orig_hook(module, inp, _out):
+        x = inp[0].detach().float()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        captured['orig'] = x
+
+    def _cur_hook(module, inp, _out):
+        x = inp[0].detach().float()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        captured['cur'] = x
+
+    h_orig = original_module.register_forward_hook(_orig_hook)
+    h_cur = current_module.register_forward_hook(_cur_hook)
+    try:
+        for inp in inputs_cache:
+            captured['orig'] = None
+            captured['cur'] = None
+            try:
+                run_block_forward(original_block, inp, device)
+                run_block_forward(current_block, inp, device)
+            except Exception:
+                continue
+
+            x_orig = captured['orig']
+            x_cur = captured['cur']
+            if x_orig is None or x_cur is None:
+                continue
+
+            cross = x_orig.T @ x_cur
+            cur = x_cur.T @ x_cur
+            H_cross = cross if H_cross is None else H_cross.add_(cross)
+            H_current = cur if H_current is None else H_current.add_(cur)
+    finally:
+        h_orig.remove()
+        h_cur.remove()
+
+    if H_cross is None or H_current is None:
+        return None, None
+    return H_cross.cpu(), H_current.cpu()
+
+
+def solve_closed_form_weight(weight, H_cross, H_current, damping=1e-6):
+    """Solve min_W' ||W X - W' X'||_F^2 via a damped closed form."""
+    if H_cross is None or H_current is None:
+        return weight.detach().float().clone()
+
+    W = weight.detach().float()
+    solve_device = W.device
+    H_cross = H_cross.detach().to(device=solve_device, dtype=torch.float32)
+    H_current = H_current.detach().to(device=solve_device, dtype=torch.float32)
+    in_features = H_current.shape[0]
+    eye = torch.eye(in_features, dtype=H_current.dtype, device=solve_device)
+    damp = damping
+    if damping > 0:
+        damp = damping * torch.mean(torch.diag(H_current)).item()
+    H_reg = H_current + damp * eye
+    transform = torch.linalg.solve(H_reg.T, H_cross.T).T
+    return W @ transform
+
+
 def quantize_block(
     model_name,
     block_idx,
@@ -462,6 +547,7 @@ def quantize_block(
     layerwise_dir,
     refine_coeffs_only=False,
     fix_theta=False,
+    fix_beta=False,
     optimizer_name='adamw',
     momentum=0.0,
     binary_lr=None,
@@ -480,11 +566,13 @@ def quantize_block(
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
-    block = copy.deepcopy(model.model.layers[block_idx]).float()
+    block_prefix = get_decoder_block_prefix(model, block_idx)
+    block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
     ensure_layerwise_block_available(
         block,
         model_name=model_name,
         block_idx=block_idx,
+        block_prefix=block_prefix,
         layerwise_dir=layerwise_dir,
         bit_width=bit_width,
         group_size=group_size,
@@ -497,20 +585,25 @@ def quantize_block(
         device=dev,
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
+        fix_beta=fix_beta,
     )
     del model
     torch.cuda.empty_cache()
+
+    use_trainable_ste = (not refine_coeffs_only) and (binary_lr != 0)
 
     print(f'Loading layerwise BQQ patches from: {layerwise_dir}')
     linear_names = load_layerwise_block_from_patches(
         block,
         block_idx=block_idx,
+        block_prefix=block_prefix,
         layerwise_dir=layerwise_dir,
         bit_width=bit_width,
-        trainable_ste=True,
+        trainable_ste=use_trainable_ste,
         optimize_factors=not refine_coeffs_only,
         optimize_coeffs=True,
         optimize_theta=not fix_theta,
+        optimize_beta=not fix_beta,
     )
 
     init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
@@ -531,9 +624,19 @@ def quantize_block(
         if isinstance(layer, TrainableSTEBinaryQuadratic):
             _set_submodule(block, lname, layer.to_binaryquadratic())
 
+    for lname in linear_names:
+        layer = _get_submodule(current_block, lname)
+        if isinstance(layer, TrainableSTEBinaryQuadratic):
+            _set_submodule(current_block, lname, layer.to_binaryquadratic())
+
+    for lname in linear_names:
+        layer = _get_submodule(current_block, lname)
+        if isinstance(layer, TrainableSTEBinaryQuadratic):
+            _set_submodule(current_block, lname, layer.to_binaryquadratic())
+
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(block.cpu(), save_path)
+    torch.save(block.cpu(), save_path, pickle_module=dill)
 
     print(f'\n=== Block {block_idx} done ===')
     print(f'  Initial loaded MSE: {init_mse:.6f}')
@@ -642,7 +745,7 @@ def quantize_block_progressive(
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
-    block = copy.deepcopy(model.model.layers[block_idx]).float()
+    block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
     del model
     torch.cuda.empty_cache()
 
@@ -721,7 +824,7 @@ def quantize_block_progressive(
 
         # b. Block MSE before fine-tuning
         mse_before = compute_block_mse(block, inputs_cache, targets_cache, dev)
-        print(f'  Block MSE after quantizing:   {mse_before:.6f}')
+        print(f' Block MSE after quantizing:   {mse_before:.6f}')
 
         # c. Fine-tune all trainable params (a/b/c/d + float_weight + LayerNorm)
         optimize_block_params(
@@ -744,7 +847,7 @@ def quantize_block_progressive(
     # --- 5. Save ---
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(block.cpu(), save_path)
+    torch.save(block.cpu(), save_path, pickle_module=dill)
 
     final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
     print(f'\n=== Block {block_idx} done ===')
@@ -753,6 +856,155 @@ def quantize_block_progressive(
     print(f'  Saved to: {save_path}')
 
     return block
+
+
+def quantize_block_progressive_closed_form(
+    model_name,
+    block_idx,
+    dataloader,
+    *,
+    bit_width,
+    group_size,
+    num_steps,
+    rank_scale,
+    seed,
+    damping=1e-6,
+    epochs=0,
+    lr=1e-5,
+    max_grad_norm=1.0,
+    optimizer_name='adamw',
+    momentum=0.0,
+    binary_lr=None,
+    continuous_lr=None,
+    tune_after_each_layer=False,
+    use_closed_form=True,
+    fix_theta=False,
+    fix_beta=False,
+    device,
+    save_dir,
+):
+    """Front-to-back layer quantization with closed-form continuous recentering.
+
+    For each layer we observe the original layer input X and the current input X'
+    after previously quantized layers, solve
+
+        min_W' ||W X - W' X'||_F^2
+
+    as
+
+        W' = W (X X'^T) (X' X'^T + λI)^-1
+
+    and then quantize that W' with Hessian-aware BQQ using H = X' X'^T.
+
+    If tune_after_each_layer is True, run block-level gradient descent after each
+    layer quantization for the requested number of epochs.
+
+    If use_closed_form is False, skip the cross-Hessian recentering step and quantize
+    the current float layer directly with H = X'^T X'. This is the layer-tune mode.
+    """
+    dev = torch.device(device)
+    device_id = dev.index if dev.type == 'cuda' else 0
+
+    print(f'Loading model: {model_name}')
+    model = load_causal_lm(model_name)
+
+    print(f'Caching block {block_idx} I/O ...')
+    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
+    print(f'  Cached {len(inputs_cache)} samples')
+
+    original_block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
+    current_block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
+    del model
+    torch.cuda.empty_cache()
+
+    linear_names = get_quantizable_linears(current_block)
+    print(f'\nBlock {block_idx}: {len(linear_names)} quantizable layers -> sequential closed-form progressive')
+
+    init_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+    print(f'Initial block MSE (pretrained): {init_mse:.6f}')
+
+    for layer_idx, lname in enumerate(linear_names, start=1):
+        print(f'\n=== Layer {layer_idx}/{len(linear_names)}: {lname} ===')
+        if use_closed_form:
+            H_cross, H_current = collect_cross_hessians_for_linear(
+                original_block, current_block, lname, inputs_cache, dev
+            )
+            if H_cross is None or H_current is None:
+                raise RuntimeError(f'Failed to collect cross Hessians for {lname}')
+
+            original_linear = _get_submodule(original_block, lname)
+            quant_weight = solve_closed_form_weight(
+                original_linear.weight.data,
+                H_cross,
+                H_current,
+                damping=damping,
+            )
+            bias = original_linear.bias.data.clone().float() if original_linear.bias is not None else None
+        else:
+            H_current = collect_single_hessian(current_block, lname, inputs_cache, dev)
+            if H_current is None:
+                raise RuntimeError(f'Failed to collect current Hessian for {lname}')
+            current_linear = _get_submodule(current_block, lname)
+            quant_weight = current_linear.weight.data.detach().float().clone()
+            bias = current_linear.bias.data.clone().float() if current_linear.bias is not None else None
+
+        A, Y, Z = quantize_weight_to_bqq(
+            quant_weight.cpu(),
+            bit_width=bit_width,
+            group_size=group_size,
+            num_steps=num_steps,
+            rank_scale=rank_scale,
+            seed=seed,
+            device_id=device_id,
+            H=H_current.cpu(),
+            scale_refine=True,
+            damping=damping,
+        )
+        replace_linear_in_block(
+            current_block,
+            lname,
+            A,
+            Y,
+            Z,
+            bias=bias,
+            trainable_ste=(binary_lr != 0),
+            optimize_factors=True,
+            optimize_coeffs=True,
+            optimize_theta=not fix_theta,
+            optimize_beta=not fix_beta,
+        )
+
+        cur_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+        print(f'  Block MSE after quantizing {lname}: {cur_mse:.6f}')
+
+        if tune_after_each_layer and epochs > 0:
+            optimize_block_params(
+                current_block,
+                inputs_cache,
+                targets_cache,
+                epochs=epochs,
+                lr=lr,
+                max_grad_norm=max_grad_norm,
+                device=dev,
+                optimizer_name=optimizer_name,
+                momentum=momentum,
+                binary_lr=binary_lr,
+                continuous_lr=continuous_lr,
+            )
+            tuned_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+            print(f'  Block MSE after tuning {lname}:     {tuned_mse:.6f} (Δ={tuned_mse - cur_mse:+.6f})')
+
+    save_path = Path(save_dir) / f'block_{block_idx}.pth'
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(current_block.cpu(), save_path, pickle_module=dill)
+
+    final_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+    print(f'\n=== Block {block_idx} done ===')
+    print(f'  Initial MSE: {init_mse:.6f}')
+    print(f'  Final MSE:   {final_mse:.6f}')
+    print(f'  Saved to: {save_path}')
+
+    return current_block
 
 
 # ---------------------------------------------------------------------------
@@ -798,13 +1050,20 @@ def main():
 
     # Mode
     parser.add_argument('--progressive', action='store_true',
-                        help='Use progressive patch-wise quantization instead of loading layerwise results')
+                        help='Use a progressive quantization mode instead of loading layerwise results')
+    parser.add_argument('--progressive_mode', type=str, default='patch',
+                        choices=['patch', 'closed-form-layer', 'layer-tune'],
+                        help='Progressive mode: patch = existing patch-wise alternating quantize/tune; '
+                             'closed-form-layer = front-to-back layer quantization with closed-form recentering; '
+                             'layer-tune = front-to-back layer quantization of current float layers with block tuning after each layer')
     parser.add_argument('--layerwise_dir', type=str, default=None,
                         help='Directory containing layerwise quantization outputs. Defaults to the standard layerwise output path.')
     parser.add_argument('--refine_coeffs_only', action='store_true',
                         help='Freeze BQQ binary factors during blockwise optimization')
     parser.add_argument('--fix_theta', action='store_true',
                         help='Keep STE thresholds fixed at 0.5 during blockwise optimization')
+    parser.add_argument('--fix_beta', action='store_true',
+                        help='Keep STE sigmoid temperatures fixed during blockwise optimization')
 
     # Legacy/on-the-fly quantization args (used by progressive mode)
     parser.add_argument('--no_hessian', action='store_true',
@@ -877,9 +1136,35 @@ def main():
         layerwise_dir = default_compressed_data_dir(args.model_name, args.group_size, args.num_steps)
 
     if args.progressive:
-        quantize_block_progressive(**common_kwargs,
-                                   num_rounds=args.num_rounds,
-                                   schedule=args.schedule)
+        if args.progressive_mode == 'patch':
+            quantize_block_progressive(**common_kwargs,
+                                       num_rounds=args.num_rounds,
+                                       schedule=args.schedule)
+        else:
+            quantize_block_progressive_closed_form(
+                model_name=args.model_name,
+                block_idx=args.block_idx,
+                dataloader=train_loader,
+                bit_width=args.bit_width,
+                group_size=args.group_size,
+                num_steps=args.num_steps,
+                rank_scale=args.rank_scale,
+                seed=args.seed,
+                damping=args.damping,
+                epochs=args.epochs,
+                lr=args.lr,
+                max_grad_norm=args.max_grad_norm,
+                optimizer_name=args.optimizer,
+                momentum=args.momentum,
+                binary_lr=args.binary_lr,
+                continuous_lr=args.continuous_lr,
+                tune_after_each_layer=(args.progressive_mode == 'layer-tune'),
+                use_closed_form=(args.progressive_mode == 'closed-form-layer'),
+                fix_theta=args.fix_theta,
+                fix_beta=args.fix_beta,
+                device=args.device,
+                save_dir=args.save_dir,
+            )
     else:
         quantize_block(
             **common_kwargs,
@@ -891,6 +1176,7 @@ def main():
             layerwise_dir=layerwise_dir,
             refine_coeffs_only=args.refine_coeffs_only,
             fix_theta=args.fix_theta,
+            fix_beta=args.fix_beta,
         )
 
     if args.assemble_full_model:

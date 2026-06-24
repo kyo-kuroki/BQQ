@@ -4,8 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LM_DIR="${SCRIPT_DIR}/lm"
 
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-2B}"
-BLOCK_IDX="${BLOCK_IDX:-all}"
+# MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-0.8B}"
+BLOCK_IDX="${BLOCK_IDX:-0}"
 BIT_WIDTH="${BIT_WIDTH:-2}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
@@ -16,15 +17,21 @@ LAYERWISE_STE_WEIGHT_DECAY="${LAYERWISE_STE_WEIGHT_DECAY:-0.0}"
 LAYERWISE_STE_BINARY_LR="${LAYERWISE_STE_BINARY_LR:-1e-3}"
 LAYERWISE_STE_CONTINUOUS_LR="${LAYERWISE_STE_CONTINUOUS_LR:-1e-4}"
 LAYERWISE_STE_LOG_INTERVAL="${LAYERWISE_STE_LOG_INTERVAL:-20}"
-LAYERWISE_WORKERS_PER_GPU="${LAYERWISE_WORKERS_PER_GPU:-2}"
+LAYERWISE_WORKERS_PER_GPU="${LAYERWISE_WORKERS_PER_GPU:-4}"
+LAYERWISE_FIX_THETA="${LAYERWISE_FIX_THETA:-0}"
+LAYERWISE_FIX_BETA="${LAYERWISE_FIX_BETA:-0}"
 
-BLOCKWISE_EPOCHS="${BLOCKWISE_EPOCHS:-5}"
+BLOCKWISE_EPOCHS="${BLOCKWISE_EPOCHS:-1}"
 BLOCKWISE_LR="${BLOCKWISE_LR:-1e-4}"
-BLOCKWISE_BINARY_LR="${BLOCKWISE_BINARY_LR:-1e-3}"
+BLOCKWISE_BINARY_LR="${BLOCKWISE_BINARY_LR:-0}"
 BLOCKWISE_CONTINUOUS_LR="${BLOCKWISE_CONTINUOUS_LR:-1e-4}"
-BLOCKWISE_OPTIMIZER="${BLOCKWISE_OPTIMIZER:-sgd}"
+BLOCKWISE_OPTIMIZER="${BLOCKWISE_OPTIMIZER:-adamw}" # Options: "sgd", "adam", "adamw"
 BLOCKWISE_MOMENTUM="${BLOCKWISE_MOMENTUM:-0.9}"
 BLOCKWISE_MAX_GRAD_NORM="${BLOCKWISE_MAX_GRAD_NORM:-1.0}"
+BLOCKWISE_FIX_THETA="${BLOCKWISE_FIX_THETA:-0}"
+BLOCKWISE_FIX_BETA="${BLOCKWISE_FIX_BETA:-0}"
+PROGRESSIVE="${PROGRESSIVE:-1}" # Options: "0" (disabled), "1" (enabled)
+PROGRESSIVE_MODE="${PROGRESSIVE_MODE:-layer-tune}"  # Options: "layer-tune", "closed-form-layer", "patch"
 
 DATASET="${DATASET:-slimpajama}"
 NSAMPLES="${NSAMPLES:-1024}"
@@ -42,66 +49,128 @@ run_one_block() {
   local should_assemble="$2"
   shift 2
 
+  local runtime_device="${RUNTIME_DEVICE:-${DEVICE}}"
   local assemble_args=(--no_assemble_full_model)
   if [[ "${should_assemble}" == "1" ]]; then
     assemble_args=(--assembled_output_dir "${ASSEMBLED_OUTPUT_DIR}")
   fi
 
-  python "${LM_DIR}/layerwise_quant.py" \
-    --model_name "${MODEL_NAME}" \
-    --block_idx "${block_idx}" \
-    --bit_width "${BIT_WIDTH}" \
-    --group_size "${GROUP_SIZE}" \
-    --num_steps "${LAYERWISE_ANNEAL_STEPS}" \
-    --ste_refine_steps "${LAYERWISE_STE_STEPS}" \
-    --ste_refine_lr "${LAYERWISE_STE_LR}" \
-    --ste_refine_binary_lr "${LAYERWISE_STE_BINARY_LR}" \
-    --ste_refine_continuous_lr "${LAYERWISE_STE_CONTINUOUS_LR}" \
-    --ste_refine_weight_decay "${LAYERWISE_STE_WEIGHT_DECAY}" \
-    --ste_refine_log_interval "${LAYERWISE_STE_LOG_INTERVAL}" \
-    --workers_per_gpu "${LAYERWISE_WORKERS_PER_GPU}" \
-    --dataset "${DATASET}" \
-    --nsamples "${NSAMPLES}" \
-    --seqlen "${SEQLEN}" \
-    --seed "${SEED}" \
-    --save_dir "${LAYERWISE_DIR}" \
-    "${assemble_args[@]}"
+  if [[ "${PROGRESSIVE}" != "1" ]]; then
+    local layerwise_cmd=(
+      python "${LM_DIR}/layerwise_quant.py"
+      --model_name "${MODEL_NAME}"
+      --block_idx "${block_idx}"
+      --bit_width "${BIT_WIDTH}"
+      --group_size "${GROUP_SIZE}"
+      --num_steps "${LAYERWISE_ANNEAL_STEPS}"
+      --ste_refine_steps "${LAYERWISE_STE_STEPS}"
+      --ste_refine_lr "${LAYERWISE_STE_LR}"
+      --ste_refine_binary_lr "${LAYERWISE_STE_BINARY_LR}"
+      --ste_refine_continuous_lr "${LAYERWISE_STE_CONTINUOUS_LR}"
+      --ste_refine_weight_decay "${LAYERWISE_STE_WEIGHT_DECAY}"
+      --ste_refine_log_interval "${LAYERWISE_STE_LOG_INTERVAL}"
+      --workers_per_gpu "${LAYERWISE_WORKERS_PER_GPU}"
+      --dataset "${DATASET}"
+      --nsamples "${NSAMPLES}"
+      --seqlen "${SEQLEN}"
+      --seed "${SEED}"
+      --save_dir "${LAYERWISE_DIR}"
+      "${assemble_args[@]}"
+    )
+    if [[ "${LAYERWISE_FIX_THETA}" == "1" ]]; then
+      layerwise_cmd+=(--fix_theta)
+    fi
+    if [[ "${LAYERWISE_FIX_BETA}" == "1" ]]; then
+      layerwise_cmd+=(--fix_beta)
+    fi
+    layerwise_cmd+=("$@")
+    "${layerwise_cmd[@]}"
+  fi
 
-  python "${LM_DIR}/blockwise_quant.py" \
-    --fix_theta \
-    --model_name "${MODEL_NAME}" \
-    --block_idx "${block_idx}" \
-    --bit_width "${BIT_WIDTH}" \
-    --group_size "${GROUP_SIZE}" \
-    --num_steps "${LAYERWISE_ANNEAL_STEPS}" \
-    --dataset "${DATASET}" \
-    --nsamples "${NSAMPLES}" \
-    --seqlen "${SEQLEN}" \
-    --seed "${SEED}" \
-    --epochs "${BLOCKWISE_EPOCHS}" \
-    --optimizer "${BLOCKWISE_OPTIMIZER}" \
-    --momentum "${BLOCKWISE_MOMENTUM}" \
-    --lr "${BLOCKWISE_LR}" \
-    --binary_lr "${BLOCKWISE_BINARY_LR}" \
-    --continuous_lr "${BLOCKWISE_CONTINUOUS_LR}" \
-    --max_grad_norm "${BLOCKWISE_MAX_GRAD_NORM}" \
-    --device "${DEVICE}" \
-    --layerwise_dir "${LAYERWISE_DIR}" \
-    --save_dir "${BLOCKWISE_SAVE_DIR}" \
-    "${assemble_args[@]}" \
-    "$@"
+  local blockwise_cmd=(
+    python "${LM_DIR}/blockwise_quant.py"
+    --model_name "${MODEL_NAME}"
+    --block_idx "${block_idx}"
+    --bit_width "${BIT_WIDTH}"
+    --group_size "${GROUP_SIZE}"
+    --num_steps "${LAYERWISE_ANNEAL_STEPS}"
+    --dataset "${DATASET}"
+    --nsamples "${NSAMPLES}"
+    --seqlen "${SEQLEN}"
+    --seed "${SEED}"
+    --epochs "${BLOCKWISE_EPOCHS}"
+    --optimizer "${BLOCKWISE_OPTIMIZER}"
+    --momentum "${BLOCKWISE_MOMENTUM}"
+    --lr "${BLOCKWISE_LR}"
+    --binary_lr "${BLOCKWISE_BINARY_LR}"
+    --continuous_lr "${BLOCKWISE_CONTINUOUS_LR}"
+    --max_grad_norm "${BLOCKWISE_MAX_GRAD_NORM}"
+    --device "${runtime_device}"
+    --layerwise_dir "${LAYERWISE_DIR}"
+    --save_dir "${BLOCKWISE_SAVE_DIR}"
+    "${assemble_args[@]}"
+  )
+  if [[ "${BLOCKWISE_FIX_THETA}" == "1" ]]; then
+    blockwise_cmd+=(--fix_theta)
+  fi
+  if [[ "${BLOCKWISE_FIX_BETA}" == "1" ]]; then
+    blockwise_cmd+=(--fix_beta)
+  fi
+  if [[ "${PROGRESSIVE}" == "1" ]]; then
+    blockwise_cmd+=(--progressive --progressive_mode "${PROGRESSIVE_MODE}")
+  fi
+  blockwise_cmd+=("$@")
+  "${blockwise_cmd[@]}"
+}
+
+detect_gpu_ids() {
+  if [[ -n "${GPU_IDS:-}" ]]; then
+    IFS=',' read -r -a gpu_ids <<< "${GPU_IDS}"
+  else
+    mapfile -t gpu_ids < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+  fi
+  if [[ "${#gpu_ids[@]}" -eq 0 ]]; then
+    echo "No GPUs available for blockwise parallel execution." >&2
+    exit 1
+  fi
+}
+
+cleanup_jobs() {
+  local pids
+  pids="$(jobs -pr || true)"
+  if [[ -n "${pids}" ]]; then
+    kill ${pids} 2>/dev/null || true
+  fi
 }
 
 if [[ "${BLOCK_IDX}" == "all" ]]; then
   NUM_BLOCKS="$(python "${LM_DIR}/layerwise_quant.py" --model_name "${MODEL_NAME}" --list_blocks)"
-  LAST_BLOCK=$((NUM_BLOCKS - 1))
+  detect_gpu_ids
+  echo "Parallel blockwise quantization: ${NUM_BLOCKS} blocks over ${#gpu_ids[@]} GPU(s): ${gpu_ids[*]}"
+
+  trap cleanup_jobs EXIT
+  active_jobs=0
   for ((block_idx=0; block_idx<NUM_BLOCKS; block_idx++)); do
-    should_assemble=0
-    if [[ "${block_idx}" -eq "${LAST_BLOCK}" ]]; then
-      should_assemble=1
+    gpu_id="${gpu_ids[$((block_idx % ${#gpu_ids[@]}))]}"
+    echo "[launch] block ${block_idx} -> GPU ${gpu_id}"
+    (
+      export CUDA_VISIBLE_DEVICES="${gpu_id}"
+      export RUNTIME_DEVICE="cuda:0"
+      run_one_block "${block_idx}" 0 "$@"
+    ) &
+    active_jobs=$((active_jobs + 1))
+    if (( active_jobs >= ${#gpu_ids[@]} )); then
+      wait -n
+      active_jobs=$((active_jobs - 1))
     fi
-    run_one_block "${block_idx}" "${should_assemble}" "$@"
   done
+  while (( active_jobs > 0 )); do
+    wait -n
+    active_jobs=$((active_jobs - 1))
+  done
+  trap - EXIT
+
+  python "${LM_DIR}/src/build_bqq_model.py" assemble     --model_name "${MODEL_NAME}"     --block_dir "${BLOCKWISE_SAVE_DIR}"     --bit_width "${BIT_WIDTH}"     --group_size "${GROUP_SIZE}"     --output_dir "${ASSEMBLED_OUTPUT_DIR}"
 else
   run_one_block "${BLOCK_IDX}" 1 "$@"
 fi
