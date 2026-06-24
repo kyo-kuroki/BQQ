@@ -4,9 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LM_DIR="${SCRIPT_DIR}/lm"
 
-# MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}"
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-0.8B}"
-BLOCK_IDX="${BLOCK_IDX:-0}"
+
+MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
+BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)
+BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-2}"
 BIT_WIDTH="${BIT_WIDTH:-2}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
@@ -17,14 +18,14 @@ LAYERWISE_STE_WEIGHT_DECAY="${LAYERWISE_STE_WEIGHT_DECAY:-0.0}"
 LAYERWISE_STE_BINARY_LR="${LAYERWISE_STE_BINARY_LR:-1e-3}"
 LAYERWISE_STE_CONTINUOUS_LR="${LAYERWISE_STE_CONTINUOUS_LR:-1e-4}"
 LAYERWISE_STE_LOG_INTERVAL="${LAYERWISE_STE_LOG_INTERVAL:-20}"
-LAYERWISE_WORKERS_PER_GPU="${LAYERWISE_WORKERS_PER_GPU:-4}"
+LAYERWISE_WORKERS_PER_GPU="${LAYERWISE_WORKERS_PER_GPU:-8}"
 LAYERWISE_FIX_THETA="${LAYERWISE_FIX_THETA:-0}"
 LAYERWISE_FIX_BETA="${LAYERWISE_FIX_BETA:-0}"
 
 BLOCKWISE_EPOCHS="${BLOCKWISE_EPOCHS:-1}"
 BLOCKWISE_LR="${BLOCKWISE_LR:-1e-4}"
 BLOCKWISE_BINARY_LR="${BLOCKWISE_BINARY_LR:-0}"
-BLOCKWISE_CONTINUOUS_LR="${BLOCKWISE_CONTINUOUS_LR:-1e-4}"
+BLOCKWISE_CONTINUOUS_LR="${BLOCKWISE_CONTINUOUS_LR:-1e-5}"
 BLOCKWISE_OPTIMIZER="${BLOCKWISE_OPTIMIZER:-adamw}" # Options: "sgd", "adam", "adamw"
 BLOCKWISE_MOMENTUM="${BLOCKWISE_MOMENTUM:-0.9}"
 BLOCKWISE_MAX_GRAD_NORM="${BLOCKWISE_MAX_GRAD_NORM:-1.0}"
@@ -126,6 +127,8 @@ run_one_block() {
 detect_gpu_ids() {
   if [[ -n "${GPU_IDS:-}" ]]; then
     IFS=',' read -r -a gpu_ids <<< "${GPU_IDS}"
+  elif [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    IFS=',' read -r -a gpu_ids <<< "${CUDA_VISIBLE_DEVICES}"
   else
     mapfile -t gpu_ids < <(nvidia-smi --query-gpu=index --format=csv,noheader)
   fi
@@ -146,20 +149,26 @@ cleanup_jobs() {
 if [[ "${BLOCK_IDX}" == "all" ]]; then
   NUM_BLOCKS="$(python "${LM_DIR}/layerwise_quant.py" --model_name "${MODEL_NAME}" --list_blocks)"
   detect_gpu_ids
-  echo "Parallel blockwise quantization: ${NUM_BLOCKS} blocks over ${#gpu_ids[@]} GPU(s): ${gpu_ids[*]}"
+  if (( BLOCKS_PER_GPU < 1 )); then
+    echo "BLOCKS_PER_GPU must be >= 1" >&2
+    exit 1
+  fi
+  total_slots=$(( ${#gpu_ids[@]} * BLOCKS_PER_GPU ))
+  echo "Parallel blockwise quantization: ${NUM_BLOCKS} blocks over ${#gpu_ids[@]} GPU(s), ${BLOCKS_PER_GPU} block job(s) per GPU, total concurrency ${total_slots}: ${gpu_ids[*]}"
 
   trap cleanup_jobs EXIT
   active_jobs=0
   for ((block_idx=0; block_idx<NUM_BLOCKS; block_idx++)); do
-    gpu_id="${gpu_ids[$((block_idx % ${#gpu_ids[@]}))]}"
-    echo "[launch] block ${block_idx} -> GPU ${gpu_id}"
+    slot_idx=$(( block_idx % total_slots ))
+    gpu_id="${gpu_ids[$((slot_idx % ${#gpu_ids[@]}))]}"
+    echo "[launch] block ${block_idx} -> GPU ${gpu_id} (slot $((slot_idx + 1))/${total_slots})"
     (
       export CUDA_VISIBLE_DEVICES="${gpu_id}"
       export RUNTIME_DEVICE="cuda:0"
       run_one_block "${block_idx}" 0 "$@"
     ) &
     active_jobs=$((active_jobs + 1))
-    if (( active_jobs >= ${#gpu_ids[@]} )); then
+    if (( active_jobs >= total_slots )); then
       wait -n
       active_jobs=$((active_jobs - 1))
     fi

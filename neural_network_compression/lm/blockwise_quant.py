@@ -87,7 +87,14 @@ def cache_block_io(model, block_idx, dataloader, device):
         targets_cache: list of tensors (block output hidden_states)
     """
     model.eval()
-    model.to(device)
+    if hasattr(model, 'hf_device_map'):
+        try:
+            input_device = next(p.device for p in model.parameters() if p.device.type != 'meta')
+        except StopIteration:
+            input_device = device
+    else:
+        model.to(device)
+        input_device = device
 
     block = get_decoder_layer(model, block_idx)
     inputs_cache = []
@@ -107,7 +114,7 @@ def cache_block_io(model, block_idx, dataloader, device):
     h_out = block.register_forward_hook(capture_output, with_kwargs=True)
 
     for batch in tqdm(dataloader, desc=f'Caching block {block_idx} I/O'):
-        ids = batch[0].to(device)
+        ids = batch[0].to(input_device)
         try:
             model(ids)
         except Exception:
@@ -560,14 +567,19 @@ def quantize_block(
     dev = torch.device(device)
 
     print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name)
+    model = load_causal_lm(model_name, device_map='auto')
 
     print(f'Caching block {block_idx} I/O ...')
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
     block_prefix = get_decoder_block_prefix(model, block_idx)
-    block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
+    source_block = get_decoder_layer(model, block_idx).cpu()
+    block = copy.deepcopy(source_block).float()
+    del source_block
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     ensure_layerwise_block_available(
         block,
         model_name=model_name,
@@ -739,15 +751,18 @@ def quantize_block_progressive(
 
     # --- 1. Cache block I/O ---
     print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name)
+    model = load_causal_lm(model_name, device_map='auto')
 
     print(f'Caching block {block_idx} I/O ...')
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
-    block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
+    source_block = get_decoder_layer(model, block_idx).cpu()
+    block = copy.deepcopy(source_block).float()
+    del source_block
     del model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # --- 2. Convert all Linear → PartialBQQLinear ---
     linear_names = get_quantizable_linears(block)
@@ -906,16 +921,19 @@ def quantize_block_progressive_closed_form(
     device_id = dev.index if dev.type == 'cuda' else 0
 
     print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name)
+    model = load_causal_lm(model_name, device_map='auto')
 
     print(f'Caching block {block_idx} I/O ...')
     inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
     print(f'  Cached {len(inputs_cache)} samples')
 
-    original_block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
-    current_block = copy.deepcopy(get_decoder_layer(model, block_idx)).float()
+    source_block = get_decoder_layer(model, block_idx).cpu()
+    original_block = copy.deepcopy(source_block).float()
+    current_block = copy.deepcopy(source_block).float()
+    del source_block
     del model
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     linear_names = get_quantizable_linears(current_block)
     print(f'\nBlock {block_idx}: {len(linear_names)} quantizable layers -> sequential closed-form progressive')
