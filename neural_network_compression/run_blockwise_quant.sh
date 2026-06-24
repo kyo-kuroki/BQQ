@@ -7,8 +7,8 @@ LM_DIR="${SCRIPT_DIR}/lm"
 
 MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)
-BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-1}"
-BIT_WIDTH="${BIT_WIDTH:-2}"
+BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-2}"
+BIT_WIDTH="${BIT_WIDTH:-1}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
 LAYERWISE_ANNEAL_STEPS="${LAYERWISE_ANNEAL_STEPS:-10000}"
@@ -40,6 +40,7 @@ SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 NO_IO_CACHE="${NO_IO_CACHE:-1}"
+NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
 
 MODEL_BASENAME="${MODEL_NAME##*/}"
 LAYERWISE_DIR="${LAYERWISE_DIR:-${LM_DIR}/src/bqq_compressed_data/${MODEL_BASENAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
@@ -122,6 +123,9 @@ run_one_block() {
   fi
   if [[ "${NO_IO_CACHE}" == "1" ]]; then
     blockwise_cmd+=(--no_io_cache)
+  fi
+  if [[ "${NO_SCALE_REFINE}" == "1" ]]; then
+    blockwise_cmd+=(--no_scale_refine)
   fi
   if [[ "${PROGRESSIVE}" == "1" ]]; then
     blockwise_cmd+=(--progressive --progressive_mode "${PROGRESSIVE_MODE}")

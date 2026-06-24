@@ -1193,6 +1193,7 @@ def quantize_block_progressive_closed_form(
     continuous_lr=None,
     tune_after_each_layer=False,
     use_closed_form=True,
+    scale_refine=True,
     fix_theta=False,
     fix_beta=False,
     device,
@@ -1311,7 +1312,7 @@ def quantize_block_progressive_closed_form(
             seed=seed,
             device_id=device_id,
             H=H_current,
-            scale_refine=True,
+            scale_refine=scale_refine,
             damping=damping,
         )
         replace_linear_in_block(
@@ -1551,6 +1552,7 @@ def main():
                 continuous_lr=args.continuous_lr,
                 tune_after_each_layer=(args.progressive_mode == 'layer-tune'),
                 use_closed_form=(args.progressive_mode == 'closed-form-layer'),
+                scale_refine=not args.no_scale_refine,
                 fix_theta=args.fix_theta,
                 fix_beta=args.fix_beta,
                 device=args.device,
