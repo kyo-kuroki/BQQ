@@ -38,15 +38,15 @@ from quantizer import BinaryQuadraticQuantization
 
 try:
     from .src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
-    from .src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
+    from .src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from .src.datautils import get_loaders
-    from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix
+    from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
     from .layerwise_quant import layerwise_quantize_block
 except ImportError:
     from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
-    from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
+    from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from neural_network_compression.lm.src.datautils import get_loaders
-    from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix
+    from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
     from neural_network_compression.lm.layerwise_quant import layerwise_quantize_block
 
 
@@ -76,6 +76,266 @@ def _to_device_dtype(v, device, dtype):
     return v
 
 
+
+def _should_cache_block_kwarg(key, value):
+    """Keep only block inputs needed to replay the block deterministically."""
+    if key in {'use_cache', 'past_key_value', 'past_key_values'}:
+        return False
+    if 'cache' in key.lower():
+        return False
+    return isinstance(value, (torch.Tensor, tuple, list))
+
+
+def _block_io_cache_paths(io_cache_dir, block_idx):
+    cache_dir = Path(io_cache_dir)
+    return cache_dir / f"block_{block_idx}_io.pt", cache_dir / f"block_{block_idx}_float.pth"
+
+
+def _block_io_chunk_dir(io_cache_dir, block_idx):
+    cache_dir = Path(io_cache_dir)
+    return cache_dir / "_chunks" / f"block_{block_idx}"
+
+
+def save_block_artifacts(io_cache_dir, block_idx, *, inputs_cache, targets_cache, source_block, block_prefix, metadata):
+    io_path, block_path = _block_io_cache_paths(io_cache_dir, block_idx)
+    io_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'inputs_cache': inputs_cache,
+        'targets_cache': targets_cache,
+        'block_prefix': block_prefix,
+        'metadata': metadata,
+    }, io_path)
+    torch.save(source_block.cpu(), block_path, pickle_module=dill)
+
+
+def load_block_artifacts(io_cache_dir, block_idx):
+    io_path, block_path = _block_io_cache_paths(io_cache_dir, block_idx)
+    if not io_path.exists() or not block_path.exists():
+        return None
+    payload = torch.load(io_path, weights_only=False, map_location='cpu')
+    source_block = torch.load(block_path, weights_only=False, map_location='cpu', pickle_module=dill)
+    return {
+        'inputs_cache': payload['inputs_cache'],
+        'targets_cache': payload['targets_cache'],
+        'block_prefix': payload['block_prefix'],
+        'metadata': payload.get('metadata', {}),
+        'source_block': source_block,
+    }
+
+
+def _flush_block_io_chunks(io_cache_dir, chunk_idx, chunk_inputs, chunk_targets):
+    for block_idx, inputs_cache in chunk_inputs.items():
+        if not inputs_cache:
+            continue
+        chunk_dir = _block_io_chunk_dir(io_cache_dir, block_idx)
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        chunk_path = chunk_dir / f"chunk_{chunk_idx:06d}.pt"
+        torch.save({
+            'inputs_cache': inputs_cache,
+            'targets_cache': chunk_targets[block_idx],
+        }, chunk_path)
+        chunk_inputs[block_idx] = []
+        chunk_targets[block_idx] = []
+
+
+def _consolidate_block_io_chunks(io_cache_dir, block_idx, *, source_block, block_prefix, metadata):
+    chunk_dir = _block_io_chunk_dir(io_cache_dir, block_idx)
+    inputs_cache = []
+    targets_cache = []
+    if chunk_dir.exists():
+        for chunk_path in sorted(chunk_dir.glob('chunk_*.pt')):
+            payload = torch.load(chunk_path, weights_only=False, map_location='cpu')
+            inputs_cache.extend(payload['inputs_cache'])
+            targets_cache.extend(payload['targets_cache'])
+    save_block_artifacts(
+        io_cache_dir,
+        block_idx,
+        inputs_cache=inputs_cache,
+        targets_cache=targets_cache,
+        source_block=source_block,
+        block_prefix=block_prefix,
+        metadata=metadata,
+    )
+
+
+def _prepare_single_block_artifact(model, block_idx, dataloader, *, device, io_cache_dir, model_name, dataset, seqlen, nsamples, seed, save_to_disk=True):
+    if save_to_disk:
+        cache_dir = Path(io_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = load_block_artifacts(cache_dir, block_idx)
+        if artifacts is not None:
+            print(f'Using existing block {block_idx} I/O cache: {cache_dir}')
+            return artifacts
+        print(f'Preparing block {block_idx} I/O cache in {cache_dir}')
+    else:
+        print(f'Preparing in-memory block {block_idx} I/O artifacts')
+
+    source_block = copy.deepcopy(get_decoder_layer(model, block_idx).cpu())
+    block_prefix = get_decoder_block_prefix(model, block_idx)
+    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, device)
+    artifacts = {
+        'inputs_cache': inputs_cache,
+        'targets_cache': targets_cache,
+        'block_prefix': block_prefix,
+        'metadata': {
+            'model_name': model_name,
+            'dataset': dataset,
+            'seqlen': seqlen,
+            'nsamples': nsamples,
+            'seed': seed,
+            'block_idx': block_idx,
+        },
+        'source_block': source_block,
+    }
+    if save_to_disk:
+        save_block_artifacts(
+            io_cache_dir,
+            block_idx,
+            inputs_cache=artifacts['inputs_cache'],
+            targets_cache=artifacts['targets_cache'],
+            source_block=artifacts['source_block'],
+            block_prefix=artifacts['block_prefix'],
+            metadata=artifacts['metadata'],
+        )
+        print(f'  Saved block {block_idx} I/O cache ({len(inputs_cache)} samples)')
+    else:
+        print(f'  Prepared block {block_idx} I/O artifacts in memory ({len(inputs_cache)} samples)')
+    return artifacts
+
+
+
+
+def prepare_single_block_artifact_in_memory(model_name, block_idx, dataloader, *, device, dataset, seqlen, nsamples, seed):
+    model = load_causal_lm(model_name, device_map='auto')
+    try:
+        return _prepare_single_block_artifact(
+            model,
+            block_idx,
+            dataloader,
+            device=device,
+            io_cache_dir=None,
+            model_name=model_name,
+            dataset=dataset,
+            seqlen=seqlen,
+            nsamples=nsamples,
+            seed=seed,
+            save_to_disk=False,
+        )
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+def prepare_block_artifacts(model_name, dataloader, *, block_indices=None, device, io_cache_dir, dataset, seqlen, nsamples, seed, flush_every=8):
+    cache_dir = Path(io_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    model = load_causal_lm(model_name, device_map='auto')
+    try:
+        if block_indices is None:
+            block_indices = range(get_decoder_num_layers(model))
+        block_indices = list(block_indices)
+        pending = []
+        for block_idx in block_indices:
+            if load_block_artifacts(cache_dir, block_idx) is None:
+                pending.append(block_idx)
+        if not pending:
+            print(f'Using existing block I/O cache: {cache_dir}')
+            return
+
+        if len(pending) == 1:
+            _prepare_single_block_artifact(
+                model,
+                pending[0],
+                dataloader,
+                device=device,
+                io_cache_dir=io_cache_dir,
+                model_name=model_name,
+                dataset=dataset,
+                seqlen=seqlen,
+                nsamples=nsamples,
+                seed=seed,
+            )
+            return
+
+        print(f'Preparing shared block I/O cache in {cache_dir} for blocks: {pending}')
+
+        if hasattr(model, 'hf_device_map'):
+            try:
+                input_device = next(p.device for p in model.parameters() if p.device.type != 'meta')
+            except StopIteration:
+                input_device = device
+        else:
+            model.to(device)
+            input_device = device
+        model.eval()
+
+        block_prefixes = {}
+        chunk_inputs = {block_idx: [] for block_idx in pending}
+        chunk_targets = {block_idx: [] for block_idx in pending}
+        chunk_idx = 0
+        handles = []
+
+        for block_idx in pending:
+            block = get_decoder_layer(model, block_idx)
+            block_prefixes[block_idx] = get_decoder_block_prefix(model, block_idx)
+
+            def capture_input(module, args, kwargs, *, _block_idx=block_idx):
+                cached = {'hidden_states': args[0].detach().cpu()}
+                for k, v in kwargs.items():
+                    if _should_cache_block_kwarg(k, v):
+                        cached[k] = _detach_to_cpu(v)
+                chunk_inputs[_block_idx].append(cached)
+
+            def capture_output(module, args, kwargs, output, *, _block_idx=block_idx):
+                out = output[0] if isinstance(output, tuple) else output
+                chunk_targets[_block_idx].append(out.detach().cpu())
+
+            handles.append(block.register_forward_pre_hook(capture_input, with_kwargs=True))
+            handles.append(block.register_forward_hook(capture_output, with_kwargs=True))
+
+        processed = 0
+        for batch in tqdm(dataloader, desc='Caching all block I/O'):
+            ids = batch[0].to(input_device)
+            try:
+                model(ids, use_cache=False)
+            except Exception as exc:
+                print(f'[WARN] Skipping cache batch after forward failure: {type(exc).__name__}: {exc}')
+                continue
+            processed += 1
+            if processed % flush_every == 0:
+                _flush_block_io_chunks(io_cache_dir, chunk_idx, chunk_inputs, chunk_targets)
+                chunk_idx += 1
+
+        _flush_block_io_chunks(io_cache_dir, chunk_idx, chunk_inputs, chunk_targets)
+
+        for handle in handles:
+            handle.remove()
+
+        for block_idx in pending:
+            metadata = {
+                'model_name': model_name,
+                'dataset': dataset,
+                'seqlen': seqlen,
+                'nsamples': nsamples,
+                'seed': seed,
+                'block_idx': block_idx,
+            }
+            source_block = copy.deepcopy(get_decoder_layer(model, block_idx).cpu())
+            _consolidate_block_io_chunks(
+                io_cache_dir,
+                block_idx,
+                source_block=source_block,
+                block_prefix=block_prefixes[block_idx],
+                metadata=metadata,
+            )
+            del source_block
+            print(f'  Saved block {block_idx} I/O cache')
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
 @torch.no_grad()
 def cache_block_io(model, block_idx, dataloader, device):
     """
@@ -103,7 +363,8 @@ def cache_block_io(model, block_idx, dataloader, device):
     def capture_input(module, args, kwargs):
         cached = {'hidden_states': args[0].detach().cpu()}
         for k, v in kwargs.items():
-            cached[k] = _detach_to_cpu(v)
+            if _should_cache_block_kwarg(k, v):
+                cached[k] = _detach_to_cpu(v)
         inputs_cache.append(cached)
 
     def capture_output(module, args, kwargs, output):
@@ -116,9 +377,9 @@ def cache_block_io(model, block_idx, dataloader, device):
     for batch in tqdm(dataloader, desc=f'Caching block {block_idx} I/O'):
         ids = batch[0].to(input_device)
         try:
-            model(ids)
-        except Exception:
-            pass
+            model(ids, use_cache=False)
+        except Exception as exc:
+            print(f'[WARN] Skipping cache batch after forward failure: {type(exc).__name__}: {exc}')
 
     h_in.remove()
     h_out.remove()
@@ -195,6 +456,7 @@ def ensure_layerwise_block_available(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
+    use_disk_cache=True,
 ):
     """Generate missing layerwise quantization results for a block on demand."""
     layerwise_dir = Path(layerwise_dir)
@@ -328,12 +590,15 @@ def run_block_forward(block, inp, device):
     return output[0] if isinstance(output, tuple) else output
 
 
-def compute_block_mse(block, inputs_cache, targets_cache, device):
+def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None):
     """Compute mean block output MSE over all cached samples."""
     block.to(device).eval()
     total_mse = 0.0
+    iterator = zip(inputs_cache, targets_cache)
+    if desc is not None:
+        iterator = tqdm(iterator, total=len(inputs_cache), desc=desc, unit='sample', leave=False)
     with torch.no_grad():
-        for inp, target in zip(inputs_cache, targets_cache):
+        for inp, target in iterator:
             output = run_block_forward(block, inp, device)
             total_mse += ((output - target.to(device)) ** 2).mean().item()
     return total_mse / len(inputs_cache)
@@ -447,7 +712,7 @@ def collect_single_hessian(block, linear_name, inputs_cache, device):
     handle = target_module.register_forward_hook(_hook)
     block.to(device).eval()
     with torch.no_grad():
-        for inp in inputs_cache:
+        for inp in tqdm(inputs_cache, desc=f'Hessian {linear_name}', unit='sample', leave=False):
             try:
                 run_block_forward(block, inp, device)
             except Exception:
@@ -485,7 +750,7 @@ def collect_cross_hessians_for_linear(original_block, current_block, linear_name
     h_orig = original_module.register_forward_hook(_orig_hook)
     h_cur = current_module.register_forward_hook(_cur_hook)
     try:
-        for inp in inputs_cache:
+        for inp in tqdm(inputs_cache, desc=f'Cross-Hessian {linear_name}', unit='sample', leave=False):
             captured['orig'] = None
             captured['cur'] = None
             try:
@@ -552,6 +817,10 @@ def quantize_block(
     device,
     save_dir,
     layerwise_dir,
+    io_cache_dir=None,
+    dataset=None,
+    seqlen=None,
+    nsamples=None,
     refine_coeffs_only=False,
     fix_theta=False,
     fix_beta=False,
@@ -559,6 +828,7 @@ def quantize_block(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
+    use_disk_cache=True,
 ):
     """
     Load a block from precomputed layerwise BQQ patches, then optimize the
@@ -566,18 +836,42 @@ def quantize_block(
     """
     dev = torch.device(device)
 
-    print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name, device_map='auto')
+    if use_disk_cache:
+        if io_cache_dir is None:
+            io_cache_dir = default_block_io_cache_dir(model_name, dataset or 'dataset', seqlen or 0, nsamples or 0)
+        artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            prepare_block_artifacts(
+                model_name,
+                dataloader,
+                block_indices=[block_idx],
+                device=dev,
+                io_cache_dir=io_cache_dir,
+                dataset=dataset or 'dataset',
+                seqlen=seqlen or 0,
+                nsamples=nsamples or 0,
+                seed=seed,
+            )
+            artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            raise RuntimeError(f'Failed to prepare/load block artifacts for block {block_idx}')
+        print(f"Loaded cached block {block_idx} I/O: {len(artifacts['inputs_cache'])} samples from {io_cache_dir}")
+    else:
+        artifacts = prepare_single_block_artifact_in_memory(
+            model_name,
+            block_idx,
+            dataloader,
+            device=dev,
+            dataset=dataset or 'dataset',
+            seqlen=seqlen or 0,
+            nsamples=nsamples or 0,
+            seed=seed,
+        )
 
-    print(f'Caching block {block_idx} I/O ...')
-    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
-    print(f'  Cached {len(inputs_cache)} samples')
-
-    block_prefix = get_decoder_block_prefix(model, block_idx)
-    source_block = get_decoder_layer(model, block_idx).cpu()
-    block = copy.deepcopy(source_block).float()
-    del source_block
-    del model
+    inputs_cache = artifacts['inputs_cache']
+    targets_cache = artifacts['targets_cache']
+    block_prefix = artifacts['block_prefix']
+    block = copy.deepcopy(artifacts['source_block']).float()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     ensure_layerwise_block_available(
@@ -599,7 +893,6 @@ def quantize_block(
         fix_theta=fix_theta,
         fix_beta=fix_beta,
     )
-    del model
     torch.cuda.empty_cache()
 
     use_trainable_ste = (not refine_coeffs_only) and (binary_lr != 0)
@@ -618,7 +911,7 @@ def quantize_block(
         optimize_beta=not fix_beta,
     )
 
-    init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
+    init_mse = compute_block_mse(block, inputs_cache, targets_cache, dev, desc='Initial block MSE')
     print(f'\nBlock MSE after loading layerwise BQQ: {init_mse:.6f}')
 
     optimize_block_params(
@@ -628,7 +921,7 @@ def quantize_block(
         binary_lr=binary_lr, continuous_lr=continuous_lr,
     )
 
-    final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev)
+    final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev, desc='Final block MSE')
     print(f'Block MSE after blockwise optimization: {final_mse:.6f} (Δ={final_mse - init_mse:+.6f})')
 
     for lname in linear_names:
@@ -636,15 +929,6 @@ def quantize_block(
         if isinstance(layer, TrainableSTEBinaryQuadratic):
             _set_submodule(block, lname, layer.to_binaryquadratic())
 
-    for lname in linear_names:
-        layer = _get_submodule(current_block, lname)
-        if isinstance(layer, TrainableSTEBinaryQuadratic):
-            _set_submodule(current_block, lname, layer.to_binaryquadratic())
-
-    for lname in linear_names:
-        layer = _get_submodule(current_block, lname)
-        if isinstance(layer, TrainableSTEBinaryQuadratic):
-            _set_submodule(current_block, lname, layer.to_binaryquadratic())
 
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -712,6 +996,11 @@ def quantize_block_progressive(
     schedule='geometric',
     device,
     save_dir,
+    io_cache_dir=None,
+    dataset=None,
+    seqlen=None,
+    nsamples=None,
+    use_disk_cache=True,
 ):
     """
     Quantize all Linear weights in a block via progressive patch-wise BQQ.
@@ -749,18 +1038,29 @@ def quantize_block_progressive(
     dev = torch.device(device)
     device_id = dev.index if dev.type == 'cuda' else 0
 
-    # --- 1. Cache block I/O ---
-    print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name, device_map='auto')
+    if io_cache_dir is None:
+        io_cache_dir = default_block_io_cache_dir(model_name, dataset or 'dataset', seqlen or 0, nsamples or 0)
+    artifacts = load_block_artifacts(io_cache_dir, block_idx)
+    if artifacts is None:
+        prepare_block_artifacts(
+            model_name,
+            dataloader,
+            block_indices=[block_idx],
+            device=dev,
+            io_cache_dir=io_cache_dir,
+            dataset=dataset or 'dataset',
+            seqlen=seqlen or 0,
+            nsamples=nsamples or 0,
+            seed=seed,
+        )
+        artifacts = load_block_artifacts(io_cache_dir, block_idx)
+    if artifacts is None:
+        raise RuntimeError(f'Failed to prepare/load block artifacts for block {block_idx}')
 
-    print(f'Caching block {block_idx} I/O ...')
-    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
-    print(f'  Cached {len(inputs_cache)} samples')
-
-    source_block = get_decoder_layer(model, block_idx).cpu()
-    block = copy.deepcopy(source_block).float()
-    del source_block
-    del model
+    inputs_cache = artifacts['inputs_cache']
+    targets_cache = artifacts['targets_cache']
+    block = copy.deepcopy(artifacts['source_block']).float()
+    print(f'Loaded cached block {block_idx} I/O: {len(inputs_cache)} samples from {io_cache_dir}')
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -897,6 +1197,11 @@ def quantize_block_progressive_closed_form(
     fix_beta=False,
     device,
     save_dir,
+    io_cache_dir=None,
+    dataset=None,
+    seqlen=None,
+    nsamples=None,
+    use_disk_cache=True,
 ):
     """Front-to-back layer quantization with closed-form continuous recentering.
 
@@ -920,26 +1225,57 @@ def quantize_block_progressive_closed_form(
     dev = torch.device(device)
     device_id = dev.index if dev.type == 'cuda' else 0
 
-    print(f'Loading model: {model_name}')
-    model = load_causal_lm(model_name, device_map='auto')
+    if use_disk_cache:
+        if io_cache_dir is None:
+            io_cache_dir = default_block_io_cache_dir(model_name, dataset or 'dataset', seqlen or 0, nsamples or 0)
+        artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            prepare_block_artifacts(
+                model_name,
+                dataloader,
+                block_indices=[block_idx],
+                device=dev,
+                io_cache_dir=io_cache_dir,
+                dataset=dataset or 'dataset',
+                seqlen=seqlen or 0,
+                nsamples=nsamples or 0,
+                seed=seed,
+            )
+            artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            raise RuntimeError(f'Failed to prepare/load block artifacts for block {block_idx}')
+        print(f"Loaded cached block {block_idx} I/O: {len(artifacts['inputs_cache'])} samples from {io_cache_dir}")
+    else:
+        artifacts = prepare_single_block_artifact_in_memory(
+            model_name,
+            block_idx,
+            dataloader,
+            device=dev,
+            dataset=dataset or 'dataset',
+            seqlen=seqlen or 0,
+            nsamples=nsamples or 0,
+            seed=seed,
+        )
 
-    print(f'Caching block {block_idx} I/O ...')
-    inputs_cache, targets_cache = cache_block_io(model, block_idx, dataloader, dev)
-    print(f'  Cached {len(inputs_cache)} samples')
-
-    source_block = get_decoder_layer(model, block_idx).cpu()
+    inputs_cache = artifacts['inputs_cache']
+    targets_cache = artifacts['targets_cache']
+    source_block = artifacts['source_block']
     original_block = copy.deepcopy(source_block).float()
     current_block = copy.deepcopy(source_block).float()
     del source_block
-    del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     linear_names = get_quantizable_linears(current_block)
-    print(f'\nBlock {block_idx}: {len(linear_names)} quantizable layers -> sequential closed-form progressive')
+    mode_label = 'closed-form-layer' if use_closed_form else 'layer-tune'
+    print(f'\nBlock {block_idx}: {len(linear_names)} quantizable layers -> sequential {mode_label} progressive')
 
-    init_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
-    print(f'Initial block MSE (pretrained): {init_mse:.6f}')
+    init_mse = None
+    if use_closed_form:
+        init_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='Initial block MSE')
+        print(f'Initial block MSE (pretrained): {init_mse:.6f}')
+    else:
+        print('Initial block MSE: skipped for layer-tune mode')
 
     for layer_idx, lname in enumerate(linear_names, start=1):
         print(f'\n=== Layer {layer_idx}/{len(linear_names)}: {lname} ===')
@@ -992,7 +1328,7 @@ def quantize_block_progressive_closed_form(
             optimize_beta=not fix_beta,
         )
 
-        cur_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+        cur_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'MSE after {lname}')
         print(f'  Block MSE after quantizing {lname}: {cur_mse:.6f}')
 
         if tune_after_each_layer and epochs > 0:
@@ -1009,16 +1345,19 @@ def quantize_block_progressive_closed_form(
                 binary_lr=binary_lr,
                 continuous_lr=continuous_lr,
             )
-            tuned_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+            tuned_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'Tuned MSE {lname}')
             print(f'  Block MSE after tuning {lname}:     {tuned_mse:.6f} (Δ={tuned_mse - cur_mse:+.6f})')
 
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(current_block.cpu(), save_path, pickle_module=dill)
 
-    final_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev)
+    final_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='Final block MSE')
     print(f'\n=== Block {block_idx} done ===')
-    print(f'  Initial MSE: {init_mse:.6f}')
+    if init_mse is not None:
+        print(f'  Initial MSE: {init_mse:.6f}')
+    else:
+        print('  Initial MSE: skipped')
     print(f'  Final MSE:   {final_mse:.6f}')
     print(f'  Saved to: {save_path}')
 
@@ -1114,6 +1453,12 @@ def main():
                         help='Skip full-model assembly after blockwise quantization')
     parser.add_argument('--assembled_output_dir', type=str, default=None,
                         help='Output directory for the assembled full model')
+    parser.add_argument('--io_cache_dir', type=str, default=None,
+                        help='Directory for shared cached block I/O and source blocks')
+    parser.add_argument('--prepare_all_block_io_cache', action='store_true',
+                        help='Prepare and save all block I/O/source-block artifacts, then exit')
+    parser.add_argument('--no_io_cache', action='store_true',
+                        help='Do not save/load block I/O artifacts on disk; keep them in memory per block process')
 
     args = parser.parse_args()
 
@@ -1128,6 +1473,24 @@ def main():
         model=args.model_name,
         tokenizer=tokenizer,
     )
+
+    io_cache_dir = args.io_cache_dir
+    if io_cache_dir is None:
+        io_cache_dir = default_block_io_cache_dir(args.model_name, args.dataset, args.seqlen, args.nsamples)
+
+    if args.prepare_all_block_io_cache:
+        prepare_block_artifacts(
+            args.model_name,
+            train_loader,
+            block_indices=None,
+            device=torch.device(args.device),
+            io_cache_dir=io_cache_dir,
+            dataset=args.dataset,
+            seqlen=args.seqlen,
+            nsamples=args.nsamples,
+            seed=args.seed,
+        )
+        return
 
     common_kwargs = dict(
         model_name=args.model_name,
@@ -1147,6 +1510,11 @@ def main():
         max_grad_norm=args.max_grad_norm,
         device=args.device,
         save_dir=args.save_dir,
+        io_cache_dir=io_cache_dir,
+        dataset=args.dataset,
+        seqlen=args.seqlen,
+        nsamples=args.nsamples,
+        use_disk_cache=not args.no_io_cache,
     )
 
     layerwise_dir = args.layerwise_dir
@@ -1182,6 +1550,11 @@ def main():
                 fix_beta=args.fix_beta,
                 device=args.device,
                 save_dir=args.save_dir,
+                io_cache_dir=io_cache_dir,
+                dataset=args.dataset,
+                seqlen=args.seqlen,
+                nsamples=args.nsamples,
+                use_disk_cache=not args.no_io_cache,
             )
     else:
         quantize_block(

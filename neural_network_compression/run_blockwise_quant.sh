@@ -7,7 +7,7 @@ LM_DIR="${SCRIPT_DIR}/lm"
 
 MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)
-BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-2}"
+BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-1}"
 BIT_WIDTH="${BIT_WIDTH:-2}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
@@ -39,11 +39,13 @@ NSAMPLES="${NSAMPLES:-1024}"
 SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
 DEVICE="${DEVICE:-cuda:0}"
+NO_IO_CACHE="${NO_IO_CACHE:-1}"
 
 MODEL_BASENAME="${MODEL_NAME##*/}"
 LAYERWISE_DIR="${LAYERWISE_DIR:-${LM_DIR}/src/bqq_compressed_data/${MODEL_BASENAME}-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
 BLOCKWISE_SAVE_DIR="${BLOCKWISE_SAVE_DIR:-${LM_DIR}/blockwise_output/${MODEL_BASENAME}}"
 ASSEMBLED_OUTPUT_DIR="${ASSEMBLED_OUTPUT_DIR:-${LM_DIR}/src/quantized_models/${MODEL_BASENAME}}"
+IO_CACHE_DIR="${IO_CACHE_DIR:-${LM_DIR}/src/block_io_cache/${MODEL_BASENAME}/${DATASET}_${SEQLEN}seqlen_${NSAMPLES}samples}"
 
 run_one_block() {
   local block_idx="$1"
@@ -108,6 +110,7 @@ run_one_block() {
     --max_grad_norm "${BLOCKWISE_MAX_GRAD_NORM}"
     --device "${runtime_device}"
     --layerwise_dir "${LAYERWISE_DIR}"
+    --io_cache_dir "${IO_CACHE_DIR}"
     --save_dir "${BLOCKWISE_SAVE_DIR}"
     "${assemble_args[@]}"
   )
@@ -116,6 +119,9 @@ run_one_block() {
   fi
   if [[ "${BLOCKWISE_FIX_BETA}" == "1" ]]; then
     blockwise_cmd+=(--fix_beta)
+  fi
+  if [[ "${NO_IO_CACHE}" == "1" ]]; then
+    blockwise_cmd+=(--no_io_cache)
   fi
   if [[ "${PROGRESSIVE}" == "1" ]]; then
     blockwise_cmd+=(--progressive --progressive_mode "${PROGRESSIVE_MODE}")
