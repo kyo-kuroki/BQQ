@@ -719,7 +719,7 @@ def collect_single_hessian(block, linear_name, inputs_cache, device):
                 pass
     handle.remove()
 
-    return H.cpu() if H is not None else None
+    return H if H is not None else None
 
 
 @torch.no_grad()
@@ -774,7 +774,7 @@ def collect_cross_hessians_for_linear(original_block, current_block, linear_name
 
     if H_cross is None or H_current is None:
         return None, None
-    return H_cross.cpu(), H_current.cpu()
+    return H_cross, H_current
 
 
 def solve_closed_form_weight(weight, H_cross, H_current, damping=1e-6):
@@ -1310,7 +1310,7 @@ def quantize_block_progressive_closed_form(
             rank_scale=rank_scale,
             seed=seed,
             device_id=device_id,
-            H=H_current.cpu(),
+            H=H_current,
             scale_refine=True,
             damping=damping,
         )
@@ -1327,6 +1327,11 @@ def quantize_block_progressive_closed_form(
             optimize_theta=not fix_theta,
             optimize_beta=not fix_beta,
         )
+        del H_current
+        if use_closed_form:
+            del H_cross
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         cur_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'MSE after {lname}')
         print(f'  Block MSE after quantizing {lname}: {cur_mse:.6f}')
