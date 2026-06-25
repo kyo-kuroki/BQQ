@@ -1788,19 +1788,9 @@ class BinaryQuadraticQuantization():
         w_ranges = compute_patch_ranges(original_w, max_patch_size)
 
         x_tensor = torch.tensor(x_copy).float()
+        # Keep Hessian on the same device as W_work to avoid cpu/cuda mixing during compensation.
         H = H.to(dtype=torch.float32, device=x_tensor.device)
         num_col_groups = len(w_ranges)
-
-        # GPTQ-style: precompute damped H_inv once to guarantee finite compensation.
-        # Per-group solve of H[c1:,c1:]^{-1} is numerically unstable for ill-conditioned H.
-        COMP_DAMPING = 0.01  # 1% relative damping, same default as GPTQ paper
-        _L = self._cholesky_safe(H, COMP_DAMPING)
-        if _L is not None:
-            H_inv = torch.cholesky_inverse(_L)
-            print(f'Precomputed H_inv for compensation ({list(H_inv.shape)}, damping={COMP_DAMPING})')
-        else:
-            H_inv = None
-            print('WARNING: Cholesky failed, compensation disabled')
 
         all_decomposed = []
         Wq = torch.zeros(original_h, original_w, dtype=dtype)
@@ -1879,19 +1869,17 @@ class BinaryQuadraticQuantization():
                             'bit_idx': bit_idx,
                         })
 
-            # Compensation: GPTQ-style update using precomputed H_inv.
-            # Correct formula (per GPTQ paper): err = E_j / diag(H_inv[c0:c1,c0:c1]),
-            # then W_work[:, c1:] -= err @ H_inv[c0:c1, c1:]
-            if H_inv is not None and c1 < original_w:
-                E_j = W_work[:, c0:c1] - Wq[:, c0:c1]
-                d = H_inv[c0:c1, c0:c1].diagonal().clamp(min=1e-8)
-                E_normalized = E_j / d[None, :]
-                update = E_normalized @ H_inv[c0:c1, c1:]
-                if torch.isfinite(update).all():
-                    W_work[:, c1:] -= update
+            # Compensation: shift remaining columns
+            if c1 < original_w:
+                E_j = W_work[:, c0:c1] - Wq[:, c0:c1]  # total error for this column
+                H_22 = H[c1:, c1:]
+                H_21 = H[c1:, c0:c1]
+                try:
+                    M = torch.linalg.solve(H_22, H_21)
+                    W_work[:, c1:] += E_j @ M.T
                     print(f'  Compensated remaining {original_w - c1} columns')
-                else:
-                    print(f'  WARNING: compensation update non-finite, skipping')
+                except Exception as e:
+                    print(f'  WARNING: compensation failed: {e}')
 
         # --- Optional: inter-bit Hessian-aware scale refinement ---
         if scale_refine:

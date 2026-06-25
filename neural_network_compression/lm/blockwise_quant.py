@@ -606,7 +606,7 @@ def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None):
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
                           epochs, lr, device, max_grad_norm=1.0, optimizer_name='adamw', momentum=0.0,
-                          binary_lr=None, continuous_lr=None, tune_batch_size=1):
+                          binary_lr=None, continuous_lr=None):
     """
     Optimize all trainable parameters in block to minimize
     ||block(cached_input) - pretrained_output||^2.
@@ -650,29 +650,23 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
 
     best_mse = float('inf')
     best_state = None
-    n = len(inputs_cache)
-    acc = max(1, tune_batch_size)
 
     for epoch in tqdm(range(epochs), desc='Blockwise optimization', unit='epoch'):
         total_loss = 0.0
-        optimizer.zero_grad()
-        for step, (inp, target) in enumerate(zip(inputs_cache, targets_cache)):
+        for inp, target in zip(inputs_cache, targets_cache):
             with torch.enable_grad():
                 output = run_block_forward(block, inp, device)
                 target_hs = target.to(device)
-                # Scale loss so the effective gradient equals the mean over the mini-batch
-                loss = ((output - target_hs) ** 2).mean() / acc
-                loss.backward()
-            total_loss += loss.item() * acc
+                loss = ((output - target_hs) ** 2).mean()
 
-            is_last = (step == n - 1)
-            if (step + 1) % acc == 0 or is_last:
-                if max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-                optimizer.step()
                 optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+                optimizer.step()
 
-        avg = total_loss / n
+            total_loss += loss.item()
+
+        avg = total_loss / len(inputs_cache)
         if avg < best_mse:
             best_mse = avg
             best_state = {k: v.cpu().clone() for k, v in block.state_dict().items()}
@@ -834,7 +828,6 @@ def quantize_block(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
-    tune_batch_size=1,
     use_disk_cache=True,
 ):
     """
@@ -926,7 +919,6 @@ def quantize_block(
         epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
         optimizer_name=optimizer_name, momentum=momentum,
         binary_lr=binary_lr, continuous_lr=continuous_lr,
-        tune_batch_size=tune_batch_size,
     )
 
     final_mse = compute_block_mse(block, inputs_cache, targets_cache, dev, desc='Final block MSE')
@@ -1153,7 +1145,6 @@ def quantize_block_progressive(
         optimize_block_params(
             block, inputs_cache, targets_cache,
             epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
-            tune_batch_size=tune_batch_size,
         )
 
         mse_after = compute_block_mse(block, inputs_cache, targets_cache, dev)
@@ -1200,7 +1191,6 @@ def quantize_block_progressive_closed_form(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
-    tune_batch_size=1,
     tune_after_each_layer=False,
     use_closed_form=True,
     scale_refine=True,
@@ -1348,7 +1338,6 @@ def quantize_block_progressive_closed_form(
         print(f'  Block MSE after quantizing {lname}: {cur_mse:.6f}')
 
         if tune_after_each_layer and epochs > 0:
-            pre_opt_state = {k: v.cpu().clone() for k, v in current_block.state_dict().items()}
             optimize_block_params(
                 current_block,
                 inputs_cache,
@@ -1361,14 +1350,8 @@ def quantize_block_progressive_closed_form(
                 momentum=momentum,
                 binary_lr=binary_lr,
                 continuous_lr=continuous_lr,
-                tune_batch_size=tune_batch_size,
             )
             tuned_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'Tuned MSE {lname}')
-            if tuned_mse > cur_mse:
-                current_block.load_state_dict(pre_opt_state)
-                current_block.to(dev)
-                tuned_mse = cur_mse
-                print(f'  Optimization diverged, reverted to pre-optimization state')
             print(f'  Block MSE after tuning {lname}:     {tuned_mse:.6f} (Δ={tuned_mse - cur_mse:+.6f})')
 
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
@@ -1427,8 +1410,6 @@ def main():
                         help='Momentum used when --optimizer sgd')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
-    parser.add_argument('--tune_batch_size', type=int, default=8,
-                        help='Number of calibration samples per optimizer step during block tuning')
 
     # Mode
     parser.add_argument('--progressive', action='store_true',
@@ -1530,7 +1511,6 @@ def main():
         lr=args.lr,
         binary_lr=args.binary_lr,
         continuous_lr=args.continuous_lr,
-        tune_batch_size=args.tune_batch_size,
         optimizer_name=args.optimizer,
         momentum=args.momentum,
         max_grad_norm=args.max_grad_norm,
@@ -1570,7 +1550,6 @@ def main():
                 momentum=args.momentum,
                 binary_lr=args.binary_lr,
                 continuous_lr=args.continuous_lr,
-                tune_batch_size=args.tune_batch_size,
                 tune_after_each_layer=(args.progressive_mode == 'layer-tune'),
                 use_closed_form=(args.progressive_mode == 'closed-form-layer'),
                 scale_refine=not args.no_scale_refine,
