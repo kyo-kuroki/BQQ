@@ -4,10 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LM_DIR="${SCRIPT_DIR}/lm"
 
-
-MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
+MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)
-BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-2}"
+BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-1}"
 BIT_WIDTH="${BIT_WIDTH:-1}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
@@ -42,6 +41,14 @@ SEED="${SEED:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 NO_IO_CACHE="${NO_IO_CACHE:-1}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
+USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
+STE_REFINE="${STE_REFINE:-0}"
+STE_REFINE_STEPS="${STE_REFINE_STEPS:-200}"
+STE_REFINE_WEIGHT_DECAY="${STE_REFINE_WEIGHT_DECAY:-0.0}"
+STE_REFINE_BINARY_LR="${STE_REFINE_BINARY_LR:-1e-5}"
+STE_REFINE_CONTINUOUS_LR="${STE_REFINE_CONTINUOUS_LR:-1e-5}"
+STE_REFINE_LOG_INTERVAL="${STE_REFINE_LOG_INTERVAL:-20}"
+STE_REFINE_ROW_GROUP_BATCH_SIZE="${STE_REFINE_ROW_GROUP_BATCH_SIZE:-}"
 
 MODEL_BASENAME="${MODEL_NAME##*/}"
 LAYERWISE_DIR="${LAYERWISE_DIR:-${LM_DIR}/src/bqq_compressed_data/${MODEL_BASENAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
@@ -82,6 +89,11 @@ run_one_block() {
       --save_dir "${LAYERWISE_DIR}"
       "${assemble_args[@]}"
     )
+    if [[ "${USE_MULTIBQQ}" == "1" ]]; then
+      layerwise_cmd+=(--use_multibqq)
+    else
+      layerwise_cmd+=(--no_use_multibqq)
+    fi
     if [[ "${LAYERWISE_FIX_THETA}" == "1" ]]; then
       layerwise_cmd+=(--fix_theta)
     fi
@@ -117,6 +129,23 @@ run_one_block() {
     --save_dir "${BLOCKWISE_SAVE_DIR}"
     "${assemble_args[@]}"
   )
+  if [[ "${USE_MULTIBQQ}" == "1" ]]; then
+    blockwise_cmd+=(--use_multibqq)
+  else
+    blockwise_cmd+=(--no_use_multibqq)
+  fi
+  if [[ "${STE_REFINE}" == "1" ]]; then
+    blockwise_cmd+=(--ste_refine_steps "${STE_REFINE_STEPS}")
+    blockwise_cmd+=(--ste_refine_weight_decay "${STE_REFINE_WEIGHT_DECAY}")
+    blockwise_cmd+=(--ste_refine_log_interval "${STE_REFINE_LOG_INTERVAL}")
+    blockwise_cmd+=(--ste_refine_binary_lr "${STE_REFINE_BINARY_LR}")
+    blockwise_cmd+=(--ste_refine_continuous_lr "${STE_REFINE_CONTINUOUS_LR}")
+    if [[ -n "${STE_REFINE_ROW_GROUP_BATCH_SIZE}" ]]; then
+      blockwise_cmd+=(--ste_refine_row_group_batch_size "${STE_REFINE_ROW_GROUP_BATCH_SIZE}")
+    fi
+  else
+    blockwise_cmd+=(--ste_refine_steps 0)
+  fi
   if [[ "${BLOCKWISE_FIX_THETA}" == "1" ]]; then
     blockwise_cmd+=(--fix_theta)
   fi
@@ -191,7 +220,12 @@ if [[ "${BLOCK_IDX}" == "all" ]]; then
   done
   trap - EXIT
 
-  python "${LM_DIR}/src/build_bqq_model.py" assemble     --model_name "${MODEL_NAME}"     --block_dir "${BLOCKWISE_SAVE_DIR}"     --bit_width "${BIT_WIDTH}"     --group_size "${GROUP_SIZE}"     --output_dir "${ASSEMBLED_OUTPUT_DIR}"
+  python "${LM_DIR}/src/build_bqq_model.py" assemble \
+    --model_name "${MODEL_NAME}" \
+    --block_dir "${BLOCKWISE_SAVE_DIR}" \
+    --bit_width "${BIT_WIDTH}" \
+    --group_size "${GROUP_SIZE}" \
+    --output_dir "${ASSEMBLED_OUTPUT_DIR}"
 else
   run_one_block "${BLOCK_IDX}" 1 "$@"
 fi

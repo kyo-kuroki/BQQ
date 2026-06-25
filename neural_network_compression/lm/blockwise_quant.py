@@ -402,7 +402,19 @@ def get_quantizable_linears(block):
 
 def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             rank_scale, seed, device_id, H=None,
-                            scale_refine=True, damping=1e-6):
+                            scale_refine=True, damping=1e-6,
+                            use_multibqq=True,
+                            ste_refine_steps=0,
+                            ste_refine_lr=1e-3,
+                            ste_refine_weight_decay=0.0,
+                            ste_refine_binary_lr=None,
+                            ste_refine_continuous_lr=None,
+                            ste_refine_log_interval=20,
+                            ste_refine_optimize_factors=True,
+                            ste_refine_optimize_coeffs=True,
+                            ste_refine_optimize_theta=True,
+                            ste_refine_optimize_beta=True,
+                            ste_refine_row_group_batch_size=None):
     """Quantize a 2D weight tensor with BQQ. Returns (A, Y, Z) for BinaryQuadratic.
 
     If H is provided, uses intra-layer Hessian-aware BQQ (column-wise compensation).
@@ -422,7 +434,19 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
         )
         if H is not None:
             kwargs.update(H=H, hessian_mode='intra-layer-ste',
-                          scale_refine=scale_refine, damping=damping)
+                          scale_refine=scale_refine, damping=damping,
+                          use_multibqq=use_multibqq,
+                          ste_refine_steps=ste_refine_steps,
+                          ste_refine_lr=ste_refine_lr,
+                          ste_refine_weight_decay=ste_refine_weight_decay,
+                          ste_refine_binary_lr=ste_refine_binary_lr,
+                          ste_refine_continuous_lr=ste_refine_continuous_lr,
+                          ste_refine_log_interval=ste_refine_log_interval,
+                          ste_refine_optimize_factors=ste_refine_optimize_factors,
+                          ste_refine_optimize_coeffs=ste_refine_optimize_coeffs,
+                          ste_refine_optimize_theta=ste_refine_optimize_theta,
+                          ste_refine_optimize_beta=ste_refine_optimize_beta,
+                          ste_refine_row_group_batch_size=ste_refine_row_group_batch_size)
 
         quantizer.bqq_large_matrix_multi_worker(**kwargs)
         patches = torch.load(consolidated_path, weights_only=False, map_location='cpu')
@@ -457,6 +481,14 @@ def ensure_layerwise_block_available(
     binary_lr=None,
     continuous_lr=None,
     use_disk_cache=True,
+    ste_refine_steps=0,
+    ste_refine_lr=1e-3,
+    ste_refine_weight_decay=0.0,
+    ste_refine_binary_lr=None,
+    ste_refine_continuous_lr=None,
+    ste_refine_log_interval=20,
+    row_group_batch_size=None,
+    use_multibqq=True,
 ):
     """Generate missing layerwise quantization results for a block on demand."""
     layerwise_dir = Path(layerwise_dir)
@@ -482,17 +514,17 @@ def ensure_layerwise_block_available(
         seed=seed,
         scale_refine=scale_refine,
         damping=damping,
-        ste_refine_steps=200,
-        ste_refine_lr=1e-3,
-        ste_refine_weight_decay=0.0,
-        ste_refine_binary_lr=None,
-        ste_refine_continuous_lr=None,
-        ste_refine_log_interval=20,
+        ste_refine_steps=ste_refine_steps,
+        ste_refine_lr=ste_refine_lr,
+        ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_binary_lr=ste_refine_binary_lr,
+        ste_refine_continuous_lr=ste_refine_continuous_lr,
+        ste_refine_log_interval=ste_refine_log_interval,
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
         fix_beta=fix_beta,
-        row_group_batch_size=None,
-        use_multibqq=True,
+        row_group_batch_size=row_group_batch_size,
+        use_multibqq=use_multibqq,
         workers_per_gpu=1,
         calibration_loader=dataloader,
     )
@@ -836,6 +868,14 @@ def quantize_block(
     continuous_lr=None,
     tune_batch_size=1,
     use_disk_cache=True,
+    ste_refine_steps=0,
+    ste_refine_lr=1e-3,
+    ste_refine_weight_decay=0.0,
+    ste_refine_binary_lr=None,
+    ste_refine_continuous_lr=None,
+    ste_refine_log_interval=20,
+    ste_refine_row_group_batch_size=None,
+    use_multibqq=True,
 ):
     """
     Load a block from precomputed layerwise BQQ patches, then optimize the
@@ -1009,6 +1049,14 @@ def quantize_block_progressive(
     seqlen=None,
     nsamples=None,
     use_disk_cache=True,
+    ste_refine_steps=0,
+    ste_refine_lr=1e-3,
+    ste_refine_weight_decay=0.0,
+    ste_refine_binary_lr=None,
+    ste_refine_continuous_lr=None,
+    ste_refine_log_interval=20,
+    ste_refine_row_group_batch_size=None,
+    use_multibqq=True,
 ):
     """
     Quantize all Linear weights in a block via progressive patch-wise BQQ.
@@ -1141,6 +1189,14 @@ def quantize_block_progressive(
                 rank_scale=rank_scale,
                 seed=seed,
                 device_id=device_id,
+                use_multibqq=use_multibqq,
+                ste_refine_steps=ste_refine_steps,
+                ste_refine_lr=ste_refine_lr,
+                ste_refine_weight_decay=ste_refine_weight_decay,
+                ste_refine_binary_lr=ste_refine_binary_lr,
+                ste_refine_continuous_lr=ste_refine_continuous_lr,
+                ste_refine_log_interval=ste_refine_log_interval,
+                ste_refine_row_group_batch_size=ste_refine_row_group_batch_size,
             )
             for i, j in ij_list:
                 layer.quantize_patch(i, j, A_all[:, i, j, :], Y_all[:, i, j], Z_all[:, i, j])
@@ -1213,6 +1269,14 @@ def quantize_block_progressive_closed_form(
     seqlen=None,
     nsamples=None,
     use_disk_cache=True,
+    ste_refine_steps=0,
+    ste_refine_lr=1e-3,
+    ste_refine_weight_decay=0.0,
+    ste_refine_binary_lr=None,
+    ste_refine_continuous_lr=None,
+    ste_refine_log_interval=20,
+    ste_refine_row_group_batch_size=None,
+    use_multibqq=True,
 ):
     """Front-to-back layer quantization with closed-form continuous recentering.
 
@@ -1324,6 +1388,18 @@ def quantize_block_progressive_closed_form(
             H=H_current,
             scale_refine=scale_refine,
             damping=damping,
+            use_multibqq=use_multibqq,
+            ste_refine_steps=ste_refine_steps,
+            ste_refine_lr=ste_refine_lr,
+            ste_refine_weight_decay=ste_refine_weight_decay,
+            ste_refine_binary_lr=ste_refine_binary_lr,
+            ste_refine_continuous_lr=ste_refine_continuous_lr,
+            ste_refine_log_interval=ste_refine_log_interval,
+            ste_refine_optimize_factors=(binary_lr != 0),
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not fix_theta,
+            ste_refine_optimize_beta=not fix_beta,
+            ste_refine_row_group_batch_size=ste_refine_row_group_batch_size,
         )
         replace_linear_in_block(
             current_block,
@@ -1456,6 +1532,21 @@ def main():
                         help='[legacy] Directory to cache/load Hessian matrices')
     parser.add_argument('--no_scale_refine', action='store_true',
                         help='[legacy] Disable Hessian-aware scale refinement')
+    parser.add_argument('--use_multibqq', dest='use_multibqq', action='store_true', default=True,
+                        help='Jointly optimize all bits per column group with run_multibqq_compile_batched (default: enabled)')
+    parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false',
+                        help='Disable joint multibqq optimization and quantize bits sequentially')
+    parser.add_argument('--ste_refine_steps', type=int, default=0,
+                        help='Steps of STE refinement after Hessian-aware BQQ (0 disables)')
+    parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
+    parser.add_argument('--ste_refine_binary_lr', type=float, default=None,
+                        help='Learning rate for STE binary factors Y/Z')
+    parser.add_argument('--ste_refine_continuous_lr', type=float, default=None,
+                        help='Learning rate for STE continuous parameters')
+    parser.add_argument('--ste_refine_weight_decay', type=float, default=0.0)
+    parser.add_argument('--ste_refine_log_interval', type=int, default=20)
+    parser.add_argument('--ste_refine_row_group_batch_size', type=int, default=None,
+                        help='Batch size over independent row groups during STE refinement')
     parser.add_argument('--damping', type=float, default=1e-6)
 
     # Progressive mode only
@@ -1541,6 +1632,14 @@ def main():
         seqlen=args.seqlen,
         nsamples=args.nsamples,
         use_disk_cache=not args.no_io_cache,
+        ste_refine_steps=args.ste_refine_steps,
+        ste_refine_lr=args.ste_refine_lr,
+        ste_refine_weight_decay=args.ste_refine_weight_decay,
+        ste_refine_binary_lr=args.ste_refine_binary_lr,
+        ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+        ste_refine_log_interval=args.ste_refine_log_interval,
+        ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
+        use_multibqq=args.use_multibqq,
     )
 
     layerwise_dir = args.layerwise_dir
@@ -1583,6 +1682,14 @@ def main():
                 seqlen=args.seqlen,
                 nsamples=args.nsamples,
                 use_disk_cache=not args.no_io_cache,
+                ste_refine_steps=args.ste_refine_steps,
+                ste_refine_lr=args.ste_refine_lr,
+                ste_refine_weight_decay=args.ste_refine_weight_decay,
+                ste_refine_binary_lr=args.ste_refine_binary_lr,
+                ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+                ste_refine_log_interval=args.ste_refine_log_interval,
+                ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
+                use_multibqq=args.use_multibqq,
             )
     else:
         quantize_block(
