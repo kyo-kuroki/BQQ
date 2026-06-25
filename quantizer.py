@@ -1879,19 +1879,28 @@ class BinaryQuadraticQuantization():
                             'bit_idx': bit_idx,
                         })
 
-            # Compensation: GPTQ-style update using precomputed H_inv.
-            # Correct formula (per GPTQ paper): err = E_j / diag(H_inv[c0:c1,c0:c1]),
-            # then W_work[:, c1:] -= err @ H_inv[c0:c1, c1:]
+            # Block GPTQ-style update using precomputed H_inv.
+            # For block B = c0:c1 and remaining R = c1:,
+            # W_R <- W_R - E_B @ inv(Hinv_BB) @ Hinv_BR.
+            # We compute inv(Hinv_BB) @ Hinv_BR by solve, without forming inverse.
             if H_inv is not None and c1 < original_w:
                 E_j = W_work[:, c0:c1] - Wq[:, c0:c1]
-                d = H_inv[c0:c1, c0:c1].diagonal().clamp(min=1e-8)
-                E_normalized = E_j / d[None, :]
-                update = E_normalized @ H_inv[c0:c1, c1:]
-                if torch.isfinite(update).all():
-                    W_work[:, c1:] -= update
-                    print(f'  Compensated remaining {original_w - c1} columns')
-                else:
-                    print(f'  WARNING: compensation update non-finite, skipping')
+
+                Hinv_BB = H_inv[c0:c1, c0:c1]
+                Hinv_BR = H_inv[c0:c1, c1:]
+
+                try:
+                    M = torch.linalg.solve(Hinv_BB, Hinv_BR)
+                    update = E_j @ M
+
+                    if torch.isfinite(update).all():
+                        W_work[:, c1:] -= update
+                        print(f'  Block-compensated remaining {original_w - c1} columns')
+                    else:
+                        print(f'  WARNING: compensation update non-finite, skipping')
+
+                except RuntimeError as e:
+                    print(f'  WARNING: block compensation solve failed: {e}')
 
         # --- Optional: inter-bit Hessian-aware scale refinement ---
         if scale_refine:
