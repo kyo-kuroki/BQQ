@@ -1219,7 +1219,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1234,9 +1234,9 @@ class BinaryQuadraticQuantization():
             damping: Hessian-awareのTikhonov正則化。
         """
         if H is not None and hessian_mode == 'intra-layer-ste':
-            initial_weight = self._intra_layer_hessian_aware_large_matrix_batched(
+            initial_weight = self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode)
             if ste_refine_steps > 0:
                 refined_weight, _, _ = self.refine_decomposition_with_ste(
                     all_decomposed=consolidated_path,
@@ -1258,9 +1258,9 @@ class BinaryQuadraticQuantization():
                 return refined_weight
             return initial_weight
         elif H is not None and hessian_mode == 'intra-layer':
-            return self._intra_layer_hessian_aware_large_matrix_batched(
+            return self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -1734,10 +1734,10 @@ class BinaryQuadraticQuantization():
 
 
 
-    def _intra_layer_hessian_aware_large_matrix_batched(
+    def _hessian_aware_large_matrix_batched(
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
-        damping=1e-6, scale_refine=True, use_multibqq=True,
+        damping=1e-6, scale_refine=True, use_multibqq=True, compensation_mode='ldlq',
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -1789,18 +1789,50 @@ class BinaryQuadraticQuantization():
 
         x_tensor = torch.tensor(x_copy).float()
         H = H.to(dtype=torch.float32, device=x_tensor.device)
+        H = 0.5 * (H + H.T)
         num_col_groups = len(w_ranges)
+        compensation_mode = str(compensation_mode).lower()
+        valid_modes = {'gptq', 'ldlq', 'none'}
+        if compensation_mode not in valid_modes:
+            raise ValueError(f'Unknown compensation_mode={compensation_mode!r}; expected one of {sorted(valid_modes)}')
 
-        # GPTQ-style: precompute damped H_inv once to guarantee finite compensation.
-        # Per-group solve of H[c1:,c1:]^{-1} is numerically unstable for ill-conditioned H.
-        COMP_DAMPING = 0.01  # 1% relative damping, same default as GPTQ paper
-        _L = self._cholesky_safe(H, COMP_DAMPING)
-        if _L is not None:
-            H_inv = torch.cholesky_inverse(_L)
-            print(f'Precomputed H_inv for compensation ({list(H_inv.shape)}, damping={COMP_DAMPING})')
+        COMP_DAMPING = 0.01  # 1% relative damping, same default used by GPTQ-style compensation.
+        mean_diag = torch.mean(torch.diag(H)).clamp_min(1e-12)
+        H_damped = H + (COMP_DAMPING * mean_diag) * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
+
+        H_inv = None
+        ldlq_U = None
+        if compensation_mode == 'gptq':
+            # GPTQ/OPTQ form: use the inverse Hessian feedback.
+            _L = self._cholesky_safe(H, COMP_DAMPING)
+            if _L is not None:
+                H_inv = torch.cholesky_inverse(_L)
+                print(f'Precomputed H_inv for GPTQ compensation ({list(H_inv.shape)}, damping={COMP_DAMPING})')
+            else:
+                compensation_mode = 'none'
+                print('WARNING: Cholesky failed, compensation disabled')
+        elif compensation_mode == 'ldlq':
+            try:
+                # LDLQ over the actual column groups:
+                # H = (I + U_blk) D_blk (I + U_blk)^T. Eliminate blocks from
+                # right to left so U_{P,B} = H_{P,B} H_{B,B}^{-1}.
+                ldlq_U = torch.zeros_like(H_damped)
+                H_cur = H_damped.clone()
+                for b0, b1 in reversed(w_ranges):
+                    if b0 <= 0:
+                        continue
+                    H_BB = H_cur[b0:b1, b0:b1]
+                    H_PB = H_cur[:b0, b0:b1]
+                    U_PB = torch.linalg.solve(H_BB.T, H_PB.T).T
+                    ldlq_U[:b0, b0:b1] = U_PB
+                    H_cur[:b0, :b0] -= U_PB @ H_cur[b0:b1, :b0]
+                    H_cur[:b0, :b0] = 0.5 * (H_cur[:b0, :b0] + H_cur[:b0, :b0].T)
+                print(f'Precomputed LDLQ block U ({list(ldlq_U.shape)}, {num_col_groups} groups, damping={COMP_DAMPING})')
+            except RuntimeError as e:
+                compensation_mode = 'none'
+                print(f'WARNING: LDLQ block decomposition failed, compensation disabled: {e}')
         else:
-            H_inv = None
-            print('WARNING: Cholesky failed, compensation disabled')
+            print('Column compensation disabled')
 
         all_decomposed = []
         Wq = torch.zeros(original_h, original_w, dtype=dtype)
@@ -1879,28 +1911,34 @@ class BinaryQuadraticQuantization():
                             'bit_idx': bit_idx,
                         })
 
-            # Block GPTQ-style update using precomputed H_inv.
-            # For block B = c0:c1 and remaining R = c1:,
-            # W_R <- W_R - E_B @ inv(Hinv_BB) @ Hinv_BR.
-            # We compute inv(Hinv_BB) @ Hinv_BR by solve, without forming inverse.
-            if H_inv is not None and c1 < original_w:
+            if compensation_mode != 'none' and c1 < original_w:
                 E_j = W_work[:, c0:c1] - Wq[:, c0:c1]
 
-                Hinv_BB = H_inv[c0:c1, c0:c1]
-                Hinv_BR = H_inv[c0:c1, c1:]
-
                 try:
-                    M = torch.linalg.solve(Hinv_BB, Hinv_BR)
-                    update = E_j @ M
+                    if compensation_mode == 'gptq':
+                        # Block GPTQ update: W_R <- W_R - E_B @ inv(Hinv_BB) @ Hinv_BR.
+                        Hinv_BB = H_inv[c0:c1, c0:c1]
+                        Hinv_BR = H_inv[c0:c1, c1:]
+                        M = torch.linalg.solve(Hinv_BB, Hinv_BR)
+                        update = -(E_j @ M)
+                    else:
+                        # LDLQ nearest-plane feedback: after fixing block B, update
+                        # every future column by the precomputed coupling U_{B,R}.
+                        update = E_j @ ldlq_U[c0:c1, c1:]
 
                     if torch.isfinite(update).all():
-                        W_work[:, c1:] -= update
-                        print(f'  Block-compensated remaining {original_w - c1} columns')
+                        W_work[:, c1:] += update
+                        print(f'  {compensation_mode.upper()}-compensated remaining {original_w - c1} columns')
                     else:
-                        print(f'  WARNING: compensation update non-finite, skipping')
+                        print(f'  WARNING: {compensation_mode} compensation update non-finite, skipping')
 
                 except RuntimeError as e:
-                    print(f'  WARNING: block compensation solve failed: {e}')
+                    print(f'  WARNING: {compensation_mode} compensation solve failed: {e}')
+
+        E_final = Wq - x_tensor
+        hessian_loss = torch.sum((E_final @ H) * E_final).item()
+        mse_loss = torch.mean(E_final.pow(2)).item()
+        print(f'Final compensation={compensation_mode}: hessian_loss={hessian_loss:.6e}, mse={mse_loss:.6e}')
 
         # --- Optional: inter-bit Hessian-aware scale refinement ---
         if scale_refine:

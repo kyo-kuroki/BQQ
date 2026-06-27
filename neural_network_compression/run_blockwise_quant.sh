@@ -42,6 +42,7 @@ DEVICE="${DEVICE:-cuda:0}"
 NO_IO_CACHE="${NO_IO_CACHE:-1}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
+COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
 STE_REFINE="${STE_REFINE:-0}"
 STE_REFINE_STEPS="${STE_REFINE_STEPS:-200}"
 STE_REFINE_WEIGHT_DECAY="${STE_REFINE_WEIGHT_DECAY:-0.0}"
@@ -87,6 +88,7 @@ run_one_block() {
       --seqlen "${SEQLEN}"
       --seed "${SEED}"
       --save_dir "${LAYERWISE_DIR}"
+      --compensation_mode "${COMPENSATION_MODE}"
       "${assemble_args[@]}"
     )
     if [[ "${USE_MULTIBQQ}" == "1" ]]; then
@@ -134,6 +136,7 @@ run_one_block() {
   else
     blockwise_cmd+=(--no_use_multibqq)
   fi
+  blockwise_cmd+=(--compensation_mode "${COMPENSATION_MODE}")
   if [[ "${STE_REFINE}" == "1" ]]; then
     blockwise_cmd+=(--ste_refine_steps "${STE_REFINE_STEPS}")
     blockwise_cmd+=(--ste_refine_weight_decay "${STE_REFINE_WEIGHT_DECAY}")

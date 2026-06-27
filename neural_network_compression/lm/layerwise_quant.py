@@ -226,6 +226,7 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             hessian_mode='intra-layer-ste',
             scale_refine=common['scale_refine'],
             use_multibqq=common['use_multibqq'],
+            compensation_mode=common['compensation_mode'],
             ste_refine_steps=common['ste_refine_steps'],
             ste_refine_lr=common['ste_refine_lr'],
             ste_refine_weight_decay=common['ste_refine_weight_decay'],
@@ -282,6 +283,7 @@ def layerwise_quantize(
     fix_beta: bool,
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
+    compensation_mode: str,
     calibration_loader,
     layer_threshold: int = 0,
     target_idx: Optional[int] = None,
@@ -370,6 +372,7 @@ def layerwise_quantize(
             hessian_mode='intra-layer-ste',
             scale_refine=scale_refine,
             use_multibqq=use_multibqq,
+            compensation_mode=compensation_mode,
             ste_refine_steps=ste_refine_steps,
             ste_refine_lr=ste_refine_lr,
             ste_refine_weight_decay=ste_refine_weight_decay,
@@ -418,6 +421,7 @@ def layerwise_quantize_block(
     fix_beta: bool,
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
+    compensation_mode: str,
     workers_per_gpu: int,
     calibration_loader,
 ):
@@ -535,6 +539,7 @@ def layerwise_quantize_block(
         fix_beta=fix_beta,
         row_group_batch_size=row_group_batch_size,
         use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
         n_gpus=n_gpus,
     )
 
@@ -573,6 +578,8 @@ def main():
                         help='Jointly optimize all bits per column group with run_multibqq_compile_batched (default: enabled)')
     parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false',
                         help='Disable joint multibqq optimization and quantize bits sequentially')
+    parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
+                        help='Column compensation mode for Hessian-aware BQQ')
 
     # STE refinement
     parser.add_argument('--ste_refine_steps', type=int, default=1000)
@@ -680,6 +687,7 @@ def main():
             fix_beta=args.fix_beta,
             row_group_batch_size=args.row_group_batch_size,
             use_multibqq=args.use_multibqq,
+            compensation_mode=args.compensation_mode,
             workers_per_gpu=args.workers_per_gpu,
             calibration_loader=train_loader,
         )
@@ -718,6 +726,7 @@ def main():
         fix_beta=args.fix_beta,
         row_group_batch_size=args.row_group_batch_size,
         use_multibqq=args.use_multibqq,
+        compensation_mode=args.compensation_mode,
         calibration_loader=train_loader,
         layer_threshold=args.layer_threshold,
         target_idx=args.target_idx,

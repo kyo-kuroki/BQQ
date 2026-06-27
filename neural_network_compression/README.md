@@ -1,33 +1,51 @@
 # neural_network_compression
 
 Tools for applying BQQ to pretrained neural networks.
-The current LM path is centered on `layerwise -> blockwise -> fine_tuning`, with wrapper scripts for the standard flow.
+The current LM path has three recommended accuracy/speed tiers: layerwise quantization, blockwise quantization, and optional fine-tuning.
 
 ## Quick Start
 
-The standard LM workflow is:
+Choose the entry point by the speed/accuracy tradeoff you want:
 
-1. `run_blockwise_quant.sh`
-2. `run_fine_tuning.sh`
+- Fast / mild accuracy: `run_layerwise_quant.sh`
+- Medium speed / medium accuracy: `run_blockwise_quant.sh`
+- Slow / high accuracy: `run_fine_tuning.sh` after a quantized model has been built
 
-Minimal example:
+Minimal examples:
 
 ```bash
 cd neural_network_compression
 
+# Fast: independent layerwise Hessian-aware quantization.
+./run_layerwise_quant.sh
+
+# Medium: blockwise quantization/tuning.
 ./run_blockwise_quant.sh
+
+# Slow: fine-tune an assembled quantized model.
 ./run_fine_tuning.sh
 ```
 
-By default, `run_blockwise_quant.sh` now quantizes all transformer blocks in order.
-It runs block-level layerwise quantization first, then blockwise tuning, and assembles the full quantized model after the last block.
+`run_layerwise_quant.sh` assigns one transformer block to each GPU job, collects all Hessians for that block once, then quantizes the block's Linear layers in parallel with `LAYERS_PER_GPU`.
+
+`run_blockwise_quant.sh` assigns transformer blocks to GPU jobs and performs blockwise quantization/tuning. The current default is `PROGRESSIVE=1` with `PROGRESSIVE_MODE=layer-tune`; set `PROGRESSIVE=0` to use the older layerwise-first then block-tuning flow.
+
+`run_fine_tuning.sh` starts from an assembled quantized model and performs STE fine-tuning.
 
 Useful overrides:
 
 ```bash
+MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_layerwise_quant.sh
 MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_blockwise_quant.sh
-MODEL_NAME=Qwen/Qwen3.5-2B BLOCK_IDX=0 ./run_blockwise_quant.sh
-MODEL_NAME=Qwen/Qwen3.5-2B ./run_fine_tuning.sh
+MODEL_NAME=Qwen/Qwen3.5-2B MODEL_PATH=/path/to/quantized.pth ./run_fine_tuning.sh
+
+# Select GPUs and parallelism.
+GPU_IDS=0,1,2,3 LAYERS_PER_GPU=4 ./run_layerwise_quant.sh
+GPU_IDS=0,1,2,3 BLOCKS_PER_GPU=1 ./run_blockwise_quant.sh
+
+# Process one block manually.
+BLOCK_IDX=0 ./run_layerwise_quant.sh
+BLOCK_IDX=0 ./run_blockwise_quant.sh
 ```
 
 Notes:
@@ -35,6 +53,8 @@ Notes:
 - Default calibration dataset in the wrapper scripts: `slimpajama`
 - Default assembled quantized model directory: `lm/src/quantized_models/<model>/`
 - Default fine-tuned model directory: `lm/fine_tuned_models/<model>/`
+- Default Hessian-aware compensation mode: `ldlq`
+- Layerwise outputs are saved under `lm/src/bqq_compressed_data/<model>-<bit>bit-<gs>gs-<steps>step/`
 
 ## Standard Outputs
 
@@ -44,7 +64,7 @@ Typical directories:
 neural_network_compression/
 ├── lm/
 │   ├── src/
-│   │   ├── bqq_compressed_data/<model>-<gs>gs-<steps>step>/
+│   │   ├── bqq_compressed_data/<model>-<bit>bit-<gs>gs-<steps>step/
 │   │   │   └── _consolidated/<full_layer_name>.pth
 │   │   └── quantized_models/<model>/
 │   │       ├── <model>-<bit>bit-<gs>gs.pth
@@ -62,47 +82,88 @@ neural_network_compression/
 
 ### Recommended pipeline
 
-The recommended LM pipeline is:
+Use one of these wrapper scripts first:
 
-1. `blockwise_quant.py`
-2. `fine_tuning.py`
+1. `run_layerwise_quant.sh` for the fastest layerwise-only quantized model
+2. `run_blockwise_quant.sh` for blockwise quantization/tuning
+3. `run_fine_tuning.sh` to improve an already assembled quantized model
 
-In practice, the wrapper `run_blockwise_quant.sh` is the normal entry point.
-Its default behavior is:
+### Wrapper Configuration
 
-1. Determine the number of transformer blocks
-2. Run `layerwise_quant.py --block_idx <i>` for each block
-3. Run `blockwise_quant.py --block_idx <i>` for each block
-4. Save `block_<i>.pth` into `lm/blockwise_output/<model>/`
-5. Assemble the full blockwise model once, after the final block
+Common environment variables:
 
-You only need `BLOCK_IDX=<n>` when you want to process a single block manually.
+- `MODEL_NAME`: Hugging Face model id
+- `BIT_WIDTH`: BQQ bit width
+- `GROUP_SIZE`: column group / patch width
+- `DATASET`: calibration dataset, one of `wikitext2`, `ptb`, `c4`, `slimpajama`
+- `NSAMPLES`: number of calibration samples
+- `SEQLEN`: calibration sequence length
+- `SEED`: random seed
+- `GPU_IDS`: comma-separated GPU ids; defaults to all visible GPUs
+- `USE_MULTIBQQ`: `1` uses joint multi-bit BQQ optimization, `0` disables it
+- `COMPENSATION_MODE`: `ldlq`, `gptq`, or `none`; default is `ldlq`
+- `NO_SCALE_REFINE`: `1` disables scale refinement, `0` enables it when the wrapper supports it
 
-### Wrapper configuration
+`run_layerwise_quant.sh` variables:
 
-`run_blockwise_quant.sh` exposes the main knobs as environment variables.
-Important ones are:
+- `BLOCK_IDX`: `all` or a single transformer block index
+- `LAYERS_PER_GPU`: number of layer quantization workers inside each block job
+- `LAYERWISE_ANNEAL_STEPS`: BQQ annealing steps
+- `LAYERWISE_STE_STEPS`: optional STE refinement steps after layerwise BQQ
+- `LAYERWISE_STE_BINARY_LR`: STE learning rate for binary factors
+- `LAYERWISE_STE_CONTINUOUS_LR`: STE learning rate for continuous parameters
+- `LAYERWISE_ROW_GROUP_BATCH_SIZE`: optional row-group minibatch size during STE refinement
+- `LAYERWISE_FIX_THETA`: `1` freezes thresholds
+- `LAYERWISE_FIX_BETA`: `1` freezes sigmoid temperature
+- `LAYERWISE_DIR`: output directory for per-layer BQQ tensors
+- `ASSEMBLED_OUTPUT_DIR`: output directory for the assembled model
 
-- `MODEL_NAME`
-- `BLOCK_IDX`
-  Default: `all`
-- `BIT_WIDTH`
-- `GROUP_SIZE`
-- `LAYERWISE_ANNEAL_STEPS`
-- `LAYERWISE_STE_STEPS`
-- `BLOCKWISE_EPOCHS`
-- `DATASET`
-- `NSAMPLES`
-- `SEQLEN`
+`run_blockwise_quant.sh` variables:
 
-Example:
+- `BLOCK_IDX`: `all` or a single transformer block index
+- `BLOCKS_PER_GPU`: number of block jobs per GPU
+- `PROGRESSIVE`: `1` uses progressive blockwise quantization; `0` runs separate layerwise quantization first
+- `PROGRESSIVE_MODE`: `layer-tune`, `closed-form-layer`, or `patch`
+- `LAYERWISE_WORKERS_PER_GPU`: layerwise worker count used when `PROGRESSIVE=0`
+- `BLOCKWISE_EPOCHS`: block tuning epochs
+- `BLOCKWISE_OPTIMIZER`: `adamw`, `adam`, or `sgd`
+- `BLOCKWISE_LR`: base blockwise learning rate
+- `BLOCKWISE_BINARY_LR`: blockwise learning rate for binary factors
+- `BLOCKWISE_CONTINUOUS_LR`: blockwise learning rate for continuous parameters
+- `BLOCKWISE_TUNE_BATCH_SIZE`: block tuning minibatch size
+- `STE_REFINE`: `1` enables extra STE refinement inside blockwise quantization
+- `STE_REFINE_STEPS`: extra STE refinement steps when `STE_REFINE=1`
+- `NO_IO_CACHE`: `1` avoids writing block I/O caches to disk
+- `BLOCKWISE_SAVE_DIR`: output directory for `block_<idx>.pth`
+
+`run_fine_tuning.sh` variables:
+
+- `MODEL_PATH`: assembled quantized model path
+- `FINETUNE_EPOCHS`: number of fine-tuning epochs
+- `FINETUNE_LR`: base learning rate
+- `FINETUNE_BINARY_LR`: learning rate for trainable binary factors
+- `FINETUNE_CONTINUOUS_LR`: learning rate for continuous parameters
+- `GRADIENT_ACCUMULATION_STEPS`: gradient accumulation
+- `MAX_SEQ_LENGTH`: SFT sequence length
+- `FINETUNE_FIX_THETA`: `1` freezes thresholds
+- `FINETUNE_FIX_BETA`: `1` freezes sigmoid temperature
+- `OUTPUT_DIR`: fine-tuned model output directory
+
+Examples:
 
 ```bash
 MODEL_NAME=Qwen/Qwen3.5-2B \
 BIT_WIDTH=2 \
 GROUP_SIZE=64 \
-LAYERWISE_ANNEAL_STEPS=10000 \
-BLOCKWISE_EPOCHS=3 \
+LAYERWISE_ANNEAL_STEPS=50000 \
+LAYERS_PER_GPU=4 \
+./run_layerwise_quant.sh
+
+MODEL_NAME=Qwen/Qwen3.5-2B \
+BIT_WIDTH=2 \
+GROUP_SIZE=64 \
+BLOCKWISE_EPOCHS=1 \
+PROGRESSIVE=1 \
 ./run_blockwise_quant.sh
 ```
 
@@ -160,24 +221,35 @@ python layerwise_quant.py \
     --dataset slimpajama \
     --nsamples 1024 \
     --seqlen 2048 \
-    --save_dir src/bqq_compressed_data/Qwen3.5-2B-64gs-10000step
+    --workers_per_gpu 4 \
+    --compensation_mode ldlq \
+    --save_dir src/bqq_compressed_data/Qwen3.5-2B-2bit-64gs-10000step \
+    --no_assemble_full_model
 ```
 
 This path includes:
 
-- intra-layer Hessian-aware quantization
+- Hessian-aware quantization with `ldlq`, `gptq`, or no compensation
 - default `multibqq` joint bit optimization
 - optional STE refinement
-- automatic full-model assembly by default
+- block-local Hessian collection when `--block_idx` is used
+- automatic full-model assembly by default unless `--no_assemble_full_model` is passed
 
 Useful arguments:
 
+- `--block_idx`
+- `--workers_per_gpu`
+- `--compensation_mode ldlq|gptq|none`
+- `--scale_refine`
 - `--ste_refine_steps`
 - `--ste_refine_binary_lr`
 - `--ste_refine_continuous_lr`
 - `--refine_coeffs_only`
 - `--fix_theta`
+- `--fix_beta`
+- `--use_multibqq`
 - `--no_use_multibqq`
+- `--no_assemble_full_model`
 
 ### Blockwise tuning
 
@@ -202,29 +274,50 @@ python blockwise_quant.py \
     --binary_lr 3e-4 \
     --continuous_lr 1e-3 \
     --device cuda:0 \
-    --save_dir blockwise_output/Qwen3.5-2B
+    --layerwise_dir src/bqq_compressed_data/Qwen3.5-2B-2bit-64gs-10000step \
+    --save_dir blockwise_output/Qwen3.5-2B \
+    --progressive \
+    --progressive_mode layer-tune \
+    --no_io_cache \
+    --no_scale_refine \
+    --compensation_mode ldlq
 ```
 
-Standard mode does this:
+Progressive layer-tune mode does this:
 
-1. Cache block input/output activations
-2. Ensure block-local layerwise outputs exist
-3. Load the block with STE-trainable BQQ modules
-4. Optimize block output MSE
+1. Collect/cache the block inputs needed for sequential layer quantization
+2. Quantize Linear layers in block order with Hessian-aware BQQ
+3. Optionally run STE refinement for each layer
+4. Build the quantized block and tune block output MSE
 5. Save `block_<idx>.pth`
 6. Optionally assemble the full quantized model
 
+With `PROGRESSIVE=0` in the wrapper, the flow becomes:
+
+1. Run `layerwise_quant.py --block_idx <i>` first
+2. Load those layerwise outputs into `blockwise_quant.py`
+3. Tune the block-level output MSE
+
 Useful arguments:
 
+- `--progressive`
+- `--progressive_mode layer-tune|closed-form-layer|patch`
+- `--compensation_mode ldlq|gptq|none`
+- `--use_multibqq`
+- `--no_use_multibqq`
+- `--no_io_cache`
+- `--no_scale_refine`
+- `--ste_refine_steps`
+- `--ste_refine_binary_lr`
+- `--ste_refine_continuous_lr`
 - `--optimizer adamw|sgd`
 - `--momentum`
 - `--binary_lr`
 - `--continuous_lr`
 - `--refine_coeffs_only`
 - `--fix_theta`
+- `--fix_beta`
 - `--no_assemble_full_model`
-
-`--progressive` remains available for the older progressive patch-wise quantization path, but it is not the recommended default flow.
 
 ### Fine-tuning
 

@@ -15,160 +15,169 @@ BQQ/
 ├── matrix_compression/                  # Standalone matrix compression experiments
 └── neural_network_compression/
     ├── lm/                              # Language model quantization
-    │   ├── weight_aware_quant_cached.py # Main entry point (prepare-cache / quantize-target / extend-target)
-    │   ├── build_bqq_model.py  # Replace Linear→BinaryQuadratic, build model from patches or blocks
+    │   ├── layerwise_quant.py           # Hessian-aware layerwise quantization
+    │   ├── blockwise_quant.py           # Blockwise/progressive quantization and tuning
+    │   ├── fine_tuning.py               # STE fine-tuning for assembled BQQ models
+    │   ├── src/build_bqq_model.py       # Replace Linear→BinaryQuadratic, build model from patches or blocks
     │   ├── scale_refine_bqq.py          # Post-quantization scale refinement
-    │   ├── evaluation.py                # PPL / downstream evaluation
-    │   ├── qsub_submit_qwen35.sh        # SGE job submission orchestrator
-    │   ├── qsub_patch_array_job.sh      # SGE array job: quantize-target
-    │   └── qsub_extend_array_job.sh     # SGE array job: extend-target
+    │   └── src/evaluation.py            # PPL / downstream evaluation
+    ├── run_layerwise_quant.sh           # Fast layerwise wrapper
+    ├── run_blockwise_quant.sh           # Medium blockwise wrapper
+    ├── run_fine_tuning.sh               # Slow/high-accuracy fine-tuning wrapper
     └── cv/                              # Vision model quantization
 ```
 
-## Quick start (Language model quantization)
+## Quick Start (Language Model Quantization)
 
-The following workflow is designed for an SGE cluster with GPUs and Apptainer.
+Choose the entry point by the speed/accuracy tradeoff you want:
 
-### Step 0: Environment variables
+- Fast / mild accuracy: `neural_network_compression/run_layerwise_quant.sh`
+- Medium speed / medium accuracy: `neural_network_compression/run_blockwise_quant.sh`
+- Slow / high accuracy: `neural_network_compression/run_fine_tuning.sh` after a quantized model has been built
 
-Set paths according to your environment:
-
-```bash
-export BQQ_ROOT=/path/to/BQQ
-export LM_DIR=$BQQ_ROOT/neural_network_compression/lm
-export HF_HOME=/path/to/hf_cache
-export SIF_PATH=/path/to/pytorch_llm_vllm.sif
-```
-
-### Step 1: N-bit quantization (batch submission)
-
-`qsub_submit_qwen35.sh` automates the full pipeline: cache creation, target listing, and SGE array job submission.
+Minimal examples:
 
 ```bash
-cd $LM_DIR
+cd neural_network_compression
 
-# Quantize Qwen3.5-{2B, 4B, 9B} at 2-bit, group_size=32
-bash qsub_submit_qwen35.sh \
-    --bit_width 2 \
-    --group_size 32 \
-    --num_steps 10000 \
-    --walltime 8:00:00 \
-    --workers_per_gpu 1024
+# Fast: independent layerwise Hessian-aware quantization.
+./run_layerwise_quant.sh
+
+# Medium: blockwise quantization/tuning.
+./run_blockwise_quant.sh
+
+# Slow: fine-tune an assembled quantized model.
+./run_fine_tuning.sh
 ```
 
-**What it does** (for each model):
+`run_layerwise_quant.sh` assigns one transformer block to each GPU job, collects all Hessians for that block once, then quantizes the block's Linear layers in parallel with `LAYERS_PER_GPU`.
 
-1. `prepare-cache` -- Load the model and cache all Linear weight tensors to disk
-2. `list-targets` -- Write all quantization target names to `targets.txt`
-3. `qsub` -- Submit an SGE array job (1 task = 1 weight matrix, each task runs 384 parallel workers on 1 GPU)
+`run_blockwise_quant.sh` assigns transformer blocks to GPU jobs and performs blockwise quantization/tuning. The current default is `PROGRESSIVE=1` with `PROGRESSIVE_MODE=layer-tune`; set `PROGRESSIVE=0` to use the older layerwise-first then block-tuning flow.
 
-**Output**:
-- Patch files: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}_row{i}_col{j}.pth`
-- Reconstructed tensors: `bqq_compressed_data/{model}-{gs}gs-{steps}step/{target}.pth`
+`run_fine_tuning.sh` starts from an assembled quantized model and performs STE fine-tuning.
 
-### Step 2: Extend to higher bit-depth (extend-target)
-
-Extend N-bit results to (N+k)-bit by optimising the residual. Run after the base quantization completes.
+Useful overrides:
 
 ```bash
-MODEL=Qwen3.5-2B
-JOB_DIR=$LM_DIR/qsub_jobs/${MODEL}-bit3-gs32
+MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_layerwise_quant.sh
+MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_blockwise_quant.sh
+MODEL_NAME=Qwen/Qwen3.5-2B MODEL_PATH=/path/to/quantized.pth ./run_fine_tuning.sh
 
-# Reuse targets.txt from the 2-bit job
-mkdir -p $JOB_DIR/logs
-cp $LM_DIR/qsub_jobs/${MODEL}-bit2-gs32/targets.txt $JOB_DIR/targets.txt
+# Select GPUs and parallelism.
+GPU_IDS=0,1,2,3 LAYERS_PER_GPU=4 ./run_layerwise_quant.sh
+GPU_IDS=0,1,2,3 BLOCKS_PER_GPU=1 ./run_blockwise_quant.sh
 
-N_TARGETS=$(wc -l < $JOB_DIR/targets.txt)
-
-qsub -g <group> -t 1-${N_TARGETS}:1 \
-    -l gpu_1=1 -l h_rt=8:00:00 -j y \
-    -N "ext3b_${MODEL}" \
-    -o "$JOB_DIR/logs/" \
-    -v LM_SCRIPT_DIR=$LM_DIR \
-    -v TARGETS_LIST_FILE=$JOB_DIR/targets.txt \
-    -v SOURCE_DIR=$LM_DIR/bqq_compressed_data/${MODEL}-32gs-10000step \
-    -v SAVE_DIR=$LM_DIR/bqq_compressed_data/${MODEL}-32gs-10000step-3bit \
-    -v CACHE_DIR=$LM_DIR/cache/${MODEL}-layer0 \
-    -v SIF_PATH=$SIF_PATH -v HF_HOME=$HF_HOME \
-    -v EXTRA_BITS=1 -v GROUP_SIZE=32 -v NUM_STEPS=10000 \
-    -v WORKERS_PER_GPU=384 -v RANK_SCALE=1.0 \
-    $LM_DIR/qsub_extend_array_job.sh
+# Process one block manually.
+BLOCK_IDX=0 ./run_layerwise_quant.sh
+BLOCK_IDX=0 ./run_blockwise_quant.sh
 ```
 
-### Step 3: Build BQQ model
+Notes:
 
-Convert patch files into `BinaryQuadratic` modules and save a model that preserves the binary decomposition (Y, Z, A coefficients). On the first run, patch files are consolidated into per-target files under `_consolidated/` for fast loading.
+- Default calibration dataset in the wrapper scripts: `slimpajama`
+- Default assembled quantized model directory: `neural_network_compression/lm/src/quantized_models/<model>/`
+- Default fine-tuned model directory: `neural_network_compression/lm/fine_tuned_models/<model>/`
+- Default Hessian-aware compensation mode: `ldlq`
+- Layerwise outputs are saved under `neural_network_compression/lm/src/bqq_compressed_data/<model>-<bit>bit-<gs>gs-<steps>step/`
+
+## Standard Outputs
+
+Typical LM directories:
+
+```text
+neural_network_compression/
+├── lm/
+│   ├── src/
+│   │   ├── bqq_compressed_data/<model>-<bit>bit-<gs>gs-<steps>step/
+│   │   │   └── _consolidated/<full_layer_name>.pth
+│   │   └── quantized_models/<model>/
+│   │       ├── <model>-<bit>bit-<gs>gs.pth
+│   │       └── <model>-<bit>bit-<gs>gs-blockwise.pth
+│   ├── blockwise_output/<model>/
+│   │   ├── block_0.pth
+│   │   ├── block_1.pth
+│   │   └── ...
+│   └── fine_tuned_models/<model>/
+│       └── <model>-...-finetuned.pth
+└── cv/
+```
+
+## LM Wrapper Configuration
+
+Common environment variables:
+
+- `MODEL_NAME`: Hugging Face model id
+- `BIT_WIDTH`: BQQ bit width
+- `GROUP_SIZE`: column group / patch width
+- `DATASET`: calibration dataset, one of `wikitext2`, `ptb`, `c4`, `slimpajama`
+- `NSAMPLES`: number of calibration samples
+- `SEQLEN`: calibration sequence length
+- `SEED`: random seed
+- `GPU_IDS`: comma-separated GPU ids; defaults to all visible GPUs
+- `USE_MULTIBQQ`: `1` uses joint multi-bit BQQ optimization, `0` disables it
+- `COMPENSATION_MODE`: `ldlq`, `gptq`, or `none`; default is `ldlq`
+- `NO_SCALE_REFINE`: `1` disables scale refinement, `0` enables it when the wrapper supports it
+
+`run_layerwise_quant.sh` variables:
+
+- `BLOCK_IDX`: `all` or a single transformer block index
+- `LAYERS_PER_GPU`: number of layer quantization workers inside each block job
+- `LAYERWISE_ANNEAL_STEPS`: BQQ annealing steps
+- `LAYERWISE_STE_STEPS`: optional STE refinement steps after layerwise BQQ
+- `LAYERWISE_STE_BINARY_LR`: STE learning rate for binary factors
+- `LAYERWISE_STE_CONTINUOUS_LR`: STE learning rate for continuous parameters
+- `LAYERWISE_ROW_GROUP_BATCH_SIZE`: optional row-group minibatch size during STE refinement
+- `LAYERWISE_FIX_THETA`: `1` freezes thresholds
+- `LAYERWISE_FIX_BETA`: `1` freezes sigmoid temperature
+- `LAYERWISE_DIR`: output directory for per-layer BQQ tensors
+- `ASSEMBLED_OUTPUT_DIR`: output directory for the assembled model
+
+`run_blockwise_quant.sh` variables:
+
+- `BLOCK_IDX`: `all` or a single transformer block index
+- `BLOCKS_PER_GPU`: number of block jobs per GPU
+- `PROGRESSIVE`: `1` uses progressive blockwise quantization; `0` runs separate layerwise quantization first
+- `PROGRESSIVE_MODE`: `layer-tune`, `closed-form-layer`, or `patch`
+- `LAYERWISE_WORKERS_PER_GPU`: layerwise worker count used when `PROGRESSIVE=0`
+- `BLOCKWISE_EPOCHS`: block tuning epochs
+- `BLOCKWISE_OPTIMIZER`: `adamw`, `adam`, or `sgd`
+- `BLOCKWISE_LR`: base blockwise learning rate
+- `BLOCKWISE_BINARY_LR`: blockwise learning rate for binary factors
+- `BLOCKWISE_CONTINUOUS_LR`: blockwise learning rate for continuous parameters
+- `BLOCKWISE_TUNE_BATCH_SIZE`: block tuning minibatch size
+- `STE_REFINE`: `1` enables extra STE refinement inside blockwise quantization
+- `STE_REFINE_STEPS`: extra STE refinement steps when `STE_REFINE=1`
+- `NO_IO_CACHE`: `1` avoids writing block I/O caches to disk
+- `BLOCKWISE_SAVE_DIR`: output directory for `block_<idx>.pth`
+
+`run_fine_tuning.sh` variables:
+
+- `MODEL_PATH`: assembled quantized model path
+- `FINETUNE_EPOCHS`: number of fine-tuning epochs
+- `FINETUNE_LR`: base learning rate
+- `FINETUNE_BINARY_LR`: learning rate for trainable binary factors
+- `FINETUNE_CONTINUOUS_LR`: learning rate for continuous parameters
+- `GRADIENT_ACCUMULATION_STEPS`: gradient accumulation
+- `MAX_SEQ_LENGTH`: SFT sequence length
+- `FINETUNE_FIX_THETA`: `1` freezes thresholds
+- `FINETUNE_FIX_BETA`: `1` freezes sigmoid temperature
+- `OUTPUT_DIR`: fine-tuned model output directory
+
+## Evaluation
+
+Perplexity evaluation example:
 
 ```bash
-qsub -g <group> -l gpu_1=1 -l h_rt=4:00:00 -j y \
-    -N "mkbqq_${MODEL}" \
-    -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
-    -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
-    -v SCRIPT_DIR=$LM_DIR \
-    -v MODEL_BASENAME=Qwen3.5-2B \
-    -v MODEL_NAME=Qwen/Qwen3.5-2B \
-    -v COMPRESSED_DATA_DIR=$LM_DIR/bqq_compressed_data/Qwen3.5-2B-32gs-10000step \
-    -v OUTPUT_DIR=$LM_DIR/quantized_model_data/Qwen3.5-2B \
-    $LM_DIR/qsub_jobs/make_bqq_model/make_bqq_job.sh
+cd neural_network_compression
+
+python lm/src/evaluation.py \
+  --model_name Qwen/Qwen3.5-2B \
+  --model_path lm/src/quantized_models/Qwen3.5-2B/Qwen3.5-2B-2bit-64gs.pth \
+  --device cuda:0 \
+  --seq_len 2048
 ```
 
-**Output**: `quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step.pth`
-
-### Step 4: Scale refinement
-
-Refine the scale coefficients (a, b, c, d) of each `BinaryQuadratic` layer while keeping the binary parameters (Y, Z) fixed. Uses calibration data to minimise `||WX - W'X||^2`.
-
-```bash
-qsub -g <group> -l gpu_1=1 -l h_rt=2:00:00 -j y \
-    -N "refine_${MODEL}" \
-    -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
-    -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
-    -v SCRIPT_DIR=$LM_DIR \
-    -v MODEL_NAME=Qwen/Qwen3.5-2B \
-    -v BQQ_MODEL_PATH=$LM_DIR/quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step.pth \
-    -v REFINED_OUTPUT_PATH=$LM_DIR/quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step-refined.pth \
-    $LM_DIR/qsub_jobs/make_bqq_model/scale_refine_job.sh
-```
-
-### Step 5: Perplexity evaluation
-
-```bash
-qsub -g <group> -l gpu_1=1 -l h_rt=1:00:00 -j y \
-    -N "ppl_${MODEL}" \
-    -o "$LM_DIR/qsub_jobs/make_bqq_model/logs/" \
-    -v BQQ_ROOT=$BQQ_ROOT -v HF_HOME=$HF_HOME -v SIF_PATH=$SIF_PATH \
-    -v SCRIPT_DIR=$LM_DIR \
-    -v MODEL_BASENAME=Qwen3.5-2B \
-    -v MODEL_NAME=Qwen/Qwen3.5-2B \
-    -v BQQ_MODEL_PATH=$LM_DIR/quantized_model_data/Qwen3.5-2B/Qwen3.5-2B-2bit-32gs-10000step.pth \
-    $LM_DIR/qsub_jobs/make_bqq_model/ppl_eval_job.sh
-```
-
-Results are saved to `results/{model_label}.csv`.
-
-## Monitoring progress
-
-```bash
-# Count completed targets
-SAVEDIR=$LM_DIR/bqq_compressed_data/Qwen3.5-2B-32gs-10000step
-ls "$SAVEDIR" | grep -v "_row" | wc -l
-
-# Check SGE job status
-qstat -u $USER
-```
-
-## Skip and resume behaviour
-
-- **Target level**: If `{target_name}.pth` exists, the target is skipped immediately.
-- **Patch level**: If `{target_name}_row{i}_col{j}.pth` exists, the patch is loaded from disk instead of recomputed.
-
-Jobs killed by walltime can be resubmitted without redundant computation.
-
-## SGE notes
-
-- Always specify your group with `-g <group>` (omitting it limits walltime to 3 minutes in trial mode).
-- Walltime (`h_rt`) is **per task**, not per array job.
-- Effective worker count is capped at `min(mp.cpu_count(), workers_per_gpu)`.
+Results are written under `neural_network_compression/lm/src/results/`.
 
 ## Inference kernels
 

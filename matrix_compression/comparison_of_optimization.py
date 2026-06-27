@@ -13,7 +13,7 @@ import torch.nn as nn
 from quantizer import BinaryQuadraticQuantization as BQQ
 
 
-INTRA_LAYER_METHOD = '_intra_layer_hessian_aware_large_matrix_batched'
+INTRA_LAYER_METHOD = '_hessian_aware_large_matrix_batched'
 
 
 def output_error_energy(W, Wq, X):
@@ -95,19 +95,34 @@ def build_deit_problem(seed=0, batch_size=8, image_size=224, module_name='blocks
     return W, x_mat, f'deit_small_patch16_224:{target_name}'
 
 
-def build_problem(seed=0, batch_size=8, image_size=224, module_name='blocks.0.attn.proj'):
-    deit_problem = build_deit_problem(
+def build_problem(
+    seed=0,
+    batch_size=8,
+    image_size=224,
+    module_name='blocks.0.attn.proj',
+    force_synthetic=False,
+    synthetic_in_features=384,
+    synthetic_out_features=384,
+    synthetic_samples=1024,
+):
+    if not force_synthetic:
+        deit_problem = build_deit_problem(
+            seed=seed,
+            batch_size=batch_size,
+            image_size=image_size,
+            module_name=module_name,
+        )
+        if deit_problem is not None:
+            return deit_problem
+    return build_synthetic_problem(
         seed=seed,
-        batch_size=batch_size,
-        image_size=image_size,
-        module_name=module_name,
+        in_features=synthetic_in_features,
+        out_features=synthetic_out_features,
+        samples=synthetic_samples,
     )
-    if deit_problem is not None:
-        return deit_problem
-    return build_synthetic_problem(seed=seed)
 
 
-def quantize_intra_layer_and_save(W, H, args, consolidated_path):
+def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=None):
     quantizer = BQQ(x=W, rank_scale=args.rank_scale)
     method = getattr(quantizer, INTRA_LAYER_METHOD)
     return method(
@@ -125,8 +140,70 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path):
         damping=args.damping,
         scale_refine=args.scale_refine,
         use_multibqq=args.use_multibqq if hasattr(args, 'use_multibqq') else False,
+        compensation_mode=compensation_mode or args.compensation_mode,
     ).float().cpu()
 
+
+
+def compare_compensation_modes(args):
+    W, X, source = build_problem(
+        seed=args.seed,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        module_name=args.module_name,
+        force_synthetic=args.force_synthetic,
+        synthetic_in_features=args.synthetic_in_features,
+        synthetic_out_features=args.synthetic_out_features,
+        synthetic_samples=args.synthetic_samples,
+    )
+    H = (X @ X.T).float()
+
+    print(f'Source: {source}')
+    print(f'W shape: {tuple(W.shape)}, X shape: {tuple(X.shape)}')
+    print(f'Method: {INTRA_LAYER_METHOD}')
+
+    rows = []
+    modes = [m.strip() for m in args.compensation_modes.split(',') if m.strip()]
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for mode in modes:
+            if mode not in {'gptq', 'ldlq', 'none'}:
+                raise ValueError(f'Unknown compensation mode: {mode}')
+
+            consolidated_path = str(Path(tmpdir) / f'intra_layer_decomposition_{mode}.pt')
+            Wq = quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=mode)
+            output_error = output_error_energy(W, Wq, X)
+            weight_mse = torch.mean((W - Wq).pow(2)).item()
+            rows.append({
+                'source': source,
+                'weight_shape': str(tuple(W.shape)),
+                'activation_shape': str(tuple(X.shape)),
+                'bits': args.bits,
+                'rank_scale': args.rank_scale,
+                'max_patch_size': args.max_patch_size,
+                'nstep': args.nstep,
+                'scale_refine': args.scale_refine,
+                'use_multibqq': args.use_multibqq,
+                'method': INTRA_LAYER_METHOD,
+                'compensation_mode': mode,
+                'output_error_energy': output_error,
+                'weight_mse': weight_mse,
+            })
+
+    if rows:
+        best_error = min(row['output_error_energy'] for row in rows)
+        baseline = next((row for row in rows if row['compensation_mode'] == 'none'), None)
+        baseline_error = baseline['output_error_energy'] if baseline is not None else None
+        for row in rows:
+            row['delta_vs_best'] = row['output_error_energy'] - best_error
+            row['ratio_vs_best'] = row['output_error_energy'] / best_error if best_error != 0 else float('inf')
+            row['delta_vs_none'] = (
+                row['output_error_energy'] - baseline_error if baseline_error is not None else None
+            )
+            row['ratio_vs_none'] = (
+                row['output_error_energy'] / baseline_error
+                if baseline_error not in (None, 0) else None
+            )
+    return rows
 
 def compare_intra_layer_refinement(args):
     W, X, source = build_problem(
@@ -134,6 +211,10 @@ def compare_intra_layer_refinement(args):
         batch_size=args.batch_size,
         image_size=args.image_size,
         module_name=args.module_name,
+        force_synthetic=args.force_synthetic,
+        synthetic_in_features=args.synthetic_in_features,
+        synthetic_out_features=args.synthetic_out_features,
+        synthetic_samples=args.synthetic_samples,
     )
     H = (X @ X.T).float()
 
@@ -235,7 +316,16 @@ def main():
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--image-size', type=int, default=224)
     parser.add_argument('--module-name', type=str, default='blocks.0.attn.proj')
+    parser.add_argument('--force-synthetic', action='store_true')
+    parser.add_argument('--synthetic-in-features', type=int, default=384)
+    parser.add_argument('--synthetic-out-features', type=int, default=384)
+    parser.add_argument('--synthetic-samples', type=int, default=1024)
     parser.add_argument('--scale-refine', action='store_true', default=True)
+    parser.add_argument('--compensation-mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'])
+    parser.add_argument('--compensation-modes', type=str, default='none,gptq,ldlq',
+                        help='Comma-separated modes used by --experiment compensation')
+    parser.add_argument('--experiment', type=str, default='ste-refine',
+                        choices=['ste-refine', 'compensation'])
     parser.add_argument('--no-scale-refine', dest='scale_refine', action='store_false')
     parser.add_argument('--refine-steps', type=int, default=1000)
     parser.add_argument('--refine-lr', type=float, default=1e-3)
@@ -259,8 +349,14 @@ def main():
     args.refined_output_path = refined_output_path if refined_output_path else None
     args.scratch_output_path = scratch_output_path if scratch_output_path else None
 
-    result = compare_intra_layer_refinement(args)
-    df = pd.DataFrame([result])
+    if args.experiment == 'compensation':
+        result = compare_compensation_modes(args)
+        df = pd.DataFrame(result)
+        if not df.empty:
+            df = df.sort_values('output_error_energy')
+    else:
+        result = compare_intra_layer_refinement(args)
+        df = pd.DataFrame([result])
     output_path = Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_path, index=False)

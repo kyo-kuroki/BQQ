@@ -404,6 +404,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             rank_scale, seed, device_id, H=None,
                             scale_refine=True, damping=1e-6,
                             use_multibqq=True,
+                            compensation_mode='ldlq',
                             ste_refine_steps=0,
                             ste_refine_lr=1e-3,
                             ste_refine_weight_decay=0.0,
@@ -436,6 +437,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
             kwargs.update(H=H, hessian_mode='intra-layer-ste',
                           scale_refine=scale_refine, damping=damping,
                           use_multibqq=use_multibqq,
+                          compensation_mode=compensation_mode,
                           ste_refine_steps=ste_refine_steps,
                           ste_refine_lr=ste_refine_lr,
                           ste_refine_weight_decay=ste_refine_weight_decay,
@@ -489,6 +491,7 @@ def ensure_layerwise_block_available(
     ste_refine_log_interval=20,
     row_group_batch_size=None,
     use_multibqq=True,
+    compensation_mode='ldlq',
 ):
     """Generate missing layerwise quantization results for a block on demand."""
     layerwise_dir = Path(layerwise_dir)
@@ -525,6 +528,7 @@ def ensure_layerwise_block_available(
         fix_beta=fix_beta,
         row_group_batch_size=row_group_batch_size,
         use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
         workers_per_gpu=1,
         calibration_loader=dataloader,
     )
@@ -876,6 +880,7 @@ def quantize_block(
     ste_refine_log_interval=20,
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
+    compensation_mode='ldlq',
 ):
     """
     Load a block from precomputed layerwise BQQ patches, then optimize the
@@ -1057,6 +1062,7 @@ def quantize_block_progressive(
     ste_refine_log_interval=20,
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
+    compensation_mode='ldlq',
 ):
     """
     Quantize all Linear weights in a block via progressive patch-wise BQQ.
@@ -1190,6 +1196,7 @@ def quantize_block_progressive(
                 seed=seed,
                 device_id=device_id,
                 use_multibqq=use_multibqq,
+                compensation_mode=compensation_mode,
                 ste_refine_steps=ste_refine_steps,
                 ste_refine_lr=ste_refine_lr,
                 ste_refine_weight_decay=ste_refine_weight_decay,
@@ -1389,6 +1396,7 @@ def quantize_block_progressive_closed_form(
             scale_refine=scale_refine,
             damping=damping,
             use_multibqq=use_multibqq,
+            compensation_mode=compensation_mode,
             ste_refine_steps=ste_refine_steps,
             ste_refine_lr=ste_refine_lr,
             ste_refine_weight_decay=ste_refine_weight_decay,
@@ -1536,6 +1544,8 @@ def main():
                         help='Jointly optimize all bits per column group with run_multibqq_compile_batched (default: enabled)')
     parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false',
                         help='Disable joint multibqq optimization and quantize bits sequentially')
+    parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
+                        help='Column compensation mode for Hessian-aware BQQ')
     parser.add_argument('--ste_refine_steps', type=int, default=0,
                         help='Steps of STE refinement after Hessian-aware BQQ (0 disables)')
     parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
@@ -1640,6 +1650,7 @@ def main():
         ste_refine_log_interval=args.ste_refine_log_interval,
         ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
         use_multibqq=args.use_multibqq,
+        compensation_mode=args.compensation_mode,
     )
 
     layerwise_dir = args.layerwise_dir
@@ -1690,6 +1701,7 @@ def main():
                 ste_refine_log_interval=args.ste_refine_log_interval,
                 ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
                 use_multibqq=args.use_multibqq,
+                compensation_mode=args.compensation_mode,
             )
     else:
         quantize_block(
