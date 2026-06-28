@@ -8,7 +8,7 @@
  * Optimisations:
  *   1. Warp-level conditional select + __shfl_down reduction for Z@X
  *      (no bit→float multiply; branch instead of 0/1 multiply for Y)
- *   2. Grid splitting over col_width for high SM occupancy (~48 warps/SM)
+ *   2. Grid splitting over col_width for high SM occupancy (~72 warps/SM)
  *   3. uint32 bulk loads for Z/Y bytes (4x fewer load instructions)
  *   4. Z/Y preloaded to registers before the 8-bit inner loop
  *   5. b term folded: t_aug = a*t_k + b*xsum (merges terms 1+2)
@@ -28,6 +28,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 
 
 /* ── warp-level sum ────────────────────────────────────────────── */
@@ -37,6 +39,17 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     for (int offset = 16; offset > 0; offset >>= 1)
         val += __shfl_down_sync(0xffffffff, val, offset);
     return val;
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
+    const int tid = threadIdx.x;
+    smem[tid] = val;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) smem[tid] += smem[tid + stride];
+        __syncthreads();
+    }
+    return smem[0];
 }
 
 
@@ -80,7 +93,11 @@ __global__ void bqq_forward_kernel(
         const int x_base = n * col_width * z_col + ci * z_col;
 
         const float x_val = (lane < z_col) ? X[x_base + lane] : 0.0f;
-        float xsum = warp_reduce_sum(x_val);
+        float xsum_local = 0.0f;
+        for (int j = lane; j < z_col; j += 32) {
+            xsum_local += X[x_base + j];
+        }
+        float xsum = warp_reduce_sum(xsum_local);
         xsum = __shfl_sync(0xffffffff, xsum, 0);
 
         for (int p = 0; p < bit_width; p++) {
@@ -93,7 +110,7 @@ __global__ void bqq_forward_kernel(
             /* uint32 bulk load: Z/Y bytes → registers */
             constexpr int N_WORDS = (K8_MAX + 3) / 4;
             uint32_t z_words[N_WORDS];
-            if (lane < z_col) {
+            if (z_col <= 32 && lane < z_col) {
                 auto zp = reinterpret_cast<const uint32_t*>(
                     Z + (size_t)B_idx * z_col * k8 + lane * k8);
                 #pragma unroll
@@ -131,8 +148,18 @@ __global__ void bqq_forward_kernel(
                 #pragma unroll
                 for (int bit = 0; bit < 8; bit++) {
                     const int shift = 7 - bit;
-                    float t_k = warp_reduce_sum(
-                        ((zb >> shift) & 1) ? x_val : 0.0f);
+                    float t_local;
+                    if (z_col <= 32) {
+                        t_local = ((zb >> shift) & 1) ? x_val : 0.0f;
+                    } else {
+                        t_local = 0.0f;
+                        for (int j = lane; j < z_col; j += 32) {
+                            const uint8_t zj =
+                                Z[(size_t)B_idx * z_col * k8 + j * k8 + bk];
+                            if ((zj >> shift) & 1) t_local += X[x_base + j];
+                        }
+                    }
+                    float t_k = warp_reduce_sum(t_local);
                     t_k = __shfl_sync(0xffffffff, t_k, 0);
                     const float t_aug = a_val * t_k + b_val * xsum;
 
@@ -176,6 +203,216 @@ __global__ void bqq_forward_kernel(
             }
         }
         __syncthreads();
+    }
+}
+
+
+/* ═══════════════════════════════════════════════════════════════════
+ * Decode experiment: explicit Z@x then Y@t
+ * ═══════════════════════════════════════════════════════════════════ */
+
+template <int K8_MAX>
+__global__ void bqq_decode_two_stage_kernel(
+    const uint8_t* __restrict__ Y,
+    const uint8_t* __restrict__ Z,
+    const float*   __restrict__ X,
+    const float*   __restrict__ a_ptr,
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,
+    float*         __restrict__ out,
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8,
+    int col_splits)
+{
+    constexpr int K_MAX = K8_MAX * 8;
+    __shared__ float t_vals[K_MAX];
+    __shared__ float reduce_buf[256];
+
+    const int combined = blockIdx.x;
+    const int r = combined / col_splits;
+    const int cs = combined % col_splits;
+    const int n = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    const int c_per_split = (col_width + col_splits - 1) / col_splits;
+    const int c_block_start = cs * c_per_split;
+    const int c_block_end = min(c_block_start + c_per_split, col_width);
+    const int n_inner = k8 * 8;
+
+    float acc = 0.0f;
+    const bool has_i = tid < y_row;
+    const int i = tid;
+
+    for (int ci = c_block_start; ci < c_block_end; ci++) {
+        const int rc = r * col_width + ci;
+        const int x_base = n * col_width * z_col + ci * z_col;
+
+        float xsum_local = 0.0f;
+        for (int j = tid; j < z_col; j += blockDim.x) {
+            xsum_local += X[x_base + j];
+        }
+        const float xsum = block_reduce_sum(xsum_local, reduce_buf);
+
+        for (int p = 0; p < bit_width; p++) {
+            const int B_idx = p * row_width * col_width + rc;
+            const float a_val = a_ptr[B_idx];
+            const float b_val = b_ptr[B_idx];
+            const float c_val = c_ptr[B_idx];
+            float t_sum = 0.0f;
+
+            for (int l = 0; l < K_MAX; l++) {
+                if (l >= n_inner) break;
+                const int byte_k = l >> 3;
+                const int shift = 7 - (l & 7);
+                float t_local = 0.0f;
+                for (int j = tid; j < z_col; j += blockDim.x) {
+                    const uint8_t zb = Z[(size_t)B_idx * z_col * k8 + j * k8 + byte_k];
+                    if ((zb >> shift) & 1) t_local += X[x_base + j];
+                }
+                const float t_l = block_reduce_sum(t_local, reduce_buf);
+                if (tid == 0) t_vals[l] = t_l;
+                t_sum += t_l;
+            }
+            __syncthreads();
+
+            if (has_i) {
+                const uint8_t* yp = Y + (size_t)B_idx * y_row * k8 + i * k8;
+                float part = 0.0f;
+                for (int l = 0; l < K_MAX; l++) {
+                    if (l >= n_inner) break;
+                    const int byte_k = l >> 3;
+                    const int shift = 7 - (l & 7);
+                    if ((yp[byte_k] >> shift) & 1) {
+                        part += a_val * t_vals[l] + b_val * xsum;
+                    }
+                }
+                acc += part + c_val * t_sum;
+            }
+            __syncthreads();
+        }
+
+        if (has_i) acc += d_ptr[rc] * xsum;
+    }
+
+    if (has_i) {
+        size_t idx = (size_t)n * row_width * y_row + r * y_row + i;
+        if (col_splits > 1)
+            atomicAdd(&out[idx], acc);
+        else
+            out[idx] = acc;
+    }
+}
+
+template <int N_WARPS>
+__global__ void bqq_decode_two_stage_warp_kernel(
+    const uint8_t* __restrict__ Y,
+    const uint8_t* __restrict__ Z,
+    const float*   __restrict__ X,
+    const float*   __restrict__ a_ptr,
+    const float*   __restrict__ b_ptr,
+    const float*   __restrict__ c_ptr,
+    const float*   __restrict__ d_ptr,
+    float*         __restrict__ out,
+    int row_width, int col_width, int bit_width,
+    int y_row, int z_col, int k8,
+    int col_splits)
+{
+    constexpr int K_MAX = 128;
+    __shared__ float t_vals[K_MAX];
+    __shared__ float t_sum_shared;
+
+    const int combined = blockIdx.x;
+    const int r = combined / col_splits;
+    const int cs = combined % col_splits;
+    const int n = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int warp_id = tid >> 5;
+    const int lane = tid & 31;
+
+    const int c_per_split = (col_width + col_splits - 1) / col_splits;
+    const int c_block_start = cs * c_per_split;
+    const int c_block_end = min(c_block_start + c_per_split, col_width);
+    const int n_inner = k8 * 8;
+
+    float acc = 0.0f;
+    const bool has_i = tid < y_row;
+    const int i = tid;
+
+    for (int ci = c_block_start; ci < c_block_end; ci++) {
+        const int rc = r * col_width + ci;
+        const int x_base = n * col_width * z_col + ci * z_col;
+
+        float xsum_local = 0.0f;
+        for (int j = lane; j < z_col; j += 32) {
+            xsum_local += X[x_base + j];
+        }
+        float xsum = warp_reduce_sum(xsum_local);
+        xsum = __shfl_sync(0xffffffff, xsum, 0);
+
+        for (int p = 0; p < bit_width; p++) {
+            const int B_idx = p * row_width * col_width + rc;
+            const float a_val = a_ptr[B_idx];
+            const float b_val = b_ptr[B_idx];
+            const float c_val = c_ptr[B_idx];
+
+            for (int l_base = 0; l_base < K_MAX; l_base += N_WARPS) {
+                const int l = l_base + warp_id;
+                float t_local = 0.0f;
+                if (l < n_inner) {
+                    const int byte_k = l >> 3;
+                    const int shift = 7 - (l & 7);
+                    for (int j = lane; j < z_col; j += 32) {
+                        const uint8_t zb = Z[(size_t)B_idx * z_col * k8 + j * k8 + byte_k];
+                        if ((zb >> shift) & 1) t_local += X[x_base + j];
+                    }
+                }
+                float t_l = warp_reduce_sum(t_local);
+                if (lane == 0 && l < n_inner) t_vals[l] = t_l;
+            }
+            __syncthreads();
+
+            if (warp_id == 0) {
+                float ts = 0.0f;
+                for (int l = lane; l < n_inner; l += 32) {
+                    ts += t_vals[l];
+                }
+                ts = warp_reduce_sum(ts);
+                if (lane == 0) t_sum_shared = ts;
+            }
+            __syncthreads();
+
+            if (has_i) {
+                const uint8_t* yp = Y + (size_t)B_idx * y_row * k8 + i * k8;
+                float part = 0.0f;
+                int y_count = 0;
+                for (int byte_k = 0; byte_k < k8; byte_k++) {
+                    uint8_t yb = yp[byte_k];
+                    y_count += __popc(static_cast<unsigned>(yb));
+                    #pragma unroll
+                    for (int bit = 0; bit < 8; bit++) {
+                        const int l = (byte_k << 3) + bit;
+                        if (l >= n_inner) break;
+                        const int shift = 7 - bit;
+                        if ((yb >> shift) & 1) {
+                            part += a_val * t_vals[l];
+                        }
+                    }
+                }
+                acc += part + b_val * xsum * (float)y_count + c_val * t_sum_shared;
+            }
+            __syncthreads();
+        }
+
+        if (has_i) acc += d_ptr[rc] * xsum;
+    }
+
+    if (has_i) {
+        size_t idx = (size_t)n * row_width * y_row + r * y_row + i;
+        if (col_splits > 1)
+            atomicAdd(&out[idx], acc);
+        else
+            out[idx] = acc;
     }
 }
 
@@ -330,37 +567,91 @@ torch::Tensor bqq_forward(
                           .to(torch::kFloat32).contiguous();
 
         constexpr int NW = 4;
-        int sm_count = 56;
-        int col_splits = max(1, (48 * sm_count + row_width * NW - 1)
+        int device = 0;
+        int sm_count = 0;
+        cudaGetDevice(&device);
+        cudaDeviceGetAttribute(
+            &sm_count, cudaDevAttrMultiProcessorCount, device);
+        if (sm_count <= 0) sm_count = 1;
+
+        int col_splits = max(1, (72 * sm_count + row_width * NW - 1)
                                 / (row_width * NW));
         col_splits = min(col_splits, col_width);
         while (col_splits > 1 && col_width % col_splits != 0) col_splits--;
 
-        auto out = torch::zeros({(int)batch, row_width, y_row},
-            torch::dtype(torch::kFloat32).device(X.device()));
+        if (const char* env = std::getenv("BQQ_CUDA_COL_SPLITS")) {
+            int requested = std::atoi(env);
+            if (requested >= 1) {
+                col_splits = min(requested, col_width);
+                while (col_splits > 1 && col_width % col_splits != 0) col_splits--;
+            }
+        }
+
+        auto out = (col_splits > 1)
+            ? torch::zeros({(int)batch, row_width, y_row},
+                  torch::dtype(torch::kFloat32).device(X.device()))
+            : torch::empty({(int)batch, row_width, y_row},
+                  torch::dtype(torch::kFloat32).device(X.device()));
 
         dim3 grid(row_width * col_splits, batch);
-        dim3 block(NW * 32);
-        int smem = NW * 32 * sizeof(float);
+        const char* decode_kernel = std::getenv("BQQ_CUDA_DECODE_KERNEL");
+        const bool use_auto_decode_kernel = decode_kernel == nullptr;
+        const bool use_two_stage = decode_kernel &&
+            std::strcmp(decode_kernel, "two_stage") == 0 &&
+            y_row <= 256;
+        const bool use_two_stage_warp =
+            ((decode_kernel && std::strcmp(decode_kernel, "two_stage_warp") == 0) ||
+             (use_auto_decode_kernel && z_col >= 128)) &&
+            y_row <= 256 && k8 <= 16;
 
-        #define LAUNCH(NI, K8M) \
-            bqq_forward_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
-                Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                X_view.data_ptr<float>(), \
-                a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
-                out.data_ptr<float>(), \
-                row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+        if (use_two_stage_warp) {
+            constexpr int TW = 8;
+            dim3 block(TW * 32);
+            bqq_decode_two_stage_warp_kernel<TW><<<grid, block>>>( \
+                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                    X_view.data_ptr<float>(), \
+                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
+                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    out.data_ptr<float>(), \
+                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits);
+        } else if (use_two_stage) {
+            dim3 block(256);
+            #define LAUNCH_TWO_STAGE(K8M) \
+                bqq_decode_two_stage_kernel<K8M><<<grid, block>>>( \
+                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                    X_view.data_ptr<float>(), \
+                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
+                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    out.data_ptr<float>(), \
+                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
-        if (ni == 1) {
-            if      (k8 <= 4)  LAUNCH(1, 4);
-            else if (k8 <= 8)  LAUNCH(1, 8);
-            else               LAUNCH(1, 16);
-        } else if (ni <= 2) {
-            if      (k8 <= 8)  LAUNCH(2, 8);
-            else               LAUNCH(2, 16);
-        } else { LAUNCH(4, 16); }
-        #undef LAUNCH
+            if      (k8 <= 4)  LAUNCH_TWO_STAGE(4);
+            else if (k8 <= 8)  LAUNCH_TWO_STAGE(8);
+            else               LAUNCH_TWO_STAGE(16);
+            #undef LAUNCH_TWO_STAGE
+        } else {
+            dim3 block(NW * 32);
+            int smem = NW * 32 * sizeof(float);
+
+            #define LAUNCH(NI, K8M) \
+                bqq_forward_kernel<NW, NI, K8M><<<grid, block, smem>>>( \
+                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                    X_view.data_ptr<float>(), \
+                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
+                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    out.data_ptr<float>(), \
+                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+
+            if (ni == 1) {
+                if      (k8 <= 4)  LAUNCH(1, 4);
+                else if (k8 <= 8)  LAUNCH(1, 8);
+                else               LAUNCH(1, 16);
+            } else if (ni <= 2) {
+                if      (k8 <= 8)  LAUNCH(2, 8);
+                else               LAUNCH(2, 16);
+            } else { LAUNCH(4, 16); }
+            #undef LAUNCH
+        }
 
         result = out.reshape({(int)batch, out_f});
 

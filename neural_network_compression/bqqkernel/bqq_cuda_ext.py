@@ -10,6 +10,7 @@ Usage::
 """
 
 import os
+import sys
 import torch
 from torch.utils.cpp_extension import load
 
@@ -20,6 +21,10 @@ _ext = None
 def _get_ext():
     global _ext
     if _ext is None:
+        python_bin = os.path.dirname(sys.executable)
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if python_bin and python_bin not in path_parts:
+            os.environ["PATH"] = python_bin + os.pathsep + os.environ.get("PATH", "")
         _ext = load(
             name='bqq_cuda',
             sources=[os.path.join(_dir, 'bqq_cuda.cu')],
