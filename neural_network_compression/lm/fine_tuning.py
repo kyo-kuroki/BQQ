@@ -198,18 +198,18 @@ def train(
         num_train_epochs=num_train_epochs,
         logging_steps=50,
         save_strategy="epoch",
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         warmup_ratio=0.03,
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         report_to="none",
         bf16=False,
-        fp16=False,
-        max_seq_length=max_seq_length,
+        fp16=True,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.model_max_length = max_seq_length
 
     # Teacher model (optional)
     teacher_model = None
@@ -219,7 +219,7 @@ def train(
             teacher_model_name, dtype="auto"
         )
 
-    TrainerClass = DistillationTrainer if teacher_model is not None else SFTTrainer
+    TrainerClass = DistillationTrainer if teacher_model is not None else BQQLearningRateTrainer
 
     trainer_kwargs = dict(
         model=model,
@@ -298,6 +298,11 @@ def main():
                         help="Keep BQQ STE thresholds fixed at 0.5 during fine-tuning")
     parser.add_argument("--fix_beta", action="store_true",
                         help="Keep BQQ STE sigmoid temperatures fixed during fine-tuning")
+    parser.add_argument("--dataset", type=str, default="wikitext2",
+                        choices=["wikitext2", "slimpajama"],
+                        help="Training dataset: wikitext2 or slimpajama")
+    parser.add_argument("--nsamples", type=int, default=None,
+                        help="Limit training samples (None = use all)")
 
     args = parser.parse_args()
 
@@ -315,7 +320,14 @@ def main():
         text = example['text'].strip()
         return len(text) > 10
 
-    train_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train').filter(is_not_empty)
+    if args.dataset == "slimpajama":
+        train_dataset = load_dataset("DKYoon/SlimPajama-6B", split="train")
+        if args.nsamples is not None:
+            train_dataset = train_dataset.select(range(args.nsamples))
+    else:
+        train_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train').filter(is_not_empty)
+        if args.nsamples is not None:
+            train_dataset = train_dataset.select(range(min(args.nsamples, len(train_dataset))))
     test_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test').select(range(256))
 
     train(

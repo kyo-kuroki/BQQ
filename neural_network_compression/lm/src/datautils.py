@@ -1,3 +1,5 @@
+import glob
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,6 +8,14 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 import random
 from tqdm import tqdm
+
+
+def _c4_local_path(filename: str) -> str | None:
+    """Return local path to a c4 file from HF hub snapshot cache, or None."""
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    pattern = f"{hf_home}/hub/datasets--allenai--c4/snapshots/*/{filename}"
+    hits = glob.glob(pattern)
+    return hits[0] if hits else None
 
 _PTB_PARQUET_FILES = {
     "train": "https://huggingface.co/datasets/FALcon6/ptb_text_only/resolve/main/penn_treebank/train/0000.parquet",
@@ -267,11 +277,15 @@ def get_ptb_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None
 
 
 def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1, shuffle=True, mask_labels=False):
-    traindata = load_dataset(
-        "allenai/c4",
-        data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
-        split="train",
-    )
+    local = _c4_local_path("en/c4-train.00000-of-01024.json.gz")
+    if local:
+        traindata = load_dataset("json", data_files={"train": local}, split="train")
+    else:
+        traindata = load_dataset(
+            "allenai/c4",
+            data_files={"train": "en/c4-train.00000-of-01024.json.gz"},
+            split="train",
+        )
 
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model, use_fast=False)
@@ -307,11 +321,15 @@ def get_c4_trainloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None
 
 
 def get_c4_testloader(model, nsamples=None, seed=0, seqlen=2048, tokenizer=None, batch_size=1):
-    valdata = load_dataset(
-        "allenai/c4",
-        data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
-        split="validation",
-    )
+    local = _c4_local_path("en/c4-validation.00000-of-00008.json.gz")
+    if local:
+        valdata = load_dataset("json", data_files={"validation": local}, split="validation")
+    else:
+        valdata = load_dataset(
+            "allenai/c4",
+            data_files={"validation": "en/c4-validation.00000-of-00008.json.gz"},
+            split="validation",
+        )
 
     if tokenizer is None:
         print("Loading tokenizer...", model)
