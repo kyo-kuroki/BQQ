@@ -1393,7 +1393,8 @@ class BinaryQuadraticQuantization():
         for (ph, pw), cnt in sorted(size_counts.items(), key=lambda x: -x[1]):
             print(f'Patch Size:({ph}x{pw}), Count: {cnt}')
 
-        x_tensor = torch.tensor(x_copy).float()
+        compute_device = torch.device(f'cuda:{main_gpu_id}' if torch.cuda.is_available() else 'cpu')
+        x_tensor = torch.tensor(x_copy, device=compute_device).float()
 
         # 復元蓄積 (パッチごとに管理)
         reconst_accum = {}
@@ -1787,7 +1788,8 @@ class BinaryQuadraticQuantization():
         h_ranges = compute_patch_ranges(original_h, max_patch_size)
         w_ranges = compute_patch_ranges(original_w, max_patch_size)
 
-        x_tensor = torch.tensor(x_copy).float()
+        compute_device = torch.device(f'cuda:{main_gpu_id}' if torch.cuda.is_available() else 'cpu')
+        x_tensor = torch.tensor(x_copy, device=compute_device).float()
         H = H.to(dtype=torch.float32, device=x_tensor.device)
         H = 0.5 * (H + H.T)
         num_col_groups = len(w_ranges)
@@ -1801,7 +1803,7 @@ class BinaryQuadraticQuantization():
         H_damped = H + (COMP_DAMPING * mean_diag) * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
 
         H_inv = None
-        ldlq_U = None
+        ldlq_L = None
         if compensation_mode == 'gptq':
             # GPTQ/OPTQ form: use the inverse Hessian feedback.
             _L = self._cholesky_safe(H, COMP_DAMPING)
@@ -1813,21 +1815,17 @@ class BinaryQuadraticQuantization():
                 print('WARNING: Cholesky failed, compensation disabled')
         elif compensation_mode == 'ldlq':
             try:
-                # LDLQ over the actual column groups:
-                # H = (I + U_blk) D_blk (I + U_blk)^T. Eliminate blocks from
-                # right to left so U_{P,B} = H_{P,B} H_{B,B}^{-1}.
-                ldlq_U = torch.zeros_like(H_damped)
-                H_cur = H_damped.clone()
-                for b0, b1 in reversed(w_ranges):
-                    if b0 <= 0:
-                        continue
-                    H_BB = H_cur[b0:b1, b0:b1]
-                    H_PB = H_cur[:b0, b0:b1]
-                    U_PB = torch.linalg.solve(H_BB.T, H_PB.T).T
-                    ldlq_U[:b0, b0:b1] = U_PB
-                    H_cur[:b0, :b0] -= U_PB @ H_cur[b0:b1, :b0]
-                    H_cur[:b0, :b0] = 0.5 * (H_cur[:b0, :b0] + H_cur[:b0, :b0].T)
-                print(f'Precomputed LDLQ block U ({list(ldlq_U.shape)}, {num_col_groups} groups, damping={COMP_DAMPING})')
+                # QUIP-style block LDLQ over the actual BQQ column groups.
+                # torch.linalg.cholesky gives H = C C^T. Normalizing each
+                # diagonal block of C to identity gives the block-L factor used
+                # by LDLQ: Q(W_B + (W_F - Q_F) @ L[F, B]), processed right to left.
+                ldlq_L = torch.linalg.cholesky(H_damped)
+                for b0, b1 in w_ranges:
+                    block = ldlq_L[b0:b1, b0:b1]
+                    ldlq_L[:, b0:b1] = ldlq_L[:, b0:b1] @ torch.linalg.inv(block)
+                if not torch.isfinite(ldlq_L).all():
+                    raise RuntimeError('non-finite block LDL factor')
+                print(f'Precomputed QUIP-style LDLQ block L ({list(ldlq_L.shape)}, {num_col_groups} groups, damping={COMP_DAMPING})')
             except RuntimeError as e:
                 compensation_mode = 'none'
                 print(f'WARNING: LDLQ block decomposition failed, compensation disabled: {e}')
@@ -1835,17 +1833,25 @@ class BinaryQuadraticQuantization():
             print('Column compensation disabled')
 
         all_decomposed = []
-        Wq = torch.zeros(original_h, original_w, dtype=dtype)
+        Wq = torch.zeros(original_h, original_w, dtype=dtype, device=compute_device)
         W_work = x_tensor.clone()
 
-        for j, (c0, c1) in enumerate(w_ranges):
+        col_group_iter = list(enumerate(w_ranges))
+        if compensation_mode == 'ldlq':
+            col_group_iter = list(reversed(col_group_iter))
+
+        for j, (c0, c1) in col_group_iter:
             pw = c1 - c0
+            if compensation_mode == 'ldlq' and c1 < original_w:
+                group_input = x_tensor[:, c0:c1] + (x_tensor[:, c1:] - Wq[:, c1:]) @ ldlq_L[c1:, c0:c1]
+            else:
+                group_input = W_work[:, c0:c1]
 
             # N-bit BQQ on this column group (all bits, batched across row groups)
             if use_multibqq:
                 col_patches = []
                 for i, (r0, r1) in enumerate(h_ranges):
-                    col_patches.append(W_work[r0:r1, c0:c1].clone())
+                    col_patches.append(group_input[r0:r1, :].clone())
 
                 x_batch = torch.stack(col_patches)
                 print(f'Col {j}/{num_col_groups}: jointly decomposing {len(col_patches)} '
@@ -1859,9 +1865,9 @@ class BinaryQuadraticQuantization():
 
                 for b_idx, (r0, r1) in enumerate(h_ranges):
                     for bit_idx in range(bit_width):
-                        yb = y_mb[b_idx, bit_idx].cpu()
-                        zb = z_mb[b_idx, bit_idx].cpu()
-                        coeff = a_mb[b_idx, bit_idx].cpu()
+                        yb = y_mb[b_idx, bit_idx].to(compute_device)
+                        zb = z_mb[b_idx, bit_idx].to(compute_device)
+                        coeff = a_mb[b_idx, bit_idx].to(compute_device)
                         bit_reconst = (coeff[0] * yb @ zb
                                       + coeff[1] * yb.sum(dim=1, keepdim=True)
                                       + coeff[2] * zb.sum(dim=0, keepdim=True)
@@ -1872,12 +1878,12 @@ class BinaryQuadraticQuantization():
                             'patch_row': b_idx, 'patch_col': j,
                             'row_start': r0, 'row_end': r1,
                             'col_start': c0, 'col_end': c1,
-                            'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                            'coeff': coeff.cpu(), 'mat1': yb.cpu(), 'mat2': zb.cpu(),
                             'bit_idx': bit_idx,
                         })
             else:
-                # Residual decomposition: bit by bit on W_work[:, c0:c1]
-                col_residual = W_work[:, c0:c1].clone()
+                # Residual decomposition: bit by bit on this group's compensated input.
+                col_residual = group_input.clone()
 
                 for bit_idx in range(bit_width):
                     col_patches = []
@@ -1895,7 +1901,9 @@ class BinaryQuadraticQuantization():
                     )
 
                     for b_idx, (r0, r1) in enumerate(h_ranges):
-                        yb, zb, coeff = y_b[b_idx].cpu(), z_b[b_idx].cpu(), a_b[b_idx].cpu()
+                        yb = y_b[b_idx].to(compute_device)
+                        zb = z_b[b_idx].to(compute_device)
+                        coeff = a_b[b_idx].to(compute_device)
                         bit_reconst = (coeff[0] * yb @ zb
                                       + coeff[1] * yb.sum(dim=1, keepdim=True)
                                       + coeff[2] * zb.sum(dim=0, keepdim=True)
@@ -1907,33 +1915,31 @@ class BinaryQuadraticQuantization():
                             'patch_row': b_idx, 'patch_col': j,
                             'row_start': r0, 'row_end': r1,
                             'col_start': c0, 'col_end': c1,
-                            'coeff': coeff, 'mat1': yb, 'mat2': zb,
+                            'coeff': coeff.cpu(), 'mat1': yb.cpu(), 'mat2': zb.cpu(),
                             'bit_idx': bit_idx,
                         })
 
-            if compensation_mode != 'none' and c1 < original_w:
+            if compensation_mode == 'ldlq' and c1 < original_w:
+                print(f'  LDLQ-folded quantized future error from {original_w - c1} columns')
+
+            if compensation_mode == 'gptq' and c1 < original_w:
                 E_j = W_work[:, c0:c1] - Wq[:, c0:c1]
 
                 try:
-                    if compensation_mode == 'gptq':
-                        # Block GPTQ update: W_R <- W_R - E_B @ inv(Hinv_BB) @ Hinv_BR.
-                        Hinv_BB = H_inv[c0:c1, c0:c1]
-                        Hinv_BR = H_inv[c0:c1, c1:]
-                        M = torch.linalg.solve(Hinv_BB, Hinv_BR)
-                        update = -(E_j @ M)
-                    else:
-                        # LDLQ nearest-plane feedback: after fixing block B, update
-                        # every future column by the precomputed coupling U_{B,R}.
-                        update = E_j @ ldlq_U[c0:c1, c1:]
+                    # Block GPTQ update: W_R <- W_R - E_B @ inv(Hinv_BB) @ Hinv_BR.
+                    Hinv_BB = H_inv[c0:c1, c0:c1]
+                    Hinv_BR = H_inv[c0:c1, c1:]
+                    M = torch.linalg.solve(Hinv_BB, Hinv_BR)
+                    update = -(E_j @ M)
 
                     if torch.isfinite(update).all():
                         W_work[:, c1:] += update
-                        print(f'  {compensation_mode.upper()}-compensated remaining {original_w - c1} columns')
+                        print(f'  GPTQ-compensated remaining {original_w - c1} columns')
                     else:
-                        print(f'  WARNING: {compensation_mode} compensation update non-finite, skipping')
+                        print('  WARNING: gptq compensation update non-finite, skipping')
 
                 except RuntimeError as e:
-                    print(f'  WARNING: {compensation_mode} compensation solve failed: {e}')
+                    print(f'  WARNING: gptq compensation solve failed: {e}')
 
         E_final = Wq - x_tensor
         hessian_loss = torch.sum((E_final @ H) * E_final).item()
@@ -1949,6 +1955,7 @@ class BinaryQuadraticQuantization():
             if S is None:
                 print('  WARNING: Cholesky failed, skipping scale refine')
             else:
+                S = S.cpu()
                 S_j_list = [S[c0:c1, :] for c0, c1 in w_ranges]
                 col_sum_S_list = [sj.sum(dim=0, keepdim=True) for sj in S_j_list]
 
@@ -1965,7 +1972,7 @@ class BinaryQuadraticQuantization():
 
                 for i, (r0, r1) in enumerate(h_ranges):
                     ph = r1 - r0
-                    R_S = x_tensor[r0:r1, :].to(dtype=dtype) @ S
+                    R_S = x_tensor[r0:r1, :].to(dtype=dtype, device='cpu') @ S
                     if ph not in ones_col_ph:
                         ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
                     ones_col = ones_col_ph[ph]
@@ -2030,7 +2037,7 @@ class BinaryQuadraticQuantization():
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
 
         self.x = copy.copy(x_copy)
-        return Wq
+        return Wq.cpu()
 
 
 class BinaryMatrixFactorization():

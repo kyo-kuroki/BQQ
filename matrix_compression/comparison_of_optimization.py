@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
@@ -142,6 +143,179 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mo
         use_multibqq=args.use_multibqq if hasattr(args, 'use_multibqq') else False,
         compensation_mode=compensation_mode or args.compensation_mode,
     ).float().cpu()
+
+
+def refine_bqq_decomposition(W, H, args, consolidated_path):
+    refine_quantizer = BQQ(x=W, rank_scale=args.rank_scale)
+    Wq_refined, _refined_decomp, refine_history = refine_quantizer.refine_decomposition_with_ste(
+        all_decomposed=consolidated_path,
+        H=H,
+        num_steps=args.refine_steps,
+        lr=args.refine_lr,
+        weight_decay=args.refine_weight_decay,
+        device_id=args.device_id,
+        optimize_factors=not args.refine_coeffs_only,
+        optimize_coeffs=True,
+        optimize_theta=not args.fix_theta,
+        row_group_batch_size=args.row_group_batch_size,
+        consolidated_path=args.refined_output_path,
+        log_interval=args.refine_log_interval,
+    )
+    return Wq_refined.float().cpu(), refine_history
+
+
+def _import_quip_sharp(quip_sharp_root):
+    root = Path(quip_sharp_root).expanduser().resolve()
+    if not root.exists():
+        raise FileNotFoundError(f'QUIP-Sharp root does not exist: {root}')
+
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
+
+    if 'quiptools_cuda' not in sys.modules:
+        dummy_quiptools = ModuleType('quiptools_cuda')
+
+        def _missing_quiptools(*_args, **_kwargs):
+            raise RuntimeError(
+                'quiptools_cuda is not installed. This comparison can compute quantization error '
+                'from quip.quantize(), but QUIP-Sharp packed decode/matmul is unavailable.'
+            )
+
+        dummy_quiptools.decode_matvec_e8p = _missing_quiptools
+        dummy_quiptools.decompress_packed_e8p = _missing_quiptools
+        dummy_quiptools.decompress_e81b_packed = _missing_quiptools
+        dummy_quiptools.lookupmatmul_e81b_k8 = _missing_quiptools
+        sys.modules['quiptools_cuda'] = dummy_quiptools
+
+    if 'lm_eval.base' not in sys.modules:
+        lm_eval_module = sys.modules.setdefault('lm_eval', ModuleType('lm_eval'))
+        lm_eval_base = ModuleType('lm_eval.base')
+        lm_eval_base.BaseLM = object
+        lm_eval_module.base = lm_eval_base
+        sys.modules['lm_eval.base'] = lm_eval_base
+
+    try:
+        from lib import codebook, utils
+        from lib.algo import quip
+    except ModuleNotFoundError as exc:
+        if exc.name in {'quiptools_cuda', 'lm_eval.base'}:
+            raise RuntimeError(f'Failed to install import shim for optional QUIP-Sharp dependency: {exc.name}') from exc
+        raise
+    return codebook, quip, utils
+
+
+def quantize_quip_sharp_ldlq(W, H, args):
+    codebook_mod, quip_mod, quip_utils = _import_quip_sharp(args.quip_sharp_root)
+    cb = codebook_mod.get_codebook(args.quip_codebook)
+    validate_quip_sharp_problem(W, cb, args.quip_codebook)
+    cb.maybe_pack_idxs = lambda idxs: idxs
+
+    dtype = torch.float64 if args.quip_use_fp64 else torch.float32
+    Hq = H.to(dtype=dtype).cpu()
+    Hq = 0.5 * (Hq + Hq.T)
+    Hq = quip_utils.regularize_H(Hq, Hq.shape[0], args.quip_sigma_reg)
+
+    quip_args = SimpleNamespace(
+        sigma_reg=args.quip_sigma_reg,
+        sigma_reg2=args.quip_sigma_reg2,
+        incoh_mode=args.quip_incoh_mode,
+        lora_rank=args.quip_lora_rank,
+        scale_override=args.quip_scale_override,
+        resid_scale_override=args.quip_resid_scale_override,
+        quip_tune_iters=args.quip_tune_iters,
+        use_fp64=args.quip_use_fp64,
+        full_svd=args.quip_full_svd,
+        no_use_buffered=args.quip_no_use_buffered,
+        rescale_WH=args.quip_rescale_wh,
+        lowmem_ldlq=args.quip_lowmem_ldlq,
+        save_pfx=args.quip_debug_dir,
+    )
+
+    device = 'cuda' if torch.cuda.is_available() and args.quip_device_id >= 0 else 'cpu'
+    if device == 'cuda':
+        device = f'cuda:{args.quip_device_id}'
+
+    with torch.no_grad():
+        Wq, _attr = quip_mod.quantize(Hq, W.cpu(), args.quip_lora_rank, cb, quip_args, device=device)
+    return Wq.float().cpu()
+
+
+def validate_quip_sharp_problem(W, cb, codebook_name):
+    if W.shape[1] % cb.codesz != 0:
+        raise ValueError(
+            f'QUIP-Sharp codebook {codebook_name} requires in_features divisible by '
+            f'codesz={cb.codesz}, got {W.shape[1]}.'
+        )
+    if W.shape[0] % 2 != 0:
+        raise ValueError(f'QUIP-Sharp quantize asserts out_features is even, got {W.shape[0]}.')
+
+
+def compare_quip_ldlq(args):
+    W, X, source = build_problem(
+        seed=args.seed,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        module_name=args.module_name,
+        force_synthetic=args.force_synthetic,
+        synthetic_in_features=args.synthetic_in_features,
+        synthetic_out_features=args.synthetic_out_features,
+        synthetic_samples=args.synthetic_samples,
+    )
+    H = (X @ X.T).float()
+
+    print(f'Source: {source}')
+    print(f'W shape: {tuple(W.shape)}, X shape: {tuple(X.shape)}')
+    print(f'BQQ method: {INTRA_LAYER_METHOD}, compensation=ldlq')
+    print(f'QUIP-Sharp root: {args.quip_sharp_root}, codebook={args.quip_codebook}')
+
+    codebook_mod, _quip_mod, _quip_utils = _import_quip_sharp(args.quip_sharp_root)
+    validate_quip_sharp_problem(W, codebook_mod.get_codebook(args.quip_codebook), args.quip_codebook)
+
+    rows = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        consolidated_path = str(Path(tmpdir) / 'bqq_ldlq_decomposition.pt')
+        Wq_bqq = quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode='ldlq')
+        refine_history = []
+        if args.apply_ste_refine:
+            Wq_bqq, refine_history = refine_bqq_decomposition(W, H, args, consolidated_path)
+        rows.append({
+            'source': source,
+            'weight_shape': str(tuple(W.shape)),
+            'activation_shape': str(tuple(X.shape)),
+            'bits': args.bits,
+            'method': f'BQQ:{INTRA_LAYER_METHOD}' + ('+ste_refine' if args.apply_ste_refine else ''),
+            'compensation_mode': 'ldlq',
+            'codebook': None,
+            'ste_refine_steps': args.refine_steps if args.apply_ste_refine else 0,
+            'ste_refine_last_loss': refine_history[-1] if len(refine_history) > 0 else None,
+            'output_error_energy': output_error_energy(W, Wq_bqq, X),
+            'weight_mse': torch.mean((W - Wq_bqq).pow(2)).item(),
+        })
+
+        Wq_quip = quantize_quip_sharp_ldlq(W, H, args)
+        rows.append({
+            'source': source,
+            'weight_shape': str(tuple(W.shape)),
+            'activation_shape': str(tuple(X.shape)),
+            'bits': args.bits,
+            'method': 'QUIP-Sharp:quip.quantize',
+            'compensation_mode': 'ldlq',
+            'codebook': args.quip_codebook,
+            'ste_refine_steps': 0,
+            'ste_refine_last_loss': None,
+            'output_error_energy': output_error_energy(W, Wq_quip, X),
+            'weight_mse': torch.mean((W - Wq_quip).pow(2)).item(),
+        })
+
+    best_error = min(row['output_error_energy'] for row in rows)
+    bqq_error = rows[0]['output_error_energy']
+    for row in rows:
+        row['delta_vs_best'] = row['output_error_energy'] - best_error
+        row['ratio_vs_best'] = row['output_error_energy'] / best_error if best_error != 0 else float('inf')
+        row['delta_vs_bqq_ldlq'] = row['output_error_energy'] - bqq_error
+        row['ratio_vs_bqq_ldlq'] = row['output_error_energy'] / bqq_error if bqq_error != 0 else float('inf')
+    return rows
 
 
 
@@ -325,7 +499,7 @@ def main():
     parser.add_argument('--compensation-modes', type=str, default='none,gptq,ldlq',
                         help='Comma-separated modes used by --experiment compensation')
     parser.add_argument('--experiment', type=str, default='ste-refine',
-                        choices=['ste-refine', 'compensation'])
+                        choices=['ste-refine', 'compensation', 'quip-ldlq'])
     parser.add_argument('--no-scale-refine', dest='scale_refine', action='store_false')
     parser.add_argument('--refine-steps', type=int, default=1000)
     parser.add_argument('--refine-lr', type=float, default=1e-3)
@@ -342,6 +516,25 @@ def main():
     parser.add_argument('--scratch-output-path', type=str, default='')
     parser.add_argument('--output-csv', type=str, default=str(Path(__file__).with_name('results') / 'comparison_of_optimization.csv'))
     parser.add_argument('--use-multibqq', action='store_true')
+    parser.add_argument('--apply-ste-refine', action='store_true',
+                        help='Apply refine_decomposition_with_ste to the BQQ row in --experiment quip-ldlq')
+    parser.add_argument('--quip-sharp-root', type=str, default='/work2/k-kuroki/quip-sharp')
+    parser.add_argument('--quip-codebook', type=str, default='E8P12',
+                        choices=['E8P12', 'E8P12RVQ3B', 'E8P12RVQ4B'])
+    parser.add_argument('--quip-sigma-reg', type=float, default=1e-2)
+    parser.add_argument('--quip-sigma-reg2', type=float, default=1e-2)
+    parser.add_argument('--quip-incoh-mode', type=str, default='had', choices=['had', 'kron'])
+    parser.add_argument('--quip-lora-rank', type=int, default=0)
+    parser.add_argument('--quip-scale-override', type=float, default=-1)
+    parser.add_argument('--quip-resid-scale-override', type=float, default=-1)
+    parser.add_argument('--quip-tune-iters', type=int, default=10)
+    parser.add_argument('--quip-device-id', type=int, default=0)
+    parser.add_argument('--quip-debug-dir', type=str, default='/tmp')
+    parser.add_argument('--quip-use-fp64', action='store_true')
+    parser.add_argument('--quip-full-svd', action='store_true')
+    parser.add_argument('--quip-no-use-buffered', action='store_true')
+    parser.add_argument('--quip-rescale-wh', action='store_true')
+    parser.add_argument('--quip-lowmem-ldlq', action='store_true')
     args = parser.parse_args()
 
     refined_output_path = args.refined_output_path.strip()
@@ -351,6 +544,11 @@ def main():
 
     if args.experiment == 'compensation':
         result = compare_compensation_modes(args)
+        df = pd.DataFrame(result)
+        if not df.empty:
+            df = df.sort_values('output_error_energy')
+    elif args.experiment == 'quip-ldlq':
+        result = compare_quip_ldlq(args)
         df = pd.DataFrame(result)
         if not df.empty:
             df = df.sort_values('output_error_energy')
