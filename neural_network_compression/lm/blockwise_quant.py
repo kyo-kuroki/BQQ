@@ -689,8 +689,17 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
     n = len(inputs_cache)
     acc = max(1, tune_batch_size)
 
+    # Checkpoint every CKPT_WINDOW samples (finer than per-epoch).
+    # This catches the best parameter state within an epoch, not just at
+    # epoch boundaries, helping when the optimizer overshoots later in the epoch.
+    CKPT_WINDOW = 128
+    window_loss = 0.0
+    window_n = 0
+    ckpt_idx = 0
+    global_sample = 0
+    total_ckpts = epochs * max(1, n // CKPT_WINDOW)
+
     for epoch in tqdm(range(epochs), desc='Blockwise optimization', unit='epoch'):
-        total_loss = 0.0
         optimizer.zero_grad()
         for step, (inp, target) in enumerate(zip(inputs_cache, targets_cache)):
             with torch.enable_grad():
@@ -699,7 +708,9 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
                 # Scale loss so the effective gradient equals the mean over the mini-batch
                 loss = ((output - target_hs) ** 2).mean() / acc
                 loss.backward()
-            total_loss += loss.item() * acc
+            window_loss += loss.item() * acc
+            window_n += 1
+            global_sample += 1
 
             is_last = (step == n - 1)
             if (step + 1) % acc == 0 or is_last:
@@ -708,18 +719,23 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
                 optimizer.step()
                 optimizer.zero_grad()
 
-        avg = total_loss / n
-        if avg < best_mse:
-            best_mse = avg
-            best_state = {k: v.cpu().clone() for k, v in block.state_dict().items()}
-        print(f'    Epoch {epoch + 1}/{epochs}: MSE={avg:.6f}'
-              f'{" *" if avg <= best_mse else ""}')
+            if global_sample % CKPT_WINDOW == 0 or is_last:
+                window_avg = window_loss / window_n
+                ckpt_idx += 1
+                is_best = window_avg < best_mse
+                if is_best:
+                    best_mse = window_avg
+                    best_state = {k: v.cpu().clone() for k, v in block.state_dict().items()}
+                print(f'    Ckpt {ckpt_idx}/{total_ckpts} (ep{epoch + 1}, s{global_sample}): '
+                      f'loss={window_avg:.6f}{" *" if is_best else ""}')
+                window_loss = 0.0
+                window_n = 0
 
     # Restore best parameters
     if best_state is not None:
         block.load_state_dict(best_state)
         block.to(device)
-        print(f'    Restored best epoch (MSE={best_mse:.6f})')
+        print(f'    Restored best ckpt (loss={best_mse:.6f})')
 
 
 # ---------------------------------------------------------------------------
@@ -1284,6 +1300,7 @@ def quantize_block_progressive_closed_form(
     ste_refine_log_interval=20,
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
+    compensation_mode='ldlq',
 ):
     """Front-to-back layer quantization with closed-form continuous recentering.
 
