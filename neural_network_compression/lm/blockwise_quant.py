@@ -509,7 +509,7 @@ def ensure_layerwise_block_available(
     layerwise_quantize_block(
         model_name=model_name,
         save_dir=layerwise_dir,
-        block_idx=block_idx,
+        block_indices=[block_idx],
         bit_width=bit_width,
         group_size=group_size,
         num_steps=num_steps,

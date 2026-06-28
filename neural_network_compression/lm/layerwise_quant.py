@@ -178,6 +178,76 @@ def collect_block_hessians(
     return {k: v for k, v in H.items() if v is not None}
 
 
+def collect_blocks_hessians(
+    model: nn.Module,
+    calibration_loader,
+    block_indices: List[int],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """
+    Collect H = X^T X for all Linear layers across several blocks in a SINGLE
+    forward pass. An early-exit hook stops computation after the last (highest)
+    requested block, so the model is loaded once per GPU and the calibration
+    forward is shared by every block assigned to that GPU.
+
+    Returns dict keyed by full module name (e.g. 'model.layers.3.self_attn.q_proj').
+    """
+    block_indices = sorted(set(block_indices))
+    if not block_indices:
+        raise ValueError("block_indices must not be empty")
+
+    H: Dict[str, Optional[torch.Tensor]] = {}
+    handles = []
+
+    def make_hook(full_name: str):
+        def _hook(module, inp, _out):
+            x = inp[0].detach().float()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
+            h = x.T @ x
+            if H[full_name] is None:
+                H[full_name] = h
+            else:
+                H[full_name].add_(h)
+        return _hook
+
+    for block_idx in block_indices:
+        block = get_decoder_layer(model, block_idx)
+        block_prefix = get_decoder_block_prefix(model, block_idx)
+        for name, module in block.named_modules():
+            if isinstance(module, nn.Linear):
+                full_name = f"{block_prefix}.{name}"
+                H[full_name] = None
+                handles.append(module.register_forward_hook(make_hook(full_name)))
+
+    # Early-exit after the last requested block to avoid running the rest of the model
+    last_block = get_decoder_layer(model, block_indices[-1])
+
+    def _exit_hook(module, inp, out):
+        raise _EarlyExit()
+
+    handles.append(last_block.register_forward_hook(_exit_hook))
+
+    model.eval()
+    model.to(device)
+
+    with torch.no_grad():
+        for batch in tqdm(calibration_loader, desc=f"Collecting Hessians (blocks {block_indices})"):
+            ids = batch[0] if isinstance(batch, (list, tuple)) else batch
+            ids = ids.to(device)
+            try:
+                model(ids)
+            except _EarlyExit:
+                pass
+            except Exception:
+                pass
+
+    for h in handles:
+        h.remove()
+
+    return {k: v for k, v in H.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
 # Multi-GPU parallel quantization worker (top-level for mp.spawn pickling)
 # ---------------------------------------------------------------------------
@@ -401,7 +471,7 @@ def layerwise_quantize(
 def layerwise_quantize_block(
     model_name: str,
     save_dir: Path,
-    block_idx: int,
+    block_indices: List[int],
     *,
     bit_width: int,
     group_size: int,
@@ -426,12 +496,15 @@ def layerwise_quantize_block(
     calibration_loader,
 ):
     """
-    Quantize all Linear layers in transformer block `block_idx`.
+    Quantize all Linear layers in one or more transformer blocks `block_indices`.
 
     Efficiency improvements vs per-target mode:
-    - Model loaded once (not N times)
-    - All Hessians collected in a single forward pass (early-exit after block)
-    - Quantization distributed across all available GPUs via mp.spawn
+    - Model loaded once (not N times), and only once per GPU even when several
+      consecutive blocks are assigned to the same GPU
+    - All Hessians for every assigned block collected in a single forward pass
+      (early-exit after the last assigned block)
+    - Quantization of all Linear layers across the assigned blocks distributed
+      across the available worker slots via mp.spawn
     """
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -445,40 +518,43 @@ def layerwise_quantize_block(
     model = load_causal_lm(model_name)
 
     n_blocks = get_decoder_num_layers(model)
-    if block_idx >= n_blocks:
-        raise ValueError(f"--block_idx {block_idx} >= n_blocks {n_blocks}")
+    block_indices = sorted(set(block_indices))
+    for b in block_indices:
+        if b >= n_blocks:
+            raise ValueError(f"--block_idx {b} >= n_blocks {n_blocks}")
 
-    block = get_decoder_layer(model, block_idx)
-    block_prefix = get_decoder_block_prefix(model, block_idx)
-
-    # Enumerate quantization targets in this block
-    linear_names = []
-    for name, module in block.named_modules():
-        if isinstance(module, nn.Linear):
-            linear_names.append(name)
-    n_total = len(linear_names)
+    # Enumerate quantization targets across all assigned blocks
+    linear_specs = []  # (block_idx, block_prefix, linear_name)
+    for b in block_indices:
+        block = get_decoder_layer(model, b)
+        block_prefix = get_decoder_block_prefix(model, b)
+        for name, module in block.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_specs.append((b, block_prefix, name))
+    n_total = len(linear_specs)
 
     workers_per_gpu = max(1, int(workers_per_gpu))
     n_workers = n_gpus * workers_per_gpu
     print(
-        f"Block {block_idx}/{n_blocks-1}: {n_total} Linear targets, {n_gpus} GPU(s), "
+        f"Blocks {block_indices} (of {n_blocks}): {n_total} Linear targets, {n_gpus} GPU(s), "
         f"workers_per_gpu={workers_per_gpu}, total_workers={n_workers}"
     )
 
-    # Collect all Hessians in one forward pass (early exit after block)
-    print("Collecting Hessians (single forward pass for all targets in block)...")
-    H_dict = collect_block_hessians(model, calibration_loader, block_idx, device)
+    # Collect all Hessians for every assigned block in a single forward pass
+    # (early exit after the last assigned block).
+    print("Collecting Hessians (single forward pass for all targets in the assigned blocks)...")
+    H_dict = collect_blocks_hessians(model, calibration_loader, block_indices, device)
     print(f"  Collected {len(H_dict)} Hessians")
 
     # Snapshot weights before freeing model
     target_data = []
-    for i, linear_name in enumerate(linear_names):
+    for i, (b, block_prefix, linear_name) in enumerate(linear_specs):
         module_name = f"{block_prefix}.{linear_name}"
         param_name = f"{module_name}.weight"
         tensor_path = save_dir / f"{param_name}.pth"
         consolidated_path = consolidated_dir / f"{param_name}.pth"
 
-        submodule = block
+        submodule = get_decoder_layer(model, b)
         for part in linear_name.split('.'):
             submodule = getattr(submodule, part)
         weight = submodule.weight.detach().cpu().float()
@@ -548,7 +624,7 @@ def layerwise_quantize_block(
     else:
         mp.spawn(_quantize_block_worker, args=(gpu_tasks, common), nprocs=n_workers, join=True)
 
-    print(f"\nDone. Block {block_idx} output: {save_dir}")
+    print(f"\nDone. Blocks {block_indices} output: {save_dir}")
 
 
 # ---------------------------------------------------------------------------
@@ -626,9 +702,11 @@ def main():
                              '(for use by submit scripts).')
 
     # Mode: per-block parallel (new)
-    parser.add_argument('--block_idx', type=int, default=None,
-                        help='0-based transformer block index. '
-                             'Quantizes all Linear layers in the block using all available GPUs.')
+    parser.add_argument('--block_idx', type=str, default=None,
+                        help='0-based transformer block index, or a comma-separated list '
+                             'of indices (e.g. "0,1,2") to quantize several blocks in a '
+                             'single process with one model load. Quantizes all Linear '
+                             'layers in the block(s) using all available GPUs.')
     parser.add_argument('--list_blocks', action='store_true',
                         help='Print the number of transformer blocks and exit '
                              '(for use by submit scripts).')
@@ -663,12 +741,17 @@ def main():
         seqlen=args.seqlen, model=args.model_name, tokenizer=tokenizer,
     )
 
-    # --block_idx: block-level mode (one model load, one Hessian pass, multi-GPU)
+    # --block_idx: block-level mode (one model load, one Hessian pass, multi-GPU).
+    # Accepts a single index or a comma-separated list to process several blocks
+    # in this one process (so the model is loaded only once on this GPU).
     if args.block_idx is not None:
+        block_indices = sorted({int(b) for b in str(args.block_idx).split(',') if str(b).strip() != ''})
+        if not block_indices:
+            raise ValueError(f"--block_idx parsed to an empty set from {args.block_idx!r}")
         layerwise_quantize_block(
             model_name=args.model_name,
             save_dir=save_dir,
-            block_idx=args.block_idx,
+            block_indices=block_indices,
             bit_width=args.bit_width,
             group_size=args.group_size,
             num_steps=args.num_steps,

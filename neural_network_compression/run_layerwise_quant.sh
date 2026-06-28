@@ -7,6 +7,7 @@ LM_DIR="${SCRIPT_DIR}/lm"
 MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-2-7b-hf}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all", or a specific transformer block index.
 LAYERS_PER_GPU="${LAYERS_PER_GPU:-8}" # Parallel layer quantization workers inside each block job.
+NUM_BLOCKS_PER_GPU="${NUM_BLOCKS_PER_GPU:-1}" # Consecutive blocks handled by one process on one GPU (model loaded once per GPU).
 BIT_WIDTH="${BIT_WIDTH:-1}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
@@ -125,27 +126,87 @@ assemble_model() {
 if [[ "${BLOCK_IDX}" == "all" ]]; then
   NUM_BLOCKS="$(python "${LM_DIR}/layerwise_quant.py" --model_name "${MODEL_NAME}" --list_blocks)"
   detect_gpu_ids
-  echo "Parallel layerwise quantization: ${NUM_BLOCKS} blocks over ${#gpu_ids[@]} GPU(s), ${LAYERS_PER_GPU} layer worker(s) inside each block job: ${gpu_ids[*]}"
+  num_gpus="${#gpu_ids[@]}"
+  if (( NUM_BLOCKS_PER_GPU < 1 )); then
+    echo "NUM_BLOCKS_PER_GPU must be >= 1, got ${NUM_BLOCKS_PER_GPU}." >&2
+    exit 1
+  fi
+
+  # Group blocks into contiguous chunks of NUM_BLOCKS_PER_GPU. Each chunk is
+  # handled by ONE process pinned to a single GPU, so the model is loaded only
+  # once per GPU and the Hessian cache for all blocks in the chunk is generated
+  # in a single forward pass. The chunk's layers are quantized in parallel by
+  # LAYERS_PER_GPU workers inside that process.
+  chunks=()
+  for (( start=0; start<NUM_BLOCKS; start+=NUM_BLOCKS_PER_GPU )); do
+    end=$(( start + NUM_BLOCKS_PER_GPU - 1 ))
+    if (( end >= NUM_BLOCKS )); then
+      end=$(( NUM_BLOCKS - 1 ))
+    fi
+    spec="${start}"
+    for (( b=start+1; b<=end; b++ )); do
+      spec+=",${b}"
+    done
+    chunks+=("${spec}")
+  done
+
+  echo "Parallel layerwise quantization: ${NUM_BLOCKS} blocks in ${#chunks[@]} chunk(s) of up to ${NUM_BLOCKS_PER_GPU} block(s), one model load per GPU, over ${num_gpus} GPU(s), ${LAYERS_PER_GPU} layer worker(s) per chunk: ${gpu_ids[*]}"
+
+  # At most one chunk process (one model) runs on a GPU at a time.
+  declare -A gpu_busy
+  declare -A pid_gpu
+  for g in "${gpu_ids[@]}"; do
+    gpu_busy["${g}"]=0
+  done
+
+  pick_gpu() {
+    # Echo the first idle GPU (lowest index first).
+    local g
+    for g in "${gpu_ids[@]}"; do
+      if (( gpu_busy["${g}"] == 0 )); then
+        echo "${g}"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  reap_one() {
+    # Wait for any one chunk process to finish and free its GPU. Fail fast if a
+    # chunk exited non-zero (the EXIT trap then kills the remaining jobs).
+    local finished_pid="" status=0
+    wait -n -p finished_pid || status=$?
+    if [[ -n "${finished_pid}" && -n "${pid_gpu[${finished_pid}]:-}" ]]; then
+      gpu_busy["${pid_gpu[${finished_pid}]}"]=0
+      unset "pid_gpu[${finished_pid}]"
+    fi
+    if (( status != 0 )); then
+      echo "Chunk process (pid ${finished_pid:-unknown}) failed with status ${status}; aborting." >&2
+      exit "${status}"
+    fi
+  }
 
   trap cleanup_jobs EXIT
-  active_jobs=0
-  total_slots="${#gpu_ids[@]}"
-  for ((block_idx=0; block_idx<NUM_BLOCKS; block_idx++)); do
-    gpu_id="${gpu_ids[$((block_idx % total_slots))]}"
-    echo "[launch] block ${block_idx} -> GPU ${gpu_id} (${LAYERS_PER_GPU} layer worker(s))"
+  running=0
+  for spec in "${chunks[@]}"; do
+    while (( running >= num_gpus )); do
+      reap_one
+      running=$(( running - 1 ))
+    done
+    gpu_id="$(pick_gpu)"
+    echo "[launch] blocks ${spec} -> GPU ${gpu_id} (1 model load, ${LAYERS_PER_GPU} layer worker(s))"
     (
       export CUDA_VISIBLE_DEVICES="${gpu_id}"
-      run_one_block "${block_idx}" 0 "$@"
+      run_one_block "${spec}" 0 "$@"
     ) &
-    active_jobs=$((active_jobs + 1))
-    if (( active_jobs >= total_slots )); then
-      wait -n
-      active_jobs=$((active_jobs - 1))
-    fi
+    pid=$!
+    pid_gpu["${pid}"]="${gpu_id}"
+    gpu_busy["${gpu_id}"]=1
+    running=$(( running + 1 ))
   done
-  while (( active_jobs > 0 )); do
-    wait -n
-    active_jobs=$((active_jobs - 1))
+  while (( running > 0 )); do
+    reap_one
+    running=$(( running - 1 ))
   done
   trap - EXIT
 
