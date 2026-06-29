@@ -73,8 +73,14 @@ def collect_hessians(
     calibration_loader,
     target_names: List[str],
     device: torch.device,
+    accumulate_device=None,
 ) -> Dict[str, torch.Tensor]:
-    """Run calibration data through model and accumulate H = X^T X per layer."""
+    """Run calibration data through model and accumulate H = X^T X per layer.
+
+    accumulate_device: if set (e.g. 'cpu'), the running H sums are kept on that
+    device instead of the compute device. Use 'cpu' when caching every target's
+    Hessian at once so the full set does not have to fit in GPU memory.
+    """
     H: Dict[str, Optional[torch.Tensor]] = {n: None for n in target_names}
     handles = []
 
@@ -84,6 +90,8 @@ def collect_hessians(
             if x.dim() == 3:
                 x = x.reshape(-1, x.shape[-1])
             h = x.T @ x
+            if accumulate_device is not None:
+                h = h.to(accumulate_device)
             if H[name] is None:
                 H[name] = h
             else:
@@ -642,6 +650,178 @@ def layerwise_quantize_block(
 # CLI
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Cached Hessian flow: cache every target's Hessian+weight once, then quantize
+# each target in its own process (shell-driven GPU parallelism, no mp.spawn).
+# ---------------------------------------------------------------------------
+
+def _hessian_cache_targets_file(cache_dir) -> Path:
+    return Path(cache_dir) / 'targets.txt'
+
+
+def _hessian_cache_entry_path(cache_dir, target_name) -> Path:
+    return Path(cache_dir) / f'{target_name}.pt'
+
+
+def _read_hessian_cache_targets(cache_dir) -> List[str]:
+    path = _hessian_cache_targets_file(cache_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Hessian cache targets file not found: {path}. Run --cache_hessians first.')
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def cache_all_hessians(
+    model_name: str,
+    cache_dir,
+    *,
+    calibration_loader,
+    layer_threshold: int = 0,
+    device_id: int = 0,
+    refresh: bool = False,
+):
+    """Load the model once and cache H = X^T X (and the FP weight) for every
+    quantization target in a single calibration forward pass.
+
+    Hessians accumulate on CPU so the whole set need not fit in GPU memory.
+    Writes one '<target>.pt' file per target plus an ordered 'targets.txt'.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+
+    print(f"Loading model: {model_name}")
+    model = load_causal_lm(model_name)
+
+    target_names = []
+    for name, param in model.named_parameters():
+        if is_quantization_target(name) and param.ndim == 2:
+            if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
+                continue
+            target_names.append(name[:-len('.weight')])
+
+    # Always (re)write the ordered target list so --target_idx maps consistently.
+    _hessian_cache_targets_file(cache_dir).write_text('\n'.join(target_names) + '\n')
+
+    if refresh:
+        pending = list(target_names)
+    else:
+        pending = [t for t in target_names if not _hessian_cache_entry_path(cache_dir, t).exists()]
+
+    if not pending:
+        print(f"All {len(target_names)} target Hessians already cached at {cache_dir}")
+        del model
+        return
+
+    print(f"Caching Hessians for {len(pending)}/{len(target_names)} target(s) in one forward pass...")
+    H_dict = collect_hessians(model, calibration_loader, pending, device, accumulate_device='cpu')
+    print(f"  Collected {len(H_dict)} Hessians")
+
+    param_by_name = dict(model.named_parameters())
+    saved = 0
+    for tname in pending:
+        H = H_dict.get(tname)
+        if H is None:
+            print(f"  WARNING: no Hessian collected for {tname}, skipping")
+            continue
+        weight = param_by_name[f'{tname}.weight'].detach().cpu().float()
+        torch.save(
+            {'module_name': tname, 'H': H.cpu().float(), 'weight': weight},
+            _hessian_cache_entry_path(cache_dir, tname),
+        )
+        saved += 1
+    print(f"Cached {saved} target Hessian(s)+weight(s) to {cache_dir}")
+
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
+
+def quantize_cached_target(
+    cache_dir,
+    target_idx: int,
+    save_dir,
+    *,
+    bit_width: int,
+    group_size: int,
+    num_steps: int,
+    rank_scale: float,
+    seed: int,
+    scale_refine: bool,
+    damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    fix_beta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
+    compensation_mode: str,
+    save_reconstructed: bool = False,
+    main_gpu_id: int = 0,
+):
+    """Quantize a single target from its cached Hessian+weight (no model load)."""
+    cache_dir = Path(cache_dir)
+    save_dir = Path(save_dir)
+    targets = _read_hessian_cache_targets(cache_dir)
+    if not (0 <= target_idx < len(targets)):
+        raise ValueError(f'--target_idx {target_idx} out of range [0, {len(targets)})')
+    tname = targets[target_idx]
+
+    consolidated_dir = save_dir / '_consolidated'
+    consolidated_dir.mkdir(parents=True, exist_ok=True)
+    param_name = f'{tname}.weight'
+    consolidated_path = consolidated_dir / f'{param_name}.pth'
+    tensor_path = save_dir / f'{param_name}.pth'
+
+    if consolidated_path.exists():
+        print(f"[{target_idx}/{len(targets)}] {param_name}: already exists, skipping")
+        return
+
+    entry_path = _hessian_cache_entry_path(cache_dir, tname)
+    if not entry_path.exists():
+        raise FileNotFoundError(f'Hessian cache missing for {tname}: {entry_path}')
+    entry = torch.load(entry_path, map_location='cpu', weights_only=False)
+    weight, H = entry['weight'], entry['H']
+    print(f"[{target_idx}/{len(targets)}] {param_name} {tuple(weight.shape)} (cached Hessian)")
+
+    quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
+    reconstructed = quantizer.bqq_large_matrix_multi_worker(
+        max_patch_size=group_size,
+        bit_width=bit_width,
+        consolidated_path=str(consolidated_path),
+        Nstep=num_steps,
+        seed=seed,
+        main_gpu_id=main_gpu_id,
+        H=H,
+        damping=damping,
+        hessian_mode='intra-layer-ste',
+        scale_refine=scale_refine,
+        use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
+        ste_refine_steps=ste_refine_steps,
+        ste_refine_lr=ste_refine_lr,
+        ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_binary_lr=ste_refine_binary_lr,
+        ste_refine_continuous_lr=ste_refine_continuous_lr,
+        ste_refine_optimize_factors=not refine_coeffs_only,
+        ste_refine_optimize_coeffs=True,
+        ste_refine_optimize_theta=not fix_theta,
+        ste_refine_optimize_beta=not fix_beta,
+        ste_refine_row_group_batch_size=row_group_batch_size,
+        ste_refine_log_interval=ste_refine_log_interval,
+    )
+    if save_reconstructed:
+        torch.save(reconstructed.cpu(), tensor_path)
+        print(f"  Saved: {tensor_path}")
+    else:
+        print(f"  Saved patches: {consolidated_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Layer-wise Hessian-aware BQQ quantization for LMs")
@@ -716,6 +896,16 @@ def main():
                         help='Print the number of quantization targets and exit '
                              '(for use by submit scripts).')
 
+    # Mode: cached Hessian flow (cache once, then quantize per-target across GPUs via a shell)
+    parser.add_argument('--cache_hessians', action='store_true',
+                        help='Load the model once, compute every target Hessian (and weight) in a '
+                             'single forward pass, save them under --hessian_cache_dir, then exit.')
+    parser.add_argument('--hessian_cache_dir', type=str, default=None,
+                        help='Directory of cached per-target Hessians+weights. Written by '
+                             '--cache_hessians; read by --target_idx/--list_targets (no model load).')
+    parser.add_argument('--refresh_hessian_cache', action='store_true',
+                        help='Recompute and overwrite cached Hessians even if already present.')
+
     # Mode: per-block parallel (new)
     parser.add_argument('--block_idx', type=str, default=None,
                         help='0-based transformer block index, or a comma-separated list '
@@ -728,10 +918,14 @@ def main():
 
     args = parser.parse_args()
 
-    # --list_targets: print count and exit (no GPU needed)
+    # --list_targets: print count and exit (no GPU needed). When a Hessian cache
+    # is given, read the cached ordering instead of loading the model.
     if args.list_targets:
-        names = get_target_names(args.model_name, args.layer_threshold)
-        print(len(names))
+        if args.hessian_cache_dir:
+            print(len(_read_hessian_cache_targets(args.hessian_cache_dir)))
+        else:
+            names = get_target_names(args.model_name, args.layer_threshold)
+            print(len(names))
         return
 
     # --list_blocks: print block count and exit (no GPU needed)
@@ -748,6 +942,38 @@ def main():
             args.model_name, args.bit_width, args.group_size, args.num_steps)
     save_dir = Path(save_dir)
 
+    # Cached per-target quantize: read the cached Hessian+weight and quantize one
+    # target. No model load and no calibration data needed (so a fleet of these
+    # processes can run in parallel across GPUs). Assembly is done separately.
+    if args.target_idx is not None and args.hessian_cache_dir:
+        quantize_cached_target(
+            args.hessian_cache_dir,
+            args.target_idx,
+            save_dir,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            rank_scale=args.rank_scale,
+            seed=args.seed,
+            scale_refine=args.scale_refine,
+            damping=args.damping,
+            ste_refine_steps=args.ste_refine_steps,
+            ste_refine_lr=args.ste_refine_lr,
+            ste_refine_weight_decay=args.ste_refine_weight_decay,
+            ste_refine_binary_lr=args.ste_refine_binary_lr,
+            ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+            ste_refine_log_interval=args.ste_refine_log_interval,
+            refine_coeffs_only=args.refine_coeffs_only,
+            fix_theta=args.fix_theta,
+            fix_beta=args.fix_beta,
+            row_group_batch_size=args.row_group_batch_size,
+            use_multibqq=args.use_multibqq,
+            compensation_mode=args.compensation_mode,
+            save_reconstructed=args.save_reconstructed,
+            main_gpu_id=args.main_gpu_id,
+        )
+        return
+
     # Data
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, use_fast=False)
@@ -755,6 +981,20 @@ def main():
         args.dataset, nsamples=args.nsamples, seed=args.seed,
         seqlen=args.seqlen, model=args.model_name, tokenizer=tokenizer,
     )
+
+    # --cache_hessians: compute & cache every target's Hessian+weight, then exit.
+    if args.cache_hessians:
+        if not args.hessian_cache_dir:
+            raise ValueError('--cache_hessians requires --hessian_cache_dir')
+        cache_all_hessians(
+            args.model_name,
+            args.hessian_cache_dir,
+            calibration_loader=train_loader,
+            layer_threshold=args.layer_threshold,
+            device_id=args.main_gpu_id,
+            refresh=args.refresh_hessian_cache,
+        )
+        return
 
     # --block_idx: block-level mode (one model load, one Hessian pass, multi-GPU).
     # Accepts a single index or a comma-separated list to process several blocks
