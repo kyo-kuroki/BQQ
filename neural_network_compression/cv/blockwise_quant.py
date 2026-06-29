@@ -29,8 +29,12 @@ from quantizer import BinaryQuadraticQuantization
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
 from neural_network_compression.bqqkernel.bqq_modules import BinaryQuadratic, get_matrices
 
-from build_model import get_model
-from build_dataset import get_imagenet, calibsample_from_trainloader
+try:
+    from .src.model_loader import get_vision_model, get_block, get_num_blocks
+    from .src.datautils import get_imagenet, calibsample_from_trainloader
+except ImportError:
+    from neural_network_compression.cv.src.model_loader import get_vision_model, get_block, get_num_blocks
+    from neural_network_compression.cv.src.datautils import get_imagenet, calibsample_from_trainloader
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +59,7 @@ def cache_block_io(model, block_idx, calib_images, device):
     model.eval()
     model.to(device)
 
-    block = model.blocks[block_idx]
+    block = get_block(model, block_idx)
     inputs_cache = []
     targets_cache = []
 
@@ -99,7 +103,8 @@ def get_quantizable_linears(block):
 
 def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             rank_scale, seed, device_id, H=None,
-                            scale_refine=True, damping=1e-6):
+                            scale_refine=True, damping=1e-6,
+                            use_multibqq=True, compensation_mode='ldlq'):
     """Quantize a 2D weight tensor with BQQ. Returns (A, Y, Z)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         consolidated_path = os.path.join(tmpdir, 'temp.pth')
@@ -110,8 +115,11 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
             seed=seed, main_gpu_id=device_id,
         )
         if H is not None:
-            kwargs.update(H=H, hessian_mode='intra-layer',
-                          scale_refine=scale_refine, damping=damping)
+            kwargs.update(H=H, hessian_mode='intra-layer-ste',
+                          scale_refine=scale_refine, damping=damping,
+                          use_multibqq=use_multibqq,
+                          compensation_mode=compensation_mode,
+                          ste_refine_steps=0)
         quantizer.bqq_large_matrix_multi_worker(**kwargs)
         patches = torch.load(consolidated_path, weights_only=False, map_location='cpu')
     A, Y, Z = get_matrices(patches, bit_width)
@@ -251,6 +259,8 @@ def quantize_block(
     hessian_cache_dir=None,
     scale_refine=True,
     damping=1e-6,
+    use_multibqq=True,
+    compensation_mode='ldlq',
     device,
     save_dir,
 ):
@@ -259,13 +269,13 @@ def quantize_block(
 
     # 1. Cache block I/O
     print(f'Loading model: {model_name}')
-    model = get_model(model_name)
+    model = get_vision_model(model_name)
 
     print(f'Caching block {block_idx} I/O ...')
     inputs_cache, targets_cache = cache_block_io(model, block_idx, calib_images, dev)
     print(f'  Cached {len(inputs_cache)} batches')
 
-    block = copy.deepcopy(model.blocks[block_idx])
+    block = copy.deepcopy(get_block(model, block_idx))
     del model
     torch.cuda.empty_cache()
 
@@ -312,7 +322,8 @@ def quantize_block(
             weight, bit_width=bit_width, group_size=group_size,
             num_steps=num_steps, rank_scale=rank_scale, seed=seed,
             device_id=device_id, H=H, scale_refine=scale_refine,
-            damping=damping,
+            damping=damping, use_multibqq=use_multibqq,
+            compensation_mode=compensation_mode,
         )
         _set_submodule(block, linear_name, BinaryQuadratic(Y, Z, A, bias=bias))
 
@@ -373,6 +384,11 @@ def main():
     parser.add_argument('--no_scale_refine', action='store_true',
                         help='Disable Hessian-aware scale refinement')
     parser.add_argument('--damping', type=float, default=1e-6)
+    parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false', default=True,
+                        help='Disable joint multibqq optimization (quantize bits sequentially)')
+    parser.add_argument('--compensation_mode', type=str, default='ldlq',
+                        choices=['gptq', 'ldlq', 'none'],
+                        help='Column compensation mode for Hessian-aware BQQ')
 
     parser.add_argument('--data_path', type=str, default=None,
                         help='Path to ImageNet. Falls back to IMAGENET_DIR env var.')
@@ -403,6 +419,8 @@ def main():
         hessian_cache_dir=args.hessian_cache_dir,
         scale_refine=not args.no_scale_refine,
         damping=args.damping,
+        use_multibqq=args.use_multibqq,
+        compensation_mode=args.compensation_mode,
         device=args.device,
         save_dir=args.save_dir,
     )

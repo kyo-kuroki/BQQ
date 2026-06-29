@@ -1,35 +1,60 @@
 """
-Layer-wise Hessian-aware BQQ quantization for vision models.
+Layer-wise Hessian-aware BQQ quantization for vision transformers (DeiT, ViT, Swin).
 
-1. Load pretrained model (DeiT, ViT, Swin)
+1. Load pretrained model
 2. Collect Hessian (H = X^T X) per linear layer via ImageNet calibration data
 3. Quantize each weight with intra-layer Hessian-aware BQQ
-4. Save in same format as weight_aware_quant_cached.py (consolidated patch files)
+   (column-wise N-bit decomposition + GPTQ/LDLQ-style compensation + optional
+    scale refine + optional STE refine)
+4. Save consolidated patch files (the artifact the model assembly consumes)
 
-Usage:
+Usage (all targets sequentially):
   python layerwise_quant.py \
     --model_name deit-s \
-    --save_dir bqq_compressed_data/deit-s-2bit-32gs-hessian \
+    --save_dir bqq_compressed_data/deit-s-2bit-32gs \
     --bit_width 2 --group_size 32 --num_steps 20000 \
-    --nsamples 256 --data_path /path/to/imagenet \
-    --scale_refine
+    --nsamples 256 --data_path /path/to/imagenet
+
+Usage (single target, for parallel jobs):
+  python layerwise_quant.py --model_name deit-s --target_idx 0 ...
+  python layerwise_quant.py --model_name deit-s --list_targets   # print count and exit
+
+Usage (block-level parallel, one task = one transformer block, multi-GPU within block):
+  python layerwise_quant.py --model_name deit-s --block_idx 0 ...
+  python layerwise_quant.py --model_name deit-s --list_blocks    # print block count and exit
 """
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.multiprocessing as mp
 import torch.nn as nn
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from quantizer import BinaryQuadraticQuantization
 
-from build_model import get_model
-from build_dataset import get_imagenet
+try:
+    from .src.model_loader import (
+        MODEL_CHOICES, get_vision_model, get_block, get_block_prefix,
+        get_num_blocks, resolve_blocks,
+    )
+    from .src.datautils import get_imagenet
+    from .src.compressed_data import default_compressed_data_dir
+    from .src.build_bqq_model import save_bqq_model
+except ImportError:
+    from neural_network_compression.cv.src.model_loader import (
+        MODEL_CHOICES, get_vision_model, get_block, get_block_prefix,
+        get_num_blocks, resolve_blocks,
+    )
+    from neural_network_compression.cv.src.datautils import get_imagenet
+    from neural_network_compression.cv.src.compressed_data import default_compressed_data_dir
+    from neural_network_compression.cv.src.build_bqq_model import save_bqq_model
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +63,11 @@ from build_dataset import get_imagenet
 
 def is_quantization_target(name: str) -> bool:
     return not any(token in name for token in ('norm', 'bias', 'token', 'pos', 'emb', 'head'))
+
+
+def passes_layer_threshold(name: str, layer_threshold: int) -> bool:
+    layer_ids = [int(num) for num in re.findall(r'\d+', name)]
+    return any(layer_id >= layer_threshold for layer_id in layer_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +79,14 @@ def collect_hessians(
     calibration_loader,
     target_names: List[str],
     device: torch.device,
+    accumulate_device=None,
 ) -> Dict[str, torch.Tensor]:
-    """Run calibration data through model and accumulate H = X^T X per layer."""
+    """Run calibration images through the model and accumulate H = X^T X per layer.
+
+    accumulate_device: if set (e.g. 'cpu'), the running H sums are kept on that
+    device instead of the compute device. Use 'cpu' when caching every target's
+    Hessian at once so the full set does not have to fit in GPU memory.
+    """
     H: Dict[str, Optional[torch.Tensor]] = {n: None for n in target_names}
     handles = []
 
@@ -60,6 +96,8 @@ def collect_hessians(
             if x.dim() == 3:
                 x = x.reshape(-1, x.shape[-1])
             h = x.T @ x
+            if accumulate_device is not None:
+                h = h.to(accumulate_device)
             if H[name] is None:
                 H[name] = h
             else:
@@ -88,9 +126,164 @@ def collect_hessians(
     return {k: v for k, v in H.items() if v is not None}
 
 
+class _EarlyExit(Exception):
+    pass
+
+
+def collect_blocks_hessians(
+    model: nn.Module,
+    calibration_loader,
+    block_indices: List[int],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """
+    Collect H = X^T X for all Linear layers across several blocks in a SINGLE
+    forward pass. An early-exit hook stops computation after the last (highest)
+    requested block, so the model is loaded once per GPU and the calibration
+    forward is shared by every block assigned to that GPU.
+
+    Returns dict keyed by full module name (e.g. 'blocks.3.attn.qkv').
+    """
+    block_indices = sorted(set(block_indices))
+    if not block_indices:
+        raise ValueError("block_indices must not be empty")
+
+    H: Dict[str, Optional[torch.Tensor]] = {}
+    handles = []
+
+    def make_hook(full_name: str):
+        def _hook(module, inp, _out):
+            x = inp[0].detach().float()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.shape[-1])
+            h = x.T @ x
+            if H[full_name] is None:
+                H[full_name] = h
+            else:
+                H[full_name].add_(h)
+        return _hook
+
+    for block_idx in block_indices:
+        block = get_block(model, block_idx)
+        block_prefix = get_block_prefix(model, block_idx)
+        for name, module in block.named_modules():
+            if isinstance(module, nn.Linear):
+                full_name = f"{block_prefix}.{name}"
+                H[full_name] = None
+                handles.append(module.register_forward_hook(make_hook(full_name)))
+
+    # Early-exit after the last requested block to avoid running the rest of the model
+    last_block = get_block(model, block_indices[-1])
+
+    def _exit_hook(module, inp, out):
+        raise _EarlyExit()
+
+    handles.append(last_block.register_forward_hook(_exit_hook))
+
+    model.eval()
+    model.to(device)
+
+    with torch.no_grad():
+        for batch in tqdm(calibration_loader, desc=f"Collecting Hessians (blocks {block_indices})"):
+            images = batch[0] if isinstance(batch, (list, tuple)) else batch
+            images = images.to(device)
+            try:
+                model(images)
+            except _EarlyExit:
+                pass
+            except Exception:
+                pass
+
+    for h in handles:
+        h.remove()
+
+    return {k: v for k, v in H.items() if v is not None}
+
+
 # ---------------------------------------------------------------------------
-# Main quantization
+# Multi-GPU parallel quantization worker (top-level for mp.spawn pickling)
 # ---------------------------------------------------------------------------
+
+def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
+    """
+    Worker spawned by mp.spawn. Quantizes all tasks assigned to worker `rank`.
+    Multiple workers may share one GPU when workers_per_gpu > 1.
+    """
+    tasks = gpu_tasks[rank]
+    n_gpus = common['n_gpus']
+    gpu_id = rank % n_gpus
+
+    for task in tasks:
+        module_name = task['module_name']
+        display_idx = task['display_idx']
+        n_total = task['n_total']
+        param_name = f"{module_name}.weight"
+        tensor_path = Path(task['tensor_path'])
+        consolidated_path = Path(task['consolidated_path'])
+        save_reconstructed = common.get('save_reconstructed', False)
+
+        if consolidated_path.exists():
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: already exists, skip")
+            continue
+
+        weight = task['weight']   # CPU tensor (shared memory)
+        H = task.get('H')         # CPU tensor (shared memory) or None
+
+        if H is None:
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: no Hessian, skip")
+            continue
+
+        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
+
+        quantizer = BinaryQuadraticQuantization(weight, rank_scale=common['rank_scale'])
+        reconstructed = quantizer.bqq_large_matrix_multi_worker(
+            max_patch_size=common['group_size'],
+            bit_width=common['bit_width'],
+            consolidated_path=str(consolidated_path),
+            Nstep=common['num_steps'],
+            seed=common['seed'],
+            main_gpu_id=gpu_id,
+            H=H,
+            damping=common['damping'],
+            hessian_mode='intra-layer-ste',
+            scale_refine=common['scale_refine'],
+            use_multibqq=common['use_multibqq'],
+            compensation_mode=common['compensation_mode'],
+            ste_refine_steps=common['ste_refine_steps'],
+            ste_refine_lr=common['ste_refine_lr'],
+            ste_refine_weight_decay=common['ste_refine_weight_decay'],
+            ste_refine_binary_lr=common['ste_refine_binary_lr'],
+            ste_refine_continuous_lr=common['ste_refine_continuous_lr'],
+            ste_refine_optimize_factors=not common['refine_coeffs_only'],
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not common['fix_theta'],
+            ste_refine_optimize_beta=not common['fix_beta'],
+            ste_refine_row_group_batch_size=common['row_group_batch_size'],
+            ste_refine_log_interval=common['ste_refine_log_interval'],
+        )
+        if save_reconstructed:
+            torch.save(reconstructed.cpu(), tensor_path)
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved: {tensor_path}")
+        else:
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved patches: {consolidated_path}")
+
+
+# ---------------------------------------------------------------------------
+# Main quantization (all targets or single --target_idx)
+# ---------------------------------------------------------------------------
+
+def get_target_names(model_name: str, layer_threshold: int = 0) -> List[str]:
+    """Return ordered list of quantization target module names for the given model."""
+    model = get_vision_model(model_name)
+    names = []
+    for name, param in model.named_parameters():
+        if is_quantization_target(name) and param.ndim == 2:
+            if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
+                continue
+            names.append(name[:-len('.weight')] if name.endswith('.weight') else name)
+    del model
+    return names
+
 
 def layerwise_quantize(
     model_name: str,
@@ -104,53 +297,87 @@ def layerwise_quantize(
     main_gpu_id: int,
     scale_refine: bool,
     damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    fix_beta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
+    compensation_mode: str,
     calibration_loader,
+    save_reconstructed: bool = False,
+    layer_threshold: int = 0,
+    target_idx: Optional[int] = None,
 ):
+    """
+    Quantize target weights with intra-layer Hessian-aware BQQ.
+
+    If target_idx is given, only that single weight (0-based index into the
+    full target list) is quantized. This enables parallel array jobs.
+    """
     device = torch.device(f'cuda:{main_gpu_id}' if torch.cuda.is_available() else 'cpu')
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     consolidated_dir = save_dir / '_consolidated'
     consolidated_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model
     print(f"Loading model: {model_name}")
-    model = get_model(model_name)
+    model = get_vision_model(model_name)
 
-    # Find quantization targets
     target_params = {}
     for name, param in model.named_parameters():
         if is_quantization_target(name) and param.ndim == 2:
+            if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
+                continue
             module_name = name[:-len('.weight')] if name.endswith('.weight') else name
             target_params[module_name] = param.detach().cpu().float()
 
-    target_names = list(target_params.keys())
-    print(f"Found {len(target_names)} quantization targets")
+    all_target_names = list(target_params.keys())
+    print(f"Found {len(all_target_names)} quantization targets")
 
-    # Collect Hessians
-    print(f"Collecting Hessians ({len(target_names)} layers)...")
-    H_dict = collect_hessians(model, calibration_loader, target_names, device)
+    if target_idx is not None:
+        if target_idx >= len(all_target_names):
+            raise ValueError(
+                f"--target_idx {target_idx} is out of range "
+                f"(model has {len(all_target_names)} targets)"
+            )
+        selected_name = all_target_names[target_idx]
+        print(f"Single-target mode: [{target_idx+1}/{len(all_target_names)}] {selected_name}")
+        work_items = {selected_name: target_params[selected_name]}
+    else:
+        work_items = target_params
+
+    hessian_targets = list(work_items.keys())
+    print(f"Collecting Hessians ({len(hessian_targets)} layer(s))...")
+    H_dict = collect_hessians(model, calibration_loader, hessian_targets, device)
     print(f"  Collected {len(H_dict)} Hessians")
 
     model.cpu()
     del model
     torch.cuda.empty_cache()
 
-    # Quantize each target
-    for idx, (module_name, weight) in enumerate(target_params.items()):
+    n_total = len(all_target_names)
+    for module_name, weight in work_items.items():
+        display_idx = all_target_names.index(module_name) + 1
         param_name = f"{module_name}.weight"
         consolidated_path = consolidated_dir / f'{param_name}.pth'
         tensor_path = save_dir / f'{param_name}.pth'
 
-        if tensor_path.exists():
-            print(f"[{idx+1}/{len(target_params)}] {param_name}: already exists, skipping")
+        if consolidated_path.exists():
+            print(f"[{display_idx}/{n_total}] {param_name}: already exists, skipping")
             continue
 
         if module_name not in H_dict:
-            print(f"[{idx+1}/{len(target_params)}] {param_name}: no Hessian, skipping")
+            print(f"[{display_idx}/{n_total}] {param_name}: no Hessian, skipping")
             continue
 
         H = H_dict[module_name].cpu()
-        print(f"\n[{idx+1}/{len(target_params)}] {param_name} {tuple(weight.shape)}")
+        print(f"\n[{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
 
         quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
@@ -161,15 +388,366 @@ def layerwise_quantize(
             seed=seed,
             main_gpu_id=main_gpu_id,
             H=H,
-            hessian_mode='intra-layer',
-            scale_refine=scale_refine,
             damping=damping,
+            hessian_mode='intra-layer-ste',
+            scale_refine=scale_refine,
+            use_multibqq=use_multibqq,
+            compensation_mode=compensation_mode,
+            ste_refine_steps=ste_refine_steps,
+            ste_refine_lr=ste_refine_lr,
+            ste_refine_weight_decay=ste_refine_weight_decay,
+            ste_refine_binary_lr=ste_refine_binary_lr,
+            ste_refine_continuous_lr=ste_refine_continuous_lr,
+            ste_refine_optimize_factors=not refine_coeffs_only,
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not fix_theta,
+            ste_refine_optimize_beta=not fix_beta,
+            ste_refine_row_group_batch_size=row_group_batch_size,
+            ste_refine_log_interval=ste_refine_log_interval,
         )
 
-        torch.save(reconstructed.cpu(), tensor_path)
-        print(f"  Saved: {tensor_path}")
+        if save_reconstructed:
+            torch.save(reconstructed.cpu(), tensor_path)
+            print(f"  Saved: {tensor_path}")
+        else:
+            print(f"  Saved patches: {consolidated_path}")
 
     print(f"\nDone. Output: {save_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Block-level quantization (--block_idx): one task per transformer block,
+# all Linear layers collected in one forward pass, quantized in parallel
+# across all available GPUs via mp.spawn.
+# ---------------------------------------------------------------------------
+
+def layerwise_quantize_block(
+    model_name: str,
+    save_dir: Path,
+    block_indices: List[int],
+    *,
+    bit_width: int,
+    group_size: int,
+    num_steps: int,
+    rank_scale: float,
+    seed: int,
+    scale_refine: bool,
+    damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    fix_beta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
+    compensation_mode: str,
+    workers_per_gpu: int,
+    calibration_loader,
+    save_reconstructed: bool = False,
+):
+    """
+    Quantize all Linear layers in one or more transformer blocks `block_indices`.
+
+    Efficiency improvements vs per-target mode:
+    - Model loaded once (not N times), and only once per GPU even when several
+      consecutive blocks are assigned to the same GPU
+    - All Hessians for every assigned block collected in a single forward pass
+      (early-exit after the last assigned block)
+    - Quantization of all Linear layers across the assigned blocks distributed
+      across the available worker slots via mp.spawn
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    consolidated_dir = save_dir / '_consolidated'
+    consolidated_dir.mkdir(parents=True, exist_ok=True)
+
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+
+    print(f"Loading model: {model_name}")
+    model = get_vision_model(model_name)
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    n_blocks = get_num_blocks(model)
+    block_indices = sorted(set(block_indices))
+    for b in block_indices:
+        if b >= n_blocks:
+            raise ValueError(f"--block_idx {b} >= n_blocks {n_blocks}")
+
+    # Enumerate quantization targets across all assigned blocks
+    linear_specs = []  # (block_idx, block_prefix, linear_name)
+    for b in block_indices:
+        block = get_block(model, b)
+        block_prefix = get_block_prefix(model, b)
+        for name, module in block.named_modules():
+            if isinstance(module, nn.Linear):
+                linear_specs.append((b, block_prefix, name))
+    n_total = len(linear_specs)
+
+    workers_per_gpu = max(1, int(workers_per_gpu))
+    n_workers = n_gpus * workers_per_gpu
+    print(
+        f"Blocks {block_indices} (of {n_blocks}): {n_total} Linear targets, {n_gpus} GPU(s), "
+        f"workers_per_gpu={workers_per_gpu}, total_workers={n_workers}"
+    )
+
+    print("Collecting Hessians (single forward pass for all targets in the assigned blocks)...")
+    H_dict = collect_blocks_hessians(model, calibration_loader, block_indices, device)
+    print(f"  Collected {len(H_dict)} Hessians")
+
+    # Snapshot weights before freeing model
+    target_data = []
+    for i, (b, block_prefix, linear_name) in enumerate(linear_specs):
+        module_name = f"{block_prefix}.{linear_name}"
+        param_name = f"{module_name}.weight"
+        tensor_path = save_dir / f"{param_name}.pth"
+        consolidated_path = consolidated_dir / f"{param_name}.pth"
+
+        submodule = get_block(model, b)
+        for part in linear_name.split('.'):
+            submodule = getattr(submodule, part)
+        weight = submodule.weight.detach().cpu().float()
+        H = H_dict.get(module_name)
+
+        target_data.append({
+            'module_name': module_name,
+            'display_idx': i + 1,
+            'n_total': n_total,
+            'tensor_path': str(tensor_path),
+            'consolidated_path': str(consolidated_path),
+            'weight': weight,
+            'H': H,
+        })
+
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
+    # Filter already-done targets (the consolidated patch file is the artifact
+    # consumed downstream, so its presence marks a target as complete).
+    todo = [t for t in target_data if not Path(t['consolidated_path']).exists()]
+    if not todo:
+        print("All targets already done, skipping block.")
+        return
+
+    skipped = n_total - len(todo)
+    if skipped:
+        print(f"Skipping {skipped} already-done target(s), processing {len(todo)}")
+
+    for task in todo:
+        task['weight'].share_memory_()
+        if task['H'] is not None:
+            task['H'].share_memory_()
+
+    gpu_tasks: List[List[dict]] = [[] for _ in range(n_workers)]
+    for i, task in enumerate(todo):
+        gpu_tasks[i % n_workers].append(task)
+
+    common = dict(
+        group_size=group_size,
+        bit_width=bit_width,
+        num_steps=num_steps,
+        rank_scale=rank_scale,
+        seed=seed,
+        scale_refine=scale_refine,
+        damping=damping,
+        ste_refine_steps=ste_refine_steps,
+        ste_refine_lr=ste_refine_lr,
+        ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_binary_lr=ste_refine_binary_lr,
+        ste_refine_continuous_lr=ste_refine_continuous_lr,
+        ste_refine_log_interval=ste_refine_log_interval,
+        refine_coeffs_only=refine_coeffs_only,
+        fix_theta=fix_theta,
+        fix_beta=fix_beta,
+        row_group_batch_size=row_group_batch_size,
+        use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
+        save_reconstructed=save_reconstructed,
+        n_gpus=n_gpus,
+    )
+
+    if n_workers == 1:
+        _quantize_block_worker(0, gpu_tasks, common)
+    else:
+        mp.spawn(_quantize_block_worker, args=(gpu_tasks, common), nprocs=n_workers, join=True)
+
+    print(f"\nDone. Blocks {block_indices} output: {save_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Cached Hessian flow: cache every target's Hessian+weight once, then quantize
+# each target in its own process (shell-driven GPU parallelism, no mp.spawn).
+# ---------------------------------------------------------------------------
+
+def _hessian_cache_targets_file(cache_dir) -> Path:
+    return Path(cache_dir) / 'targets.txt'
+
+
+def _hessian_cache_entry_path(cache_dir, target_name) -> Path:
+    return Path(cache_dir) / f'{target_name}.pt'
+
+
+def _read_hessian_cache_targets(cache_dir) -> List[str]:
+    path = _hessian_cache_targets_file(cache_dir)
+    if not path.exists():
+        raise FileNotFoundError(
+            f'Hessian cache targets file not found: {path}. Run --cache_hessians first.')
+    return [line.strip() for line in path.read_text().splitlines() if line.strip()]
+
+
+def cache_all_hessians(
+    model_name: str,
+    cache_dir,
+    *,
+    calibration_loader,
+    layer_threshold: int = 0,
+    device_id: int = 0,
+    refresh: bool = False,
+):
+    """Load the model once and cache H = X^T X (and the FP weight) for every
+    quantization target in a single calibration forward pass.
+
+    Hessians accumulate on CPU so the whole set need not fit in GPU memory.
+    Writes one '<target>.pt' file per target plus an ordered 'targets.txt'.
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+
+    print(f"Loading model: {model_name}")
+    model = get_vision_model(model_name)
+
+    target_names = []
+    for name, param in model.named_parameters():
+        if is_quantization_target(name) and param.ndim == 2:
+            if layer_threshold > 0 and not passes_layer_threshold(name, layer_threshold):
+                continue
+            target_names.append(name[:-len('.weight')] if name.endswith('.weight') else name)
+
+    # Always (re)write the ordered target list so --target_idx maps consistently.
+    _hessian_cache_targets_file(cache_dir).write_text('\n'.join(target_names) + '\n')
+
+    if refresh:
+        pending = list(target_names)
+    else:
+        pending = [t for t in target_names if not _hessian_cache_entry_path(cache_dir, t).exists()]
+
+    if not pending:
+        print(f"All {len(target_names)} target Hessians already cached at {cache_dir}")
+        del model
+        return
+
+    print(f"Caching Hessians for {len(pending)}/{len(target_names)} target(s) in one forward pass...")
+    H_dict = collect_hessians(model, calibration_loader, pending, device, accumulate_device='cpu')
+    print(f"  Collected {len(H_dict)} Hessians")
+
+    param_by_name = dict(model.named_parameters())
+    saved = 0
+    for tname in pending:
+        H = H_dict.get(tname)
+        if H is None:
+            print(f"  WARNING: no Hessian collected for {tname}, skipping")
+            continue
+        weight = param_by_name[f'{tname}.weight'].detach().cpu().float()
+        torch.save(
+            {'module_name': tname, 'H': H.cpu().float(), 'weight': weight},
+            _hessian_cache_entry_path(cache_dir, tname),
+        )
+        saved += 1
+    print(f"Cached {saved} target Hessian(s)+weight(s) to {cache_dir}")
+
+    model.cpu()
+    del model
+    torch.cuda.empty_cache()
+
+
+def quantize_cached_target(
+    cache_dir,
+    target_idx: int,
+    save_dir,
+    *,
+    bit_width: int,
+    group_size: int,
+    num_steps: int,
+    rank_scale: float,
+    seed: int,
+    scale_refine: bool,
+    damping: float,
+    ste_refine_steps: int,
+    ste_refine_lr: float,
+    ste_refine_weight_decay: float,
+    ste_refine_binary_lr: Optional[float],
+    ste_refine_continuous_lr: Optional[float],
+    ste_refine_log_interval: int,
+    refine_coeffs_only: bool,
+    fix_theta: bool,
+    fix_beta: bool,
+    row_group_batch_size: Optional[int],
+    use_multibqq: bool,
+    compensation_mode: str,
+    save_reconstructed: bool = False,
+    main_gpu_id: int = 0,
+):
+    """Quantize a single target from its cached Hessian+weight (no model load)."""
+    cache_dir = Path(cache_dir)
+    save_dir = Path(save_dir)
+    targets = _read_hessian_cache_targets(cache_dir)
+    if not (0 <= target_idx < len(targets)):
+        raise ValueError(f'--target_idx {target_idx} out of range [0, {len(targets)})')
+    tname = targets[target_idx]
+
+    consolidated_dir = save_dir / '_consolidated'
+    consolidated_dir.mkdir(parents=True, exist_ok=True)
+    param_name = f'{tname}.weight'
+    consolidated_path = consolidated_dir / f'{param_name}.pth'
+    tensor_path = save_dir / f'{param_name}.pth'
+
+    if consolidated_path.exists():
+        print(f"[{target_idx}/{len(targets)}] {param_name}: already exists, skipping")
+        return
+
+    entry_path = _hessian_cache_entry_path(cache_dir, tname)
+    if not entry_path.exists():
+        raise FileNotFoundError(f'Hessian cache missing for {tname}: {entry_path}')
+    entry = torch.load(entry_path, map_location='cpu', weights_only=False)
+    weight, H = entry['weight'], entry['H']
+    print(f"[{target_idx}/{len(targets)}] {param_name} {tuple(weight.shape)} (cached Hessian)")
+
+    quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
+    reconstructed = quantizer.bqq_large_matrix_multi_worker(
+        max_patch_size=group_size,
+        bit_width=bit_width,
+        consolidated_path=str(consolidated_path),
+        Nstep=num_steps,
+        seed=seed,
+        main_gpu_id=main_gpu_id,
+        H=H,
+        damping=damping,
+        hessian_mode='intra-layer-ste',
+        scale_refine=scale_refine,
+        use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
+        ste_refine_steps=ste_refine_steps,
+        ste_refine_lr=ste_refine_lr,
+        ste_refine_weight_decay=ste_refine_weight_decay,
+        ste_refine_binary_lr=ste_refine_binary_lr,
+        ste_refine_continuous_lr=ste_refine_continuous_lr,
+        ste_refine_optimize_factors=not refine_coeffs_only,
+        ste_refine_optimize_coeffs=True,
+        ste_refine_optimize_theta=not fix_theta,
+        ste_refine_optimize_beta=not fix_beta,
+        ste_refine_row_group_batch_size=row_group_batch_size,
+        ste_refine_log_interval=ste_refine_log_interval,
+    )
+    if save_reconstructed:
+        torch.save(reconstructed.cpu(), tensor_path)
+        print(f"  Saved: {tensor_path}")
+    else:
+        print(f"  Saved patches: {consolidated_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -177,41 +755,214 @@ def layerwise_quantize(
 # ---------------------------------------------------------------------------
 
 def main():
-    SCRIPT_DIR = Path(__file__).resolve().parent
-
     parser = argparse.ArgumentParser(
         description="Layer-wise Hessian-aware BQQ quantization for vision models")
 
-    parser.add_argument('--model_name', type=str, required=True,
-                        choices=['deit-s', 'deit-b', 'vit-s', 'vit-b', 'swin-t', 'swin-s'])
+    # Model
+    parser.add_argument('--model_name', type=str, required=True, choices=MODEL_CHOICES)
+    parser.add_argument('--layer_threshold', type=int, default=0)
 
+    # BQQ params
     parser.add_argument('--bit_width', type=int, default=2)
     parser.add_argument('--group_size', type=int, default=32)
     parser.add_argument('--num_steps', type=int, default=20000)
     parser.add_argument('--rank_scale', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=0)
 
-    parser.add_argument('--scale_refine', action='store_true')
+    # Hessian
+    parser.add_argument('--scale_refine', action='store_true',
+                        help='Apply inter-bit scale refinement after intra-layer compensation')
     parser.add_argument('--damping', type=float, default=1e-6)
+    parser.add_argument('--use_multibqq', dest='use_multibqq', action='store_true', default=True,
+                        help='Jointly optimize all bits per column group (default: enabled)')
+    parser.add_argument('--no_use_multibqq', dest='use_multibqq', action='store_false',
+                        help='Disable joint multibqq optimization and quantize bits sequentially')
+    parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
+                        help='Column compensation mode for Hessian-aware BQQ')
 
-    parser.add_argument('--nsamples', type=int, default=256)
-    parser.add_argument('--data_path', type=str, default=None)
+    # STE refinement
+    parser.add_argument('--ste_refine_steps', type=int, default=0)
+    parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
+    parser.add_argument('--ste_refine_binary_lr', type=float, default=None,
+                        help='Learning rate for STE binary factors Y/Z during layerwise refinement')
+    parser.add_argument('--ste_refine_continuous_lr', type=float, default=None,
+                        help='Learning rate for continuous parameters (coeff/theta) during layerwise refinement')
+    parser.add_argument('--ste_refine_weight_decay', type=float, default=0.0)
+    parser.add_argument('--ste_refine_log_interval', type=int, default=20)
+    parser.add_argument('--refine_coeffs_only', action='store_true',
+                        help='Only refine coefficients; keep binary factors fixed')
+    parser.add_argument('--fix_theta', action='store_true',
+                        help='Keep STE threshold theta fixed at 0.5')
+    parser.add_argument('--fix_beta', action='store_true',
+                        help='Keep STE sigmoid temperature beta fixed during layerwise refinement')
+    parser.add_argument('--row_group_batch_size', type=int, default=None,
+                        help='Batch size over independent row groups during STE refinement')
+    parser.add_argument('--workers_per_gpu', type=int, default=1,
+                        help='Number of parallel block-level quantization workers to launch per GPU')
 
+    # Dataset (ImageNet calibration)
+    parser.add_argument('--nsamples', type=int, default=256, help='Number of calibration images')
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Path to ImageNet. Falls back to IMAGENET_DIR env var.')
+
+    # Device / output
     parser.add_argument('--main_gpu_id', type=int, default=0)
     parser.add_argument('--save_dir', type=str, default=None)
+    parser.add_argument('--assemble_full_model', dest='assemble_full_model', action='store_true', default=True,
+                        help='Assemble a full quantized model after layerwise quantization (default: enabled)')
+    parser.add_argument('--no_assemble_full_model', dest='assemble_full_model', action='store_false',
+                        help='Skip full-model assembly after layerwise quantization')
+    parser.add_argument('--assembled_output_dir', type=str, default=None,
+                        help='Output directory for the assembled full model')
+    parser.add_argument('--save_reconstructed', action='store_true', default=False,
+                        help='Also save the dense reconstructed weight per layer (save_dir/<param>.pth). '
+                             'Off by default; the consolidated patch files are what the assembly uses.')
+
+    # Mode: per-target parallel
+    parser.add_argument('--target_idx', type=int, default=None,
+                        help='0-based index of the single target to quantize (for parallel array jobs).')
+    parser.add_argument('--list_targets', action='store_true',
+                        help='Print the number of quantization targets and exit.')
+
+    # Mode: cached Hessian flow (cache once, then quantize per-target across GPUs via a shell)
+    parser.add_argument('--cache_hessians', action='store_true',
+                        help='Load the model once, compute every target Hessian (and weight) in a '
+                             'single forward pass, save them under --hessian_cache_dir, then exit.')
+    parser.add_argument('--hessian_cache_dir', type=str, default=None,
+                        help='Directory of cached per-target Hessians+weights. Written by '
+                             '--cache_hessians; read by --target_idx/--list_targets (no model load).')
+    parser.add_argument('--refresh_hessian_cache', action='store_true',
+                        help='Recompute and overwrite cached Hessians even if already present.')
+
+    # Mode: per-block parallel
+    parser.add_argument('--block_idx', type=str, default=None,
+                        help='0-based transformer block index, or a comma-separated list '
+                             'of indices (e.g. "0,1,2") to quantize several blocks in a '
+                             'single process with one model load.')
+    parser.add_argument('--list_blocks', action='store_true',
+                        help='Print the number of transformer blocks and exit.')
 
     args = parser.parse_args()
 
+    # --list_targets: print count and exit (no GPU needed). When a Hessian cache
+    # is given, read the cached ordering instead of loading the model.
+    if args.list_targets:
+        if args.hessian_cache_dir:
+            print(len(_read_hessian_cache_targets(args.hessian_cache_dir)))
+        else:
+            print(len(get_target_names(args.model_name, args.layer_threshold)))
+        return
+
+    # --list_blocks: print block count and exit (no GPU needed)
+    if args.list_blocks:
+        model = get_vision_model(args.model_name)
+        print(get_num_blocks(model))
+        del model
+        return
+
+    # Output dir
+    save_dir = args.save_dir
+    if save_dir is None:
+        save_dir = default_compressed_data_dir(
+            args.model_name, args.bit_width, args.group_size, args.num_steps)
+    save_dir = Path(save_dir)
+
+    # Cached per-target quantize: read the cached Hessian+weight and quantize one
+    # target. No model load and no calibration data needed. Assembly is separate.
+    if args.target_idx is not None and args.hessian_cache_dir:
+        quantize_cached_target(
+            args.hessian_cache_dir,
+            args.target_idx,
+            save_dir,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            rank_scale=args.rank_scale,
+            seed=args.seed,
+            scale_refine=args.scale_refine,
+            damping=args.damping,
+            ste_refine_steps=args.ste_refine_steps,
+            ste_refine_lr=args.ste_refine_lr,
+            ste_refine_weight_decay=args.ste_refine_weight_decay,
+            ste_refine_binary_lr=args.ste_refine_binary_lr,
+            ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+            ste_refine_log_interval=args.ste_refine_log_interval,
+            refine_coeffs_only=args.refine_coeffs_only,
+            fix_theta=args.fix_theta,
+            fix_beta=args.fix_beta,
+            row_group_batch_size=args.row_group_batch_size,
+            use_multibqq=args.use_multibqq,
+            compensation_mode=args.compensation_mode,
+            save_reconstructed=args.save_reconstructed,
+            main_gpu_id=args.main_gpu_id,
+        )
+        return
+
+    # Calibration data
     train_loader, _ = get_imagenet(
         args.model_name, num_traindatas=args.nsamples,
         data_path=args.data_path, seed=args.seed,
     )
 
-    save_dir = args.save_dir
-    if save_dir is None:
-        save_dir = SCRIPT_DIR / 'bqq_compressed_data' / \
-            f'{args.model_name}-{args.num_steps}step-{args.group_size}gs-hessian'
+    # --cache_hessians: compute & cache every target's Hessian+weight, then exit.
+    if args.cache_hessians:
+        if not args.hessian_cache_dir:
+            raise ValueError('--cache_hessians requires --hessian_cache_dir')
+        cache_all_hessians(
+            args.model_name,
+            args.hessian_cache_dir,
+            calibration_loader=train_loader,
+            layer_threshold=args.layer_threshold,
+            device_id=args.main_gpu_id,
+            refresh=args.refresh_hessian_cache,
+        )
+        return
 
+    # --block_idx: block-level mode (one model load, one Hessian pass, multi-GPU).
+    if args.block_idx is not None:
+        block_indices = sorted({int(b) for b in str(args.block_idx).split(',') if str(b).strip() != ''})
+        if not block_indices:
+            raise ValueError(f"--block_idx parsed to an empty set from {args.block_idx!r}")
+        layerwise_quantize_block(
+            model_name=args.model_name,
+            save_dir=save_dir,
+            block_indices=block_indices,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            rank_scale=args.rank_scale,
+            seed=args.seed,
+            scale_refine=args.scale_refine,
+            damping=args.damping,
+            ste_refine_steps=args.ste_refine_steps,
+            ste_refine_lr=args.ste_refine_lr,
+            ste_refine_weight_decay=args.ste_refine_weight_decay,
+            ste_refine_binary_lr=args.ste_refine_binary_lr,
+            ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+            ste_refine_log_interval=args.ste_refine_log_interval,
+            refine_coeffs_only=args.refine_coeffs_only,
+            fix_theta=args.fix_theta,
+            fix_beta=args.fix_beta,
+            row_group_batch_size=args.row_group_batch_size,
+            use_multibqq=args.use_multibqq,
+            compensation_mode=args.compensation_mode,
+            workers_per_gpu=args.workers_per_gpu,
+            calibration_loader=train_loader,
+            save_reconstructed=args.save_reconstructed,
+        )
+        if args.assemble_full_model:
+            save_bqq_model(
+                model_name=args.model_name,
+                compressed_data_dir=save_dir,
+                bit_width=args.bit_width,
+                group_size=args.group_size,
+                num_steps=args.num_steps,
+                device='cpu',
+                output_dir=args.assembled_output_dir,
+            )
+        return
+
+    # Default: per-target mode (all targets or single --target_idx)
     layerwise_quantize(
         model_name=args.model_name,
         save_dir=save_dir,
@@ -223,8 +974,34 @@ def main():
         main_gpu_id=args.main_gpu_id,
         scale_refine=args.scale_refine,
         damping=args.damping,
+        ste_refine_steps=args.ste_refine_steps,
+        ste_refine_lr=args.ste_refine_lr,
+        ste_refine_weight_decay=args.ste_refine_weight_decay,
+        ste_refine_binary_lr=args.ste_refine_binary_lr,
+        ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+        ste_refine_log_interval=args.ste_refine_log_interval,
+        refine_coeffs_only=args.refine_coeffs_only,
+        fix_theta=args.fix_theta,
+        fix_beta=args.fix_beta,
+        row_group_batch_size=args.row_group_batch_size,
+        use_multibqq=args.use_multibqq,
+        compensation_mode=args.compensation_mode,
         calibration_loader=train_loader,
+        save_reconstructed=args.save_reconstructed,
+        layer_threshold=args.layer_threshold,
+        target_idx=args.target_idx,
     )
+
+    if args.assemble_full_model:
+        save_bqq_model(
+            model_name=args.model_name,
+            compressed_data_dir=save_dir,
+            bit_width=args.bit_width,
+            group_size=args.group_size,
+            num_steps=args.num_steps,
+            device='cpu',
+            output_dir=args.assembled_output_dir,
+        )
 
 
 if __name__ == '__main__':

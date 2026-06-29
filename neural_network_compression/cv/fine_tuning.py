@@ -32,11 +32,16 @@ import torch.optim as optim
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-
-from build_dataset import get_imagenet
-from build_model import get_model
-from utils import test_model_accuracy
+try:
+    from .src.datautils import get_imagenet
+    from .src.model_loader import get_vision_model as get_model
+    from .src.evaluation import test_model_accuracy
+except ImportError:
+    from neural_network_compression.cv.src.datautils import get_imagenet
+    from neural_network_compression.cv.src.model_loader import get_vision_model as get_model
+    from neural_network_compression.cv.src.evaluation import test_model_accuracy
 
 
 def fine_tuning(args):

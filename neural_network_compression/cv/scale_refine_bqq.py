@@ -27,8 +27,12 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'bqqkernel'))
 from neural_network_compression.bqqkernel.bqq_modules import BinaryQuadratic
 
-from build_model import get_model
-from build_dataset import get_imagenet
+try:
+    from .src.model_loader import get_vision_model as get_model
+    from .src.datautils import get_imagenet
+except ImportError:
+    from neural_network_compression.cv.src.model_loader import get_vision_model as get_model
+    from neural_network_compression.cv.src.datautils import get_imagenet
 
 
 # ---------------------------------------------------------------------------

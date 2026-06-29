@@ -7,9 +7,9 @@ The current LM path has three recommended accuracy/speed tiers: layerwise quanti
 
 Choose the entry point by the speed/accuracy tradeoff you want:
 
-- Fast / mild accuracy: `run_layerwise_quant.sh`
-- Medium speed / medium accuracy: `run_blockwise_quant.sh`
-- Slow / high accuracy: `run_fine_tuning.sh` after a quantized model has been built
+- Fast / mild accuracy: `run_lm_layerwise_quant.sh`
+- Medium speed / medium accuracy: `run_lm_blockwise_quant.sh`
+- Slow / high accuracy: `run_lm_fine_tuning.sh` after a quantized model has been built
 
 Minimal examples:
 
@@ -17,35 +17,35 @@ Minimal examples:
 cd neural_network_compression
 
 # Fast: independent layerwise Hessian-aware quantization.
-./run_layerwise_quant.sh
+./run_lm_layerwise_quant.sh
 
 # Medium: blockwise quantization/tuning.
-./run_blockwise_quant.sh
+./run_lm_blockwise_quant.sh
 
 # Slow: fine-tune an assembled quantized model.
-./run_fine_tuning.sh
+./run_lm_fine_tuning.sh
 ```
 
-`run_layerwise_quant.sh` assigns one transformer block to each GPU job, collects all Hessians for that block once, then quantizes the block's Linear layers in parallel with `LAYERS_PER_GPU`.
+`run_lm_layerwise_quant.sh` assigns one transformer block to each GPU job, collects all Hessians for that block once, then quantizes the block's Linear layers in parallel with `LAYERS_PER_GPU`.
 
-`run_blockwise_quant.sh` assigns transformer blocks to GPU jobs and performs blockwise quantization/tuning. The current default is `PROGRESSIVE=1` with `PROGRESSIVE_MODE=layer-tune`; set `PROGRESSIVE=0` to use the older layerwise-first then block-tuning flow.
+`run_lm_blockwise_quant.sh` assigns transformer blocks to GPU jobs and performs blockwise quantization/tuning. The current default is `PROGRESSIVE=1` with `PROGRESSIVE_MODE=layer-tune`; set `PROGRESSIVE=0` to use the older layerwise-first then block-tuning flow.
 
-`run_fine_tuning.sh` starts from an assembled quantized model and performs STE fine-tuning.
+`run_lm_fine_tuning.sh` starts from an assembled quantized model and performs STE fine-tuning.
 
 Useful overrides:
 
 ```bash
-MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_layerwise_quant.sh
-MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_blockwise_quant.sh
-MODEL_NAME=Qwen/Qwen3.5-2B MODEL_PATH=/path/to/quantized.pth ./run_fine_tuning.sh
+MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_lm_layerwise_quant.sh
+MODEL_NAME=Qwen/Qwen3.5-2B BIT_WIDTH=2 GROUP_SIZE=64 ./run_lm_blockwise_quant.sh
+MODEL_NAME=Qwen/Qwen3.5-2B MODEL_PATH=/path/to/quantized.pth ./run_lm_fine_tuning.sh
 
 # Select GPUs and parallelism.
-GPU_IDS=0,1,2,3 LAYERS_PER_GPU=4 ./run_layerwise_quant.sh
-GPU_IDS=0,1,2,3 BLOCKS_PER_GPU=1 ./run_blockwise_quant.sh
+GPU_IDS=0,1,2,3 LAYERS_PER_GPU=4 ./run_lm_layerwise_quant.sh
+GPU_IDS=0,1,2,3 BLOCKS_PER_GPU=1 ./run_lm_blockwise_quant.sh
 
 # Process one block manually.
-BLOCK_IDX=0 ./run_layerwise_quant.sh
-BLOCK_IDX=0 ./run_blockwise_quant.sh
+BLOCK_IDX=0 ./run_lm_layerwise_quant.sh
+BLOCK_IDX=0 ./run_lm_blockwise_quant.sh
 ```
 
 Notes:
@@ -84,9 +84,9 @@ neural_network_compression/
 
 Use one of these wrapper scripts first:
 
-1. `run_layerwise_quant.sh` for the fastest layerwise-only quantized model
-2. `run_blockwise_quant.sh` for blockwise quantization/tuning
-3. `run_fine_tuning.sh` to improve an already assembled quantized model
+1. `run_lm_layerwise_quant.sh` for the fastest layerwise-only quantized model
+2. `run_lm_blockwise_quant.sh` for blockwise quantization/tuning
+3. `run_lm_fine_tuning.sh` to improve an already assembled quantized model
 
 ### Wrapper Configuration
 
@@ -104,7 +104,7 @@ Common environment variables:
 - `COMPENSATION_MODE`: `ldlq`, `gptq`, or `none`; default is `ldlq`
 - `NO_SCALE_REFINE`: `1` disables scale refinement, `0` enables it when the wrapper supports it
 
-`run_layerwise_quant.sh` variables:
+`run_lm_layerwise_quant.sh` variables:
 
 - `BLOCK_IDX`: `all` or a single transformer block index
 - `LAYERS_PER_GPU`: number of layer quantization workers inside each block job
@@ -118,7 +118,7 @@ Common environment variables:
 - `LAYERWISE_DIR`: output directory for per-layer BQQ tensors
 - `ASSEMBLED_OUTPUT_DIR`: output directory for the assembled model
 
-`run_blockwise_quant.sh` variables:
+`run_lm_blockwise_quant.sh` variables:
 
 - `BLOCK_IDX`: `all` or a single transformer block index
 - `BLOCKS_PER_GPU`: number of block jobs per GPU
@@ -136,7 +136,7 @@ Common environment variables:
 - `NO_IO_CACHE`: `1` avoids writing block I/O caches to disk
 - `BLOCKWISE_SAVE_DIR`: output directory for `block_<idx>.pth`
 
-`run_fine_tuning.sh` variables:
+`run_lm_fine_tuning.sh` variables:
 
 - `MODEL_PATH`: assembled quantized model path
 - `FINETUNE_EPOCHS`: number of fine-tuning epochs
@@ -157,14 +157,14 @@ BIT_WIDTH=2 \
 GROUP_SIZE=64 \
 LAYERWISE_ANNEAL_STEPS=50000 \
 LAYERS_PER_GPU=4 \
-./run_layerwise_quant.sh
+./run_lm_layerwise_quant.sh
 
 MODEL_NAME=Qwen/Qwen3.5-2B \
 BIT_WIDTH=2 \
 GROUP_SIZE=64 \
 BLOCKWISE_EPOCHS=1 \
 PROGRESSIVE=1 \
-./run_blockwise_quant.sh
+./run_lm_blockwise_quant.sh
 ```
 
 ### Separate learning rates for binary and continuous parameters
@@ -202,7 +202,7 @@ BLOCKWISE_OPTIMIZER=sgd \
 BLOCKWISE_MOMENTUM=0.9 \
 BLOCKWISE_BINARY_LR=3e-4 \
 BLOCKWISE_CONTINUOUS_LR=1e-3 \
-./run_blockwise_quant.sh
+./run_lm_blockwise_quant.sh
 ```
 
 ### Layerwise quantization
@@ -321,12 +321,12 @@ Useful arguments:
 
 ### Fine-tuning
 
-Standard fine-tuning is wrapped by `run_fine_tuning.sh`.
+Standard fine-tuning is wrapped by `run_lm_fine_tuning.sh`.
 
 ```bash
 cd neural_network_compression
 
-./run_fine_tuning.sh
+./run_lm_fine_tuning.sh
 ```
 
 Direct use:
