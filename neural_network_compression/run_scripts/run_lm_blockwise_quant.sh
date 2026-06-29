@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LM_DIR="${SCRIPT_DIR}/lm"
+LM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/lm"
 
 MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-3.1-8B-Instruct}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)

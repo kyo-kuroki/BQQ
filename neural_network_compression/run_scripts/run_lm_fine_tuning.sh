@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LM_DIR="${SCRIPT_DIR}/lm"
+LM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/lm"
 
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-2B}"
 BIT_WIDTH="${BIT_WIDTH:-2}"

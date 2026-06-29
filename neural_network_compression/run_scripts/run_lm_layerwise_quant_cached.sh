@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cache-first layerwise quantization for vision models.
+# Cache-first layerwise quantization.
 #   Phase 1: load the model ONCE and cache every target's Hessian (+ FP weight)
-#            into a cache directory (single calibration forward pass).
+#            into a cache directory (single forward pass).
 #   Phase 2: quantize each target in its own process, distributed across GPUs by
 #            this script (one process per target, several per GPU) -- no mp.spawn.
 #            Each process only reads its cached Hessian, so no model/data reload.
 #   Phase 3: assemble the full quantized model from the consolidated patches.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CV_DIR="${SCRIPT_DIR}/cv"
+LM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/lm"
 
-MODEL_NAME="${MODEL_NAME:-deit-s}" # Options: deit-s, deit-b, vit-s, vit-b, swin-t, swin-s
+MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-2-7b-hf}" # Example: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 LAYER_THRESHOLD="${LAYER_THRESHOLD:-0}"
 TARGETS_PER_GPU="${TARGETS_PER_GPU:-4}" # Concurrent single-target quantize processes per GPU.
 BIT_WIDTH="${BIT_WIDTH:-2}"
-GROUP_SIZE="${GROUP_SIZE:-32}"
+GROUP_SIZE="${GROUP_SIZE:-128}"
 
-LAYERWISE_ANNEAL_STEPS="${LAYERWISE_ANNEAL_STEPS:-20000}"
+LAYERWISE_ANNEAL_STEPS="${LAYERWISE_ANNEAL_STEPS:-50000}"
 LAYERWISE_STE_STEPS="${LAYERWISE_STE_STEPS:-0}"
 LAYERWISE_STE_LR="${LAYERWISE_STE_LR:-1e-3}"
 LAYERWISE_STE_WEIGHT_DECAY="${LAYERWISE_STE_WEIGHT_DECAY:-0.0}"
@@ -30,29 +30,26 @@ LAYERWISE_FIX_THETA="${LAYERWISE_FIX_THETA:-0}"
 LAYERWISE_FIX_BETA="${LAYERWISE_FIX_BETA:-0}"
 LAYERWISE_SAVE_RECONSTRUCTED="${LAYERWISE_SAVE_RECONSTRUCTED:-0}" # 1 = also save the dense reconstructed weight per layer (debug).
 
-NSAMPLES="${NSAMPLES:-256}" # Number of ImageNet calibration images.
-DATA_PATH="${DATA_PATH:-}"  # Path to ImageNet. Empty => fall back to IMAGENET_DIR env var.
+DATASET="${DATASET:-slimpajama}"
+NSAMPLES="${NSAMPLES:-1024}"
+SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-0}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-0}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
 REFRESH_HESSIAN_CACHE="${REFRESH_HESSIAN_CACHE:-0}" # 1 = recompute Hessians even if cached.
 
-LAYERWISE_DIR="${LAYERWISE_DIR:-${CV_DIR}/src/bqq_compressed_data/${MODEL_NAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
-ASSEMBLED_OUTPUT_DIR="${ASSEMBLED_OUTPUT_DIR:-${CV_DIR}/src/quantized_models/${MODEL_NAME}}"
-HESSIAN_CACHE_DIR="${HESSIAN_CACHE_DIR:-${CV_DIR}/src/hessian_cache/${MODEL_NAME}/${NSAMPLES}samples_thr${LAYER_THRESHOLD}}"
-
-data_args=(--nsamples "${NSAMPLES}")
-if [[ -n "${DATA_PATH}" ]]; then
-  data_args+=(--data_path "${DATA_PATH}")
-fi
+MODEL_BASENAME="${MODEL_NAME##*/}"
+LAYERWISE_DIR="${LAYERWISE_DIR:-${LM_DIR}/src/bqq_compressed_data/${MODEL_BASENAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
+ASSEMBLED_OUTPUT_DIR="${ASSEMBLED_OUTPUT_DIR:-${LM_DIR}/src/quantized_models/${MODEL_BASENAME}}"
+HESSIAN_CACHE_DIR="${HESSIAN_CACHE_DIR:-${LM_DIR}/src/hessian_cache/${MODEL_BASENAME}/${DATASET}_${SEQLEN}seqlen_${NSAMPLES}samples_thr${LAYER_THRESHOLD}}"
 
 # Build the per-target quantize command (shared by all parallel jobs).
 run_one_target() {
   local target_idx="$1"
 
   local cmd=(
-    python "${CV_DIR}/layerwise_quant.py"
+    python "${LM_DIR}/layerwise_quant.py"
     --model_name "${MODEL_NAME}"
     --target_idx "${target_idx}"
     --hessian_cache_dir "${HESSIAN_CACHE_DIR}"
@@ -120,7 +117,7 @@ cleanup_jobs() {
 }
 
 assemble_model() {
-  python "${CV_DIR}/src/build_bqq_model.py" build \
+  python "${LM_DIR}/src/build_bqq_model.py" build \
     --model_name "${MODEL_NAME}" \
     --bit_widths "${BIT_WIDTH}" \
     --group_size "${GROUP_SIZE}" \
@@ -142,12 +139,14 @@ fi
 # ---------------------------------------------------------------------------
 echo "[phase 1] caching Hessians -> ${HESSIAN_CACHE_DIR} (one model load on GPU ${gpu_ids[0]})"
 cache_cmd=(
-  python "${CV_DIR}/layerwise_quant.py"
+  python "${LM_DIR}/layerwise_quant.py"
   --model_name "${MODEL_NAME}"
   --cache_hessians
   --hessian_cache_dir "${HESSIAN_CACHE_DIR}"
   --layer_threshold "${LAYER_THRESHOLD}"
-  "${data_args[@]}"
+  --dataset "${DATASET}"
+  --nsamples "${NSAMPLES}"
+  --seqlen "${SEQLEN}"
   --seed "${SEED}"
   --main_gpu_id 0
 )
@@ -159,10 +158,12 @@ CUDA_VISIBLE_DEVICES="${gpu_ids[0]}" "${cache_cmd[@]}"
 # ---------------------------------------------------------------------------
 # Phase 2: quantize each target in its own process, spread across GPUs.
 # ---------------------------------------------------------------------------
-NUM_TARGETS="$(python "${CV_DIR}/layerwise_quant.py" --model_name "${MODEL_NAME}" --list_targets --hessian_cache_dir "${HESSIAN_CACHE_DIR}")"
+NUM_TARGETS="$(python "${LM_DIR}/layerwise_quant.py" --model_name "${MODEL_NAME}" --list_targets --hessian_cache_dir "${HESSIAN_CACHE_DIR}")"
 total_slots=$(( num_gpus * TARGETS_PER_GPU ))
 echo "[phase 2] quantizing ${NUM_TARGETS} targets over ${num_gpus} GPU(s) x ${TARGETS_PER_GPU} job(s)/GPU = ${total_slots} concurrent job(s): ${gpu_ids[*]}"
 
+# Track how many jobs run on each GPU and which GPU each PID uses, so a GPU never
+# exceeds TARGETS_PER_GPU concurrent jobs.
 declare -A gpu_active
 declare -A pid_gpu
 for g in "${gpu_ids[@]}"; do
@@ -181,6 +182,7 @@ pick_gpu() {
 }
 
 reap_one() {
+  # Wait for any one job to finish and free its GPU slot. Fail fast on error.
   local finished_pid="" status=0
   wait -n -p finished_pid || status=$?
   if [[ -n "${finished_pid}" && -n "${pid_gpu[${finished_pid}]:-}" ]]; then

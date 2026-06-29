@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CV_DIR="${SCRIPT_DIR}/cv"
+CV_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/cv"
 
 MODEL_NAME="${MODEL_NAME:-deit-s}" # Options: deit-s, deit-b, vit-s, vit-b, swin-t, swin-s
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all", or a specific transformer block index.
