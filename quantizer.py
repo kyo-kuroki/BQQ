@@ -1955,7 +1955,8 @@ class BinaryQuadraticQuantization():
             if S is None:
                 print('  WARNING: Cholesky failed, skipping scale refine')
             else:
-                S = S.cpu()
+                # Keep the least-squares solve on the compute device (GPU).
+                S = S.to(device=compute_device, dtype=dtype)
                 S_j_list = [S[c0:c1, :] for c0, c1 in w_ranges]
                 col_sum_S_list = [sj.sum(dim=0, keepdim=True) for sj in S_j_list]
 
@@ -1972,16 +1973,17 @@ class BinaryQuadraticQuantization():
 
                 for i, (r0, r1) in enumerate(h_ranges):
                     ph = r1 - r0
-                    R_S = x_tensor[r0:r1, :].to(dtype=dtype, device='cpu') @ S
+                    R_S = x_tensor[r0:r1, :].to(dtype=dtype) @ S
                     if ph not in ones_col_ph:
-                        ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype)
+                        ones_col_ph[ph] = torch.ones(ph, 1, dtype=dtype, device=compute_device)
                     ones_col = ones_col_ph[ph]
 
                     G_cols = []
                     for j in range(num_col_groups):
                         for b_idx in range(bit_width):
                             Y_b, Z_b = binary_by_patch[(i, j)][b_idx]
-                            Y_b, Z_b = Y_b.to(dtype=dtype), Z_b.to(dtype=dtype)
+                            Y_b = Y_b.to(device=compute_device, dtype=dtype)
+                            Z_b = Z_b.to(device=compute_device, dtype=dtype)
                             G_cols.extend([
                                 ((Y_b @ Z_b) @ S_j_list[j]).reshape(-1),
                                 (Y_b.sum(-1, keepdim=True) @ col_sum_S_list[j]).reshape(-1),
@@ -1996,7 +1998,7 @@ class BinaryQuadraticQuantization():
                 PtP_batch = torch.stack(PtP_list)
                 Ptr_batch = torch.stack(Ptr_list)
                 mean_diag = PtP_batch.diagonal(dim1=-2, dim2=-1).mean(dim=-1, keepdim=True).unsqueeze(-1)
-                eye = torch.eye(n_params, dtype=dtype).unsqueeze(0)
+                eye = torch.eye(n_params, dtype=dtype, device=compute_device).unsqueeze(0)
 
                 theta_batch = None
                 for reg in [1e-6, 1e-4, 1e-2, 1e-1]:
@@ -2009,9 +2011,11 @@ class BinaryQuadraticQuantization():
                         continue
 
                 if theta_batch is not None:
-                    Wq = torch.zeros(original_h, original_w, dtype=dtype)
+                    Wq = torch.zeros(original_h, original_w, dtype=dtype, device=compute_device)
                     for i, (r0, r1) in enumerate(h_ranges):
-                        theta = theta_batch[i]
+                        # Pull this row-group's solved params to CPU once so the
+                        # per-coefficient .item() reads don't each trigger a sync.
+                        theta = theta_batch[i].cpu()
                         p2 = 0
                         for j, (c0, c1) in enumerate(w_ranges):
                             patch_entries = entries_by_patch[(i, j)]
@@ -2019,10 +2023,12 @@ class BinaryQuadraticQuantization():
                                 a_v, b_v, c_v = theta[p2].item(), theta[p2+1].item(), theta[p2+2].item()
                                 p2 += 3
                                 Y_b, Z_b = binary_by_patch[(i, j)][b_idx]
+                                Y_b = Y_b.to(device=compute_device, dtype=dtype)
+                                Z_b = Z_b.to(device=compute_device, dtype=dtype)
                                 patch_entries[b_idx]['coeff'] = torch.tensor([a_v, b_v, c_v, 0.0], dtype=dtype)
-                                Wq[r0:r1, c0:c1] += (a_v * Y_b.float() @ Z_b.float()
-                                    + b_v * Y_b.float().sum(1, keepdim=True)
-                                    + c_v * Z_b.float().sum(0, keepdim=True))
+                                Wq[r0:r1, c0:c1] += (a_v * Y_b @ Z_b
+                                    + b_v * Y_b.sum(1, keepdim=True)
+                                    + c_v * Z_b.sum(0, keepdim=True))
                             d_v = theta[p2].item(); p2 += 1
                             patch_entries[0]['coeff'][3] = d_v
                             Wq[r0:r1, c0:c1] += d_v
@@ -2037,10 +2043,12 @@ class BinaryQuadraticQuantization():
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
 
         self.x = copy.copy(x_copy)
-        # Return on the compute device; callers that need a CPU tensor (saving,
-        # CPU-side error metrics) move it themselves, so we avoid a forced
-        # GPU->CPU sync on the hot path.
-        return Wq
+        # Return a CPU tensor with a deterministic device. With scale_refine
+        # (the default) Wq is already rebuilt on CPU above, so .cpu() is a no-op
+        # there; without it Wq lives on the GPU. Normalizing to CPU keeps the
+        # return device consistent for every caller (saving, CPU-side metrics)
+        # and avoids "expected all tensors on the same device" downstream.
+        return Wq.cpu()
 
 
 class BinaryMatrixFactorization():
