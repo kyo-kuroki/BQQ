@@ -269,8 +269,9 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
         param_name = f"{module_name}.weight"
         tensor_path = Path(task['tensor_path'])
         consolidated_path = Path(task['consolidated_path'])
+        save_reconstructed = common.get('save_reconstructed', False)
 
-        if tensor_path.exists():
+        if consolidated_path.exists():
             print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: already exists, skip")
             continue
 
@@ -309,8 +310,11 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ste_refine_row_group_batch_size=common['row_group_batch_size'],
             ste_refine_log_interval=common['ste_refine_log_interval'],
         )
-        torch.save(reconstructed.cpu(), tensor_path)
-        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved: {tensor_path}")
+        if save_reconstructed:
+            torch.save(reconstructed.cpu(), tensor_path)
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved: {tensor_path}")
+        else:
+            print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved patches: {consolidated_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +359,7 @@ def layerwise_quantize(
     use_multibqq: bool,
     compensation_mode: str,
     calibration_loader,
+    save_reconstructed: bool = False,
     layer_threshold: int = 0,
     target_idx: Optional[int] = None,
 ):
@@ -418,7 +423,7 @@ def layerwise_quantize(
         consolidated_path = consolidated_dir / f'{param_name}.pth'
         tensor_path = save_dir / f'{param_name}.pth'
 
-        if tensor_path.exists():
+        if consolidated_path.exists():
             print(f"[{display_idx}/{n_total}] {param_name}: already exists, skipping")
             continue
 
@@ -456,8 +461,11 @@ def layerwise_quantize(
             ste_refine_log_interval=ste_refine_log_interval,
         )
 
-        torch.save(reconstructed.cpu(), tensor_path)
-        print(f"  Saved: {tensor_path}")
+        if save_reconstructed:
+            torch.save(reconstructed.cpu(), tensor_path)
+            print(f"  Saved: {tensor_path}")
+        else:
+            print(f"  Saved patches: {consolidated_path}")
 
     print(f"\nDone. Output: {save_dir}")
 
@@ -494,6 +502,7 @@ def layerwise_quantize_block(
     compensation_mode: str,
     workers_per_gpu: int,
     calibration_loader,
+    save_reconstructed: bool = False,
 ):
     """
     Quantize all Linear layers in one or more transformer blocks `block_indices`.
@@ -575,8 +584,9 @@ def layerwise_quantize_block(
     del model
     torch.cuda.empty_cache()
 
-    # Filter already-done targets
-    todo = [t for t in target_data if not Path(t['tensor_path']).exists()]
+    # Filter already-done targets (the consolidated patch file is the artifact
+    # consumed downstream, so its presence marks a target as complete).
+    todo = [t for t in target_data if not Path(t['consolidated_path']).exists()]
     if not todo:
         print("All targets already done, skipping block.")
         return
@@ -616,6 +626,7 @@ def layerwise_quantize_block(
         row_group_batch_size=row_group_batch_size,
         use_multibqq=use_multibqq,
         compensation_mode=compensation_mode,
+        save_reconstructed=save_reconstructed,
         n_gpus=n_gpus,
     )
 
@@ -692,6 +703,10 @@ def main():
                         help='Skip full-model assembly after layerwise quantization')
     parser.add_argument('--assembled_output_dir', type=str, default=None,
                         help='Output directory for the assembled full model')
+    parser.add_argument('--save_reconstructed', action='store_true', default=False,
+                        help='Also save the dense reconstructed weight per layer (save_dir/<param>.pth). '
+                             'Off by default; the consolidated patch files are what the assembly uses. '
+                             'Mainly useful for debugging/inspection.')
 
     # Mode: per-target parallel (original)
     parser.add_argument('--target_idx', type=int, default=None,
@@ -773,6 +788,7 @@ def main():
             compensation_mode=args.compensation_mode,
             workers_per_gpu=args.workers_per_gpu,
             calibration_loader=train_loader,
+            save_reconstructed=args.save_reconstructed,
         )
         if args.assemble_full_model:
             save_bqq_model(
@@ -811,6 +827,7 @@ def main():
         use_multibqq=args.use_multibqq,
         compensation_mode=args.compensation_mode,
         calibration_loader=train_loader,
+        save_reconstructed=args.save_reconstructed,
         layer_threshold=args.layer_threshold,
         target_idx=args.target_idx,
     )

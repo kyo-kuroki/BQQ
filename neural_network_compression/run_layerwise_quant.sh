@@ -6,10 +6,10 @@ LM_DIR="${SCRIPT_DIR}/lm"
 
 MODEL_NAME="${MODEL_NAME:-meta-llama/Llama-2-7b-hf}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all", or a specific transformer block index.
-LAYERS_PER_GPU="${LAYERS_PER_GPU:-8}" # Parallel layer quantization workers inside each block job.
-NUM_BLOCKS_PER_GPU="${NUM_BLOCKS_PER_GPU:-1}" # Consecutive blocks handled by one process on one GPU (model loaded once per GPU).
-BIT_WIDTH="${BIT_WIDTH:-1}"
-GROUP_SIZE="${GROUP_SIZE:-64}"
+LAYERS_PER_GPU="${LAYERS_PER_GPU:-16}" # Parallel layer quantization workers inside each block job.
+NUM_BLOCKS_PER_GPU="${NUM_BLOCKS_PER_GPU:-4}" # Consecutive blocks handled by one process on one GPU (model loaded once per GPU).
+BIT_WIDTH="${BIT_WIDTH:-2}"
+GROUP_SIZE="${GROUP_SIZE:-128}"
 
 LAYERWISE_ANNEAL_STEPS="${LAYERWISE_ANNEAL_STEPS:-50000}"
 LAYERWISE_STE_STEPS="${LAYERWISE_STE_STEPS:-0}"
@@ -21,12 +21,13 @@ LAYERWISE_STE_LOG_INTERVAL="${LAYERWISE_STE_LOG_INTERVAL:-20}"
 LAYERWISE_ROW_GROUP_BATCH_SIZE="${LAYERWISE_ROW_GROUP_BATCH_SIZE:-}"
 LAYERWISE_FIX_THETA="${LAYERWISE_FIX_THETA:-0}"
 LAYERWISE_FIX_BETA="${LAYERWISE_FIX_BETA:-0}"
+LAYERWISE_SAVE_RECONSTRUCTED="${LAYERWISE_SAVE_RECONSTRUCTED:-0}" # 1 = also save the dense reconstructed weight per layer (debug). Patches are saved regardless.
 
 DATASET="${DATASET:-slimpajama}"
 NSAMPLES="${NSAMPLES:-1024}"
 SEQLEN="${SEQLEN:-2048}"
 SEED="${SEED:-0}"
-USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
+USE_MULTIBQQ="${USE_MULTIBQQ:-0}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-0}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
 
@@ -81,6 +82,9 @@ run_one_block() {
   fi
   if [[ "${LAYERWISE_FIX_BETA}" == "1" ]]; then
     layerwise_cmd+=(--fix_beta)
+  fi
+  if [[ "${LAYERWISE_SAVE_RECONSTRUCTED}" == "1" ]]; then
+    layerwise_cmd+=(--save_reconstructed)
   fi
   if [[ -n "${LAYERWISE_ROW_GROUP_BATCH_SIZE}" ]]; then
     layerwise_cmd+=(--row_group_batch_size "${LAYERWISE_ROW_GROUP_BATCH_SIZE}")

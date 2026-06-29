@@ -2037,7 +2037,10 @@ class BinaryQuadraticQuantization():
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
 
         self.x = copy.copy(x_copy)
-        return Wq.cpu()
+        # Return on the compute device; callers that need a CPU tensor (saving,
+        # CPU-side error metrics) move it themselves, so we avoid a forced
+        # GPU->CPU sync on the hot path.
+        return Wq
 
 
 class BinaryMatrixFactorization():
