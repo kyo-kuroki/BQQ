@@ -36,14 +36,15 @@ def build_synthetic_problem(seed=0, in_features=384, out_features=384, samples=1
     return W, X, 'synthetic'
 
 
-def build_deit_problem(seed=0, batch_size=8, image_size=224, module_name='blocks.0.attn.proj'):
+def build_deit_problem(seed=0, batch_size=8, image_size=224, module_name='blocks.0.attn.proj',
+                       pretrained=True, timm_model='deit_small_patch16_224'):
     try:
         import timm
     except ImportError:
         return None
 
     torch.manual_seed(seed)
-    model = timm.create_model('deit_small_patch16_224', pretrained=False)
+    model = timm.create_model(timm_model, pretrained=pretrained)
     model.eval()
 
     modules = dict(model.named_modules())
@@ -93,7 +94,87 @@ def build_deit_problem(seed=0, batch_size=8, image_size=224, module_name='blocks
         return None
 
     W = target_module.weight.detach().cpu().float()
-    return W, x_mat, f'deit_small_patch16_224:{target_name}'
+    return W, x_mat, f'{timm_model}:{target_name}'
+
+
+def build_llama_problem(seed=0, module_name='model.layers.0.self_attn.q_proj',
+                        model_name='meta-llama/Llama-2-7b-hf', nsamples=16, seqlen=512,
+                        device_id=0, dataset='wikitext2', max_tokens=8192):
+    """Load a (pretrained) causal LM, hook a target Linear, capture its input
+    activations on a small calibration set, and return (W, X[in, tokens], source)."""
+    try:
+        from neural_network_compression.lm.src.model_loader import load_causal_lm
+    except Exception as exc:
+        print(f'[llama] could not import LM loader: {exc}')
+        return None
+
+    torch.manual_seed(seed)
+    model = load_causal_lm(model_name)
+    model.eval()
+    dev = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+    model.to(dev)
+
+    modules = dict(model.named_modules())
+    target = modules.get(module_name)
+    if not isinstance(target, nn.Linear):
+        for name, mod in modules.items():
+            if isinstance(mod, nn.Linear) and 'q_proj' in name:
+                module_name, target = name, mod
+                break
+    if not isinstance(target, nn.Linear):
+        print(f'[llama] no Linear target found (tried {module_name})')
+        return None
+
+    captured = []
+    tok_count = [0]
+
+    def hook(_module, inputs, _output):
+        x = inputs[0].detach()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        captured.append(x.float().cpu())
+        tok_count[0] += x.shape[0]
+
+    handle = target.register_forward_hook(hook)
+
+    ids_list = None
+    try:
+        from transformers import AutoTokenizer
+        from neural_network_compression.lm.src.datautils import get_loaders
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        loader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, seqlen=seqlen,
+                                model=model_name, tokenizer=tokenizer)
+        ids_list = [(b[0] if isinstance(b, (list, tuple)) else b) for b in loader]
+    except Exception as exc:
+        print(f'[llama] dataset load failed ({exc}); using random token ids')
+
+    with torch.no_grad():
+        if ids_list:
+            for ids in ids_list:
+                model(ids.to(dev))
+                if tok_count[0] >= max_tokens:
+                    break
+        else:
+            vocab = model.config.vocab_size
+            g = torch.Generator().manual_seed(seed)
+            for _ in range(nsamples):
+                ids = torch.randint(0, vocab, (1, seqlen), generator=g)
+                model(ids.to(dev))
+                if tok_count[0] >= max_tokens:
+                    break
+
+    handle.remove()
+    X = torch.cat(captured, 0)  # [tokens, in]
+    if X.shape[0] > max_tokens:
+        idx = torch.randperm(X.shape[0], generator=torch.Generator().manual_seed(seed))[:max_tokens]
+        X = X[idx]
+    W = target.weight.detach().cpu().float()
+    x_mat = X.T.contiguous()  # [in, tokens]
+
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return W, x_mat, f'{model_name}:{module_name}'
 
 
 def build_problem(
@@ -105,25 +186,49 @@ def build_problem(
     synthetic_in_features=384,
     synthetic_out_features=384,
     synthetic_samples=1024,
+    model_family='deit',
+    timm_model='deit_small_patch16_224',
+    llama_model_name='meta-llama/Llama-2-7b-hf',
+    llama_nsamples=16,
+    llama_seqlen=512,
+    llama_dataset='wikitext2',
+    device_id=0,
 ):
-    if not force_synthetic:
-        deit_problem = build_deit_problem(
-            seed=seed,
-            batch_size=batch_size,
-            image_size=image_size,
-            module_name=module_name,
+    if force_synthetic or model_family == 'synthetic':
+        return build_synthetic_problem(
+            seed=seed, in_features=synthetic_in_features,
+            out_features=synthetic_out_features, samples=synthetic_samples,
         )
-        if deit_problem is not None:
-            return deit_problem
+
+    if model_family == 'llama':
+        llama_problem = build_llama_problem(
+            seed=seed, module_name=module_name, model_name=llama_model_name,
+            nsamples=llama_nsamples, seqlen=llama_seqlen, device_id=device_id,
+            dataset=llama_dataset,
+        )
+        if llama_problem is not None:
+            return llama_problem
+        print('[build_problem] llama unavailable; falling back to synthetic')
+        return build_synthetic_problem(
+            seed=seed, in_features=synthetic_in_features,
+            out_features=synthetic_out_features, samples=synthetic_samples,
+        )
+
+    # default: deit (pretrained)
+    deit_problem = build_deit_problem(
+        seed=seed, batch_size=batch_size, image_size=image_size,
+        module_name=module_name, pretrained=True, timm_model=timm_model,
+    )
+    if deit_problem is not None:
+        return deit_problem
     return build_synthetic_problem(
-        seed=seed,
-        in_features=synthetic_in_features,
-        out_features=synthetic_out_features,
-        samples=synthetic_samples,
+        seed=seed, in_features=synthetic_in_features,
+        out_features=synthetic_out_features, samples=synthetic_samples,
     )
 
 
-def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=None):
+def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=None,
+                                  ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
     quantizer = BQQ(x=W, rank_scale=args.rank_scale)
     method = getattr(quantizer, INTRA_LAYER_METHOD)
     return method(
@@ -142,6 +247,8 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mo
         scale_refine=args.scale_refine,
         use_multibqq=args.use_multibqq if hasattr(args, 'use_multibqq') else False,
         compensation_mode=compensation_mode or args.compensation_mode,
+        ldlq_act_order=ldlq_act_order,
+        ldlq_act_order_score=ldlq_act_order_score,
     ).float().cpu()
 
 
@@ -152,6 +259,8 @@ def refine_bqq_decomposition(W, H, args, consolidated_path):
         H=H,
         num_steps=args.refine_steps,
         lr=args.refine_lr,
+        factors_lr=args.refine_binary_lr,
+        continuous_lr=args.refine_continuous_lr,
         weight_decay=args.refine_weight_decay,
         device_id=args.device_id,
         optimize_factors=not args.refine_coeffs_only,
@@ -317,6 +426,137 @@ def compare_quip_ldlq(args):
         row['ratio_vs_bqq_ldlq'] = row['output_error_energy'] / bqq_error if bqq_error != 0 else float('inf')
     return rows
 
+
+
+def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode='ldlq',
+                            ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
+    """QUIP-style incoherence (randomized Hadamard) around BQQ.
+
+    Reuses QUIP-Sharp's RHT: pick random sign vectors SU (in-side, shared with H)
+    and SV (out-side), transform Wr = RHT_W(W, SU, SV), Hr = RHT_H(H, SU), quantize
+    the transformed weight with BQQ (ldlq), then invert with incoherence_process.
+    The orthogonal transform leaves tr((W-Wq) H (W-Wq)^T) unchanged in value but
+    makes Wr/Hr incoherent so the quantizer's error is spread benignly.
+    """
+    _import_quip_sharp(args.quip_sharp_root)
+    from lib.algo.quip import RHT_H, RHT_W, incoherence_process
+
+    dev = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
+    Wd = W.to(dev).float()
+    Hd = H.to(dev).float()
+    m, n = Wd.shape  # out, in
+
+    g = torch.Generator().manual_seed(args.seed + 12345)
+    SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # in-side
+    SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # out-side
+
+    Hr = RHT_H(Hd, SU)
+    Wr = RHT_W(Wd, SU, SV)
+
+    hatWr = quantize_intra_layer_and_save(
+        Wr.detach().cpu(), Hr.detach().cpu(), args, consolidated_path,
+        compensation_mode=compensation_mode,
+        ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
+    ).to(dev)
+
+    ns = SimpleNamespace(incoh_mode='had', rescale_WH=False)
+    Wq = incoherence_process(hatWr, SU.cpu(), SV.cpu(), None, ns)
+    return Wq.detach().cpu().float()
+
+
+def compare_all_three(args):
+    """Compare bqq-gptq, bqq-ldlq, and QUIP-Sharp on one layer's output error."""
+    W, X, source = build_problem(
+        seed=args.seed,
+        batch_size=args.batch_size,
+        image_size=args.image_size,
+        module_name=args.module_name,
+        force_synthetic=args.force_synthetic,
+        synthetic_in_features=args.synthetic_in_features,
+        synthetic_out_features=args.synthetic_out_features,
+        synthetic_samples=args.synthetic_samples,
+        model_family=args.model_family,
+        timm_model=args.timm_model,
+        llama_model_name=args.llama_model_name,
+        llama_nsamples=args.llama_nsamples,
+        llama_seqlen=args.llama_seqlen,
+        llama_dataset=args.llama_dataset,
+        device_id=args.device_id,
+    )
+    H = (X @ X.T).float()
+    out_numel = W.shape[0] * X.shape[1]
+
+    print(f'Source: {source}')
+    print(f'W shape: {tuple(W.shape)}, X shape: {tuple(X.shape)}')
+    print(f'BQQ method: {INTRA_LAYER_METHOD}; bits={args.bits}, '
+          f'max_patch_size={args.max_patch_size}, nstep={args.nstep}, '
+          f'use_multibqq={args.use_multibqq}, scale_refine={args.scale_refine}')
+
+    def mk_row(method, mode, codebook, Wq):
+        oee = output_error_energy(W, Wq, X)
+        return {
+            'source': source,
+            'weight_shape': str(tuple(W.shape)),
+            'activation_shape': str(tuple(X.shape)),
+            'bits': args.bits,
+            'method': method,
+            'compensation_mode': mode,
+            'codebook': codebook,
+            'output_error_energy': oee,
+            'output_mse': oee / out_numel,
+            'weight_mse': torch.mean((W - Wq).pow(2)).item(),
+        }
+
+    rows = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for mode in ['gptq', 'ldlq']:
+            cp = str(Path(tmpdir) / f'bqq_{mode}.pt')
+            Wq = quantize_intra_layer_and_save(W, H, args, cp, compensation_mode=mode)
+            rows.append(mk_row(f'BQQ:{mode}', mode, None, Wq))
+
+        # LDLQ with activation-order: one row per requested group-score metric
+        # (static / maxdiag / trace / logdet).
+        ao_scores = [s.strip() for s in args.ldlq_act_order_scores.split(',') if s.strip()]
+        for score in ao_scores:
+            cp_ao = str(Path(tmpdir) / f'bqq_ldlq_ao_{score}.pt')
+            Wq_ao = quantize_intra_layer_and_save(W, H, args, cp_ao, compensation_mode='ldlq',
+                                                  ldlq_act_order=True, ldlq_act_order_score=score)
+            rows.append(mk_row(f'BQQ:ldlq-ao-{score}', 'ldlq', None, Wq_ao))
+            # Optional STE refinement on top of the act-order decomposition.
+            if args.apply_ste_refine:
+                Wq_ref, hist = refine_bqq_decomposition(W, H, args, cp_ao)
+                r = mk_row(f'BQQ:ldlq-ao-{score}+ste{args.refine_steps}', 'ldlq', None, Wq_ref)
+                r['ste_refine_last_loss'] = hist[-1] if len(hist) else None
+                rows.append(r)
+
+        # Incoherence-processed BQQ (QUIP-style RHT around ldlq), optional.
+        if args.incoherence:
+            try:
+                cp_ic = str(Path(tmpdir) / 'bqq_ldlq_incoh.pt')
+                Wq_ic = quantize_bqq_incoherent(W, H, args, cp_ic, compensation_mode='ldlq',
+                                                ldlq_act_order=False)
+                rows.append(mk_row('BQQ:ldlq+incoh', 'ldlq', None, Wq_ic))
+
+                cp_ic2 = str(Path(tmpdir) / 'bqq_ldlq_ao_maxdiag_incoh.pt')
+                Wq_ic2 = quantize_bqq_incoherent(W, H, args, cp_ic2, compensation_mode='ldlq',
+                                                 ldlq_act_order=True, ldlq_act_order_score='maxdiag')
+                rows.append(mk_row('BQQ:ldlq-ao-maxdiag+incoh', 'ldlq', None, Wq_ic2))
+            except Exception as exc:
+                print(f'Incoherence BQQ rows skipped/failed: {exc}')
+
+        try:
+            codebook_mod, _q, _u = _import_quip_sharp(args.quip_sharp_root)
+            validate_quip_sharp_problem(W, codebook_mod.get_codebook(args.quip_codebook), args.quip_codebook)
+            Wq_quip = quantize_quip_sharp_ldlq(W, H, args)
+            rows.append(mk_row('QUIP-Sharp', 'ldlq', args.quip_codebook, Wq_quip))
+        except Exception as exc:
+            print(f'QUIP-Sharp comparison skipped/failed: {exc}')
+
+    if rows:
+        best = min(r['output_error_energy'] for r in rows)
+        for r in rows:
+            r['ratio_vs_best'] = r['output_error_energy'] / best if best else float('inf')
+    return rows
 
 
 def compare_compensation_modes(args):
@@ -499,10 +739,22 @@ def main():
     parser.add_argument('--compensation-modes', type=str, default='none,gptq,ldlq',
                         help='Comma-separated modes used by --experiment compensation')
     parser.add_argument('--experiment', type=str, default='ste-refine',
-                        choices=['ste-refine', 'compensation', 'quip-ldlq'])
+                        choices=['ste-refine', 'compensation', 'quip-ldlq', 'all3'])
+    parser.add_argument('--model-family', type=str, default='deit',
+                        choices=['deit', 'llama', 'synthetic'],
+                        help='Which real-model layer to quantize (used by --experiment all3)')
+    parser.add_argument('--timm-model', type=str, default='deit_small_patch16_224')
+    parser.add_argument('--llama-model-name', type=str, default='meta-llama/Llama-2-7b-hf')
+    parser.add_argument('--llama-nsamples', type=int, default=16)
+    parser.add_argument('--llama-seqlen', type=int, default=512)
+    parser.add_argument('--llama-dataset', type=str, default='wikitext2')
     parser.add_argument('--no-scale-refine', dest='scale_refine', action='store_false')
     parser.add_argument('--refine-steps', type=int, default=1000)
     parser.add_argument('--refine-lr', type=float, default=1e-3)
+    parser.add_argument('--refine-binary-lr', type=float, default=1e-3,
+                        help='AdamW LR for STE binary factors Y/Z during refine.')
+    parser.add_argument('--refine-continuous-lr', type=float, default=1e-4,
+                        help='AdamW LR for continuous params (coeff/theta/beta) during refine.')
     parser.add_argument('--refine-weight-decay', type=float, default=0.0)
     parser.add_argument('--scratch-steps', type=int, default=5000)
     parser.add_argument('--scratch-lr', type=float, default=1e-3)
@@ -516,8 +768,19 @@ def main():
     parser.add_argument('--scratch-output-path', type=str, default='')
     parser.add_argument('--output-csv', type=str, default=str(Path(__file__).with_name('results') / 'comparison_of_optimization.csv'))
     parser.add_argument('--use-multibqq', action='store_true')
+    parser.add_argument('--ldlq-act-order', action='store_true',
+                        help='Reorder LDLQ column groups (act-order) before quantizing.')
+    parser.add_argument('--ldlq-act-order-score', type=str, default='maxdiag',
+                        choices=['static', 'maxdiag', 'trace'],
+                        help='Group-score for LDLQ act-order: static=original-order LDL-D '
+                             'heuristic; maxdiag/trace=true pivoted (Schur-updated).')
+    parser.add_argument('--ldlq-act-order-scores', type=str, default='maxdiag',
+                        help='Comma-separated act-order scores to compare as separate rows '
+                             'in --experiment all3 (e.g. "static,maxdiag,trace,logdet").')
     parser.add_argument('--apply-ste-refine', action='store_true',
                         help='Apply refine_decomposition_with_ste to the BQQ row in --experiment quip-ldlq')
+    parser.add_argument('--incoherence', action='store_true',
+                        help='Add QUIP-style incoherence (randomized Hadamard) BQQ rows to --experiment all3')
     parser.add_argument('--quip-sharp-root', type=str, default='/work2/k-kuroki/quip-sharp')
     parser.add_argument('--quip-codebook', type=str, default='E8P12',
                         choices=['E8P12', 'E8P12RVQ3B', 'E8P12RVQ4B'])
@@ -549,6 +812,11 @@ def main():
             df = df.sort_values('output_error_energy')
     elif args.experiment == 'quip-ldlq':
         result = compare_quip_ldlq(args)
+        df = pd.DataFrame(result)
+        if not df.empty:
+            df = df.sort_values('output_error_energy')
+    elif args.experiment == 'all3':
+        result = compare_all_three(args)
         df = pd.DataFrame(result)
         if not df.empty:
             df = df.sort_values('output_error_energy')

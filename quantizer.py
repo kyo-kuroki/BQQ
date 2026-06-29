@@ -1219,7 +1219,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1236,7 +1236,8 @@ class BinaryQuadraticQuantization():
         if H is not None and hessian_mode == 'intra-layer-ste':
             initial_weight = self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
+                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score)
             if ste_refine_steps > 0:
                 refined_weight, _, _ = self.refine_decomposition_with_ste(
                     all_decomposed=consolidated_path,
@@ -1260,7 +1261,8 @@ class BinaryQuadraticQuantization():
         elif H is not None and hessian_mode == 'intra-layer':
             return self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
-                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode)
+                zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
+                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -1536,6 +1538,16 @@ class BinaryQuadraticQuantization():
         Returns:
             refined_weight, refined_decomposition, history
         """
+        # Vectorized STE refine: reconstruct the whole Wq with the batched
+        # TrainableSTEBinaryQuadratic (one STE binarize + one batched matmul over
+        # all patches) instead of a Python loop over thousands of per-patch
+        # tensors. The Hessian-weighted objective tr((W-Wq) H (W-Wq)^T) is computed
+        # via the Cholesky factor H = C C^T  ->  ||W C - Wq C||^2, precomputing W C
+        # once (falls back to the direct E@H form if H is not Cholesky-factorable).
+        from neural_network_compression.bqqkernel.bqq_modules import (
+            TrainableSTEBinaryQuadratic, get_matrices,
+        )
+
         if isinstance(all_decomposed, (str, os.PathLike)):
             all_decomposed = torch.load(all_decomposed, map_location='cpu')
         all_decomposed = copy.deepcopy(all_decomposed)
@@ -1548,82 +1560,103 @@ class BinaryQuadraticQuantization():
             raise ValueError(f'self.x must be 2D, got shape {tuple(W_target.shape)}')
 
         H_mat = self._resolve_hessian_matrix(H, W_target.shape[1])
-
         device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
-        module = _BQQSTERefinementModule(
-            all_decomposed,
-            weight_shape=W_target.shape,
+        W_target = W_target.to(device)
+        H_mat = H_mat.to(device)
+
+        # Batched factor tensors [bit, row, col, ...] from the saved patches.
+        bit_width = max(int(p['bit_idx']) for p in all_decomposed) + 1
+        A, Y, Z = get_matrices(all_decomposed, bit_width)
+        module = TrainableSTEBinaryQuadratic(
+            Y.float(), Z.float(), A.float(), bias=None,
             optimize_factors=optimize_factors,
             optimize_coeffs=optimize_coeffs,
             optimize_theta=optimize_theta,
             optimize_beta=optimize_beta,
         ).to(device)
-        W_target = W_target.to(device)
-        H_mat = H_mat.to(device)
+
+        # Hessian-weighted loss as a plain Frobenius norm via the Cholesky factor.
+        mean_diag = torch.mean(torch.diag(H_mat)).clamp_min(1e-12)
+        C = None
+        for s in (0.0, 1e-8, 1e-6, 1e-4, 1e-2):
+            try:
+                C = torch.linalg.cholesky(
+                    H_mat + (s * mean_diag) * torch.eye(H_mat.shape[0], device=device, dtype=H_mat.dtype))
+                break
+            except Exception:
+                C = None
+        use_chol = C is not None
+        WC = (W_target @ C) if use_chol else None
+        if not use_chol:
+            print('STE refine: Cholesky failed, using direct E@H loss')
 
         named_params = [(name, p) for name, p in module.named_parameters() if p.requires_grad]
         if len(named_params) == 0:
             raise ValueError('No trainable parameters selected for refinement')
-
         binary_lr = lr if factors_lr is None else factors_lr
         continuous_lr_value = lr if continuous_lr is None else continuous_lr
-        binary_params = [p for name, p in named_params if name.startswith('y_fp_') or name.startswith('z_fp_')]
-        continuous_params = [p for name, p in named_params if not (name.startswith('y_fp_') or name.startswith('z_fp_'))]
+        binary_params = [p for name, p in named_params if name.startswith('Y_fp') or name.startswith('Z_fp')]
+        continuous_params = [p for name, p in named_params if not (name.startswith('Y_fp') or name.startswith('Z_fp'))]
         param_groups = []
         if continuous_params:
             param_groups.append({'params': continuous_params, 'lr': continuous_lr_value, 'weight_decay': weight_decay})
         if binary_params:
             param_groups.append({'params': binary_params, 'lr': binary_lr, 'weight_decay': weight_decay})
-
         optimizer = torch.optim.AdamW(param_groups)
+
+        numel = W_target.numel()
+
+        def _loss():
+            Wq = module.get_weight(dtype=torch.float32)
+            if use_chol:
+                diff = WC - Wq @ C
+            else:
+                E = W_target - Wq
+                return torch.sum((E @ H_mat) * E) / numel
+            return torch.sum(diff * diff) / numel
+
         history = []
         best_loss = float('inf')
         best_step = -1
         best_state_dict = None
-
-        grouped_patch_rows = []
-        for patch_height in sorted(module.patch_rows_by_height):
-            patch_rows = module.patch_rows_by_height[patch_height]
-            batch_size = len(patch_rows) if not row_group_batch_size or row_group_batch_size <= 0 else row_group_batch_size
-            for start in range(0, len(patch_rows), batch_size):
-                grouped_patch_rows.append(patch_rows[start:start + batch_size])
-
         for step in range(num_steps):
-            for patch_rows in grouped_patch_rows:
-                optimizer.zero_grad(set_to_none=True)
-                Wq_batch, row_ranges = module.reconstruct_row_group_batch(patch_rows)
-                target_batch = torch.stack([W_target[r0:r1, :] for r0, r1 in row_ranges], dim=0)
-                diff_batch = target_batch - Wq_batch
-                loss = torch.sum((diff_batch @ H_mat) * diff_batch) / diff_batch.numel()
-                loss.backward()
-                optimizer.step()
-
-            with torch.no_grad():
-                Wq_eval = module.reconstruct_weight()
-                diff_eval = W_target - Wq_eval
-                loss_value = (torch.sum((diff_eval @ H_mat) * diff_eval) / diff_eval.numel()).detach().cpu().item()
+            optimizer.zero_grad(set_to_none=True)
+            loss = _loss()
+            loss.backward()
+            optimizer.step()
+            loss_value = loss.detach().item()
             history.append(loss_value)
 
             if loss_value < best_loss:
                 best_loss = loss_value
                 best_step = step + 1
-                best_state_dict = {
-                    key: value.detach().cpu().clone()
-                    for key, value in module.state_dict().items()
-                }
+                best_state_dict = {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
 
             if log_interval and (step == 0 or (step + 1) % log_interval == 0 or step + 1 == num_steps):
                 print(f'STE refine step {step + 1}/{num_steps}: loss={loss_value:.6e}, best={best_loss:.6e}')
 
         if best_state_dict is not None:
-            module.load_state_dict({
-                key: value.to(device)
-                for key, value in best_state_dict.items()
-            })
+            module.load_state_dict({k: v.to(device) for k, v in best_state_dict.items()})
             print(f'STE refine restored best step {best_step}/{num_steps}: best_loss={best_loss:.6e}')
 
-        refined_weight = module.reconstruct_weight().detach().cpu()
-        refined_decomposition = module.export_decomposition()
+        # Export refined factors back into the original patch dicts (metadata kept).
+        refined_bqq = module.to_binaryquadratic()
+        Yq = refined_bqq.Y.detach().cpu().float()   # [bit, row, col, m, l]
+        Zq = refined_bqq.Z.detach().cpu().float()   # [bit, row, col, l, n]
+        a_t = refined_bqq.a.detach().cpu().float()  # [bit, row, col, 1, 1]
+        b_t = refined_bqq.b.detach().cpu().float()
+        c_t = refined_bqq.c.detach().cpu().float()
+        d_t = refined_bqq.d.detach().cpu().float()  # [row, col, 1, 1] (summed onto bit 0)
+        for p in all_decomposed:
+            bit, i, j = int(p['bit_idx']), int(p['patch_row']), int(p['patch_col'])
+            p['mat1'] = Yq[bit, i, j].clone()
+            p['mat2'] = Zq[bit, i, j].clone()
+            d_val = float(d_t[i, j, 0, 0]) if bit == 0 else 0.0
+            p['coeff'] = torch.tensor(
+                [float(a_t[bit, i, j, 0, 0]), float(b_t[bit, i, j, 0, 0]),
+                 float(c_t[bit, i, j, 0, 0]), d_val], dtype=torch.float32)
+        refined_decomposition = all_decomposed
+        refined_weight = refined_bqq.get_weight(dtype=torch.float32).detach().cpu()
 
         if consolidated_path:
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
@@ -1739,6 +1772,7 @@ class BinaryQuadraticQuantization():
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
         damping=1e-6, scale_refine=True, use_multibqq=True, compensation_mode='ldlq',
+        ldlq_act_order=False, ldlq_act_order_score='maxdiag',
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -1797,6 +1831,85 @@ class BinaryQuadraticQuantization():
         valid_modes = {'gptq', 'ldlq', 'none'}
         if compensation_mode not in valid_modes:
             raise ValueError(f'Unknown compensation_mode={compensation_mode!r}; expected one of {sorted(valid_modes)}')
+
+        # Optional activation-order for LDLQ: reorder the column GROUPS by a
+        # static importance score and quantize the highest-score group first.
+        # The score is the LDL pivot of H computed ONCE in the original column
+        # order: score_j = D_jj where H = L D L^T (= Cholesky(H)[j,j]^2). This is
+        # a precomputed heuristic, NOT a true pivoted LDL: D_jj is order-dependent
+        # (the Schur complement changes as groups are reordered), so the score of
+        # the reordered layout differs from this one. A true pivoted LDLQ would
+        # update the Schur complement each step and greedily pick the next group.
+        # A group is moved as a whole unit, so each group's quantized block is
+        # written back to its ORIGINAL column range (patches stay deployable in
+        # original order); only the PROCESSING ORDER (and thus the LDLQ feedback
+        # structure, which is rebuilt from the permuted H below) changes.
+        act_perm = None          # permuted-col -> original-col index map
+        act_orig_ranges = None   # permuted group position -> original (c0, c1)
+        act_order_idx = None     # permuted group position -> original group index
+        if compensation_mode == 'ldlq' and ldlq_act_order:
+            _md0 = torch.mean(torch.diag(H)).clamp_min(1e-12)
+            _Hd0 = H + (0.01 * _md0) * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
+            _score_mode = str(ldlq_act_order_score).lower()
+
+            if _score_mode == 'static':
+                # Static heuristic: D_jj of the ORIGINAL-order LDL (= Cholesky[j,j]^2),
+                # group score = max over the group. NOT a true pivoted score.
+                _score_col = torch.linalg.cholesky(_Hd0).diagonal().pow(2)
+                _group_score = torch.stack([_score_col[c0:c1].max() for (c0, c1) in w_ranges])
+                # ascending -> high-score group rightmost -> processed first (reversed loop)
+                act_order_idx = torch.argsort(_group_score).tolist()
+            else:
+                # True pivoted block-LDLQ: greedily pick the highest-score remaining
+                # group from the CURRENT Schur complement, eliminate it, and repeat.
+                # The Schur complement is updated each step so the score reflects the
+                # conditional importance given the already-selected groups.
+                #   maxdiag : max_j  S_jj            (per-group max conditional variance)
+                #   trace   : trace(S_gg)            (total conditional variance)
+                if _score_mode not in {'maxdiag', 'trace'}:
+                    raise ValueError(
+                        f"Unknown ldlq_act_order_score={ldlq_act_order_score!r}; "
+                        f"expected one of ['maxdiag','trace','static']")
+                S = _Hd0.clone()
+                cols_of = [list(range(c0, c1)) for (c0, c1) in w_ranges]
+                remaining = list(range(num_col_groups))
+                order_high_first = []
+                for _ in range(num_col_groups):
+                    best_g, best_sc = None, None
+                    for g in remaining:
+                        cols = cols_of[g]
+                        if _score_mode == 'maxdiag':
+                            sc = S[cols, cols].max()
+                        else:  # trace
+                            sc = torch.trace(S[cols][:, cols])
+                        if best_sc is None or bool(sc > best_sc):
+                            best_sc, best_g = sc, g
+                    order_high_first.append(best_g)
+                    remaining.remove(best_g)
+                    # Schur-complement elimination of the chosen group's columns.
+                    cols = cols_of[best_g]
+                    Sgg = S[cols][:, cols]
+                    jit = (1e-10 * torch.trace(Sgg).clamp_min(1e-12) / max(len(cols), 1))
+                    Sgg_inv = torch.linalg.inv(
+                        Sgg + jit * torch.eye(len(cols), dtype=S.dtype, device=S.device))
+                    Scol = S[:, cols]
+                    S = S - Scol @ Sgg_inv @ Scol.T
+                    S = 0.5 * (S + S.T)
+                # high-score first -> place rightmost -> left-to-right layout is reversed
+                act_order_idx = list(reversed(order_high_first))
+
+            act_orig_ranges = [w_ranges[idx] for idx in act_order_idx]
+            perm_cols, new_ranges, s = [], [], 0
+            for (oc0, oc1) in act_orig_ranges:
+                perm_cols.extend(range(oc0, oc1))
+                new_ranges.append((s, s + (oc1 - oc0)))
+                s += (oc1 - oc0)
+            act_perm = torch.tensor(perm_cols, device=x_tensor.device, dtype=torch.long)
+            x_tensor = x_tensor[:, act_perm].contiguous()
+            H = H[act_perm][:, act_perm].contiguous()
+            w_ranges = new_ranges
+            print(f'LDLQ act-order: reordered {num_col_groups} groups by '
+                  f'{_score_mode} score (high first)')
 
         COMP_DAMPING = 0.01  # 1% relative damping, same default used by GPTQ-style compensation.
         mean_diag = torch.mean(torch.diag(H)).clamp_min(1e-12)
@@ -2036,11 +2149,28 @@ class BinaryQuadraticQuantization():
                 else:
                     print('  WARNING: scale refine solve failed')
 
+        # Act-order: remap each patch's column position from the permuted layout
+        # back to its ORIGINAL column group, so the saved patches reconstruct the
+        # weight in original column order (no inference-time permutation needed).
+        if act_perm is not None:
+            for p in all_decomposed:
+                jpos = p['patch_col']
+                oc0, oc1 = act_orig_ranges[jpos]
+                p['col_start'], p['col_end'] = oc0, oc1
+                p['patch_col'] = act_order_idx[jpos]
+
         # Save
         if consolidated_path and all_decomposed:
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
             torch.save(all_decomposed, consolidated_path)
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+
+        # Act-order: undo the column permutation so the returned dense weight is
+        # in original column order.
+        if act_perm is not None:
+            Wq_full = torch.zeros(original_h, original_w, dtype=Wq.dtype, device=Wq.device)
+            Wq_full[:, act_perm] = Wq
+            Wq = Wq_full
 
         self.x = copy.copy(x_copy)
         # Return a CPU tensor with a deterministic device. With scale_refine
