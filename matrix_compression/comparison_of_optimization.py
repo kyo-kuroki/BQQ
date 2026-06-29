@@ -228,7 +228,8 @@ def build_problem(
 
 
 def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=None,
-                                  ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
+                                  ldlq_act_order=False, ldlq_act_order_score='maxdiag',
+                                  rank_alloc_mode='none'):
     quantizer = BQQ(x=W, rank_scale=args.rank_scale)
     method = getattr(quantizer, INTRA_LAYER_METHOD)
     return method(
@@ -249,6 +250,7 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mo
         compensation_mode=compensation_mode or args.compensation_mode,
         ldlq_act_order=ldlq_act_order,
         ldlq_act_order_score=ldlq_act_order_score,
+        rank_alloc_mode=rank_alloc_mode,
     ).float().cpu()
 
 
@@ -429,7 +431,8 @@ def compare_quip_ldlq(args):
 
 
 def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode='ldlq',
-                            ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
+                            ldlq_act_order=False, ldlq_act_order_score='maxdiag',
+                            rank_alloc_mode='none'):
     """QUIP-style incoherence (randomized Hadamard) around BQQ.
 
     Reuses QUIP-Sharp's RHT: pick random sign vectors SU (in-side, shared with H)
@@ -457,6 +460,7 @@ def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode=
         Wr.detach().cpu(), Hr.detach().cpu(), args, consolidated_path,
         compensation_mode=compensation_mode,
         ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
+        rank_alloc_mode=rank_alloc_mode,
     ).to(dev)
 
     ns = SimpleNamespace(incoh_mode='had', rescale_WH=False)

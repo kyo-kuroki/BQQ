@@ -1219,7 +1219,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag'):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none'):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1237,7 +1237,8 @@ class BinaryQuadraticQuantization():
             initial_weight = self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
-                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score)
+                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
+                rank_alloc_mode=rank_alloc_mode)
             if ste_refine_steps > 0:
                 refined_weight, _, _ = self.refine_decomposition_with_ste(
                     all_decomposed=consolidated_path,
@@ -1262,7 +1263,8 @@ class BinaryQuadraticQuantization():
             return self._hessian_aware_large_matrix_batched(
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
-                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score)
+                ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
+                rank_alloc_mode=rank_alloc_mode)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -1772,7 +1774,7 @@ class BinaryQuadraticQuantization():
         self, max_patch_size, bit_width, H,
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
         damping=1e-6, scale_refine=True, use_multibqq=True, compensation_mode='ldlq',
-        ldlq_act_order=False, ldlq_act_order_score='maxdiag',
+        ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none',
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -1915,6 +1917,29 @@ class BinaryQuadraticQuantization():
         mean_diag = torch.mean(torch.diag(H)).clamp_min(1e-12)
         H_damped = H + (COMP_DAMPING * mean_diag) * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
 
+        # Optional per-column-group rank allocation. The factorization rank l of
+        # each group is scaled by rank_scale_i, allocating more rank to important
+        # groups. score s_i = group's LDL pivot (max_j D_jj, D = Cholesky(H)[j,j]^2),
+        #   rank_scale_i = 1 + 0.5 * (log2 s_i - mean_j log2 s_j)
+        # (mean-centred in log space, so the average rank ~ the uniform baseline).
+        # NOTE: this produces a ragged l per group -> the dense reconstruction
+        # (this Wq, scale_refine, aggregate_matrices) handles it, but the batched
+        # BinaryQuadratic module / get_matrices / fast STE refine require uniform l.
+        per_group_rank_scale = None
+        if str(rank_alloc_mode).lower() == 'pivot-log':
+            try:
+                _Cd = torch.linalg.cholesky(H_damped)
+                _Dcol = _Cd.diagonal().pow(2).clamp_min(1e-30)
+                _s = torch.stack([_Dcol[c0:c1].max() for (c0, c1) in w_ranges])
+                _logs = torch.log2(_s)
+                _rs = 1.0 + 0.5 * (_logs - _logs.mean())
+                _rs = _rs.clamp_min(0.1)  # keep rank >= 1 downstream
+                per_group_rank_scale = _rs.tolist()
+                print(f'rank-alloc pivot-log: rank_scale in [{_rs.min().item():.3f}, '
+                      f'{_rs.max().item():.3f}] over {len(w_ranges)} groups')
+            except Exception as _e:
+                print(f'rank-alloc pivot-log failed ({_e}); using uniform rank_scale')
+
         H_inv = None
         ldlq_L = None
         if compensation_mode == 'gptq':
@@ -1955,6 +1980,7 @@ class BinaryQuadraticQuantization():
 
         for j, (c0, c1) in col_group_iter:
             pw = c1 - c0
+            rs_j = per_group_rank_scale[j] if per_group_rank_scale is not None else rank_scale_copy
             if compensation_mode == 'ldlq' and c1 < original_w:
                 group_input = x_tensor[:, c0:c1] + (x_tensor[:, c1:] - Wq[:, c1:]) @ ldlq_L[c1:, c0:c1]
             else:
@@ -1971,7 +1997,7 @@ class BinaryQuadraticQuantization():
                       f'patches of ({col_patches[0].shape[0]}x{pw}) with {bit_width} stacks')
 
                 y_mb, z_mb, a_mb = self.run_multibqq_compile_batched(
-                    x_batch, num_stack=bit_width, rank_scale=rank_scale_copy,
+                    x_batch, num_stack=bit_width, rank_scale=rs_j,
                     zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                     Nstep=Nstep, device_id=main_gpu_id, seed=seed
                 )
@@ -2008,7 +2034,7 @@ class BinaryQuadraticQuantization():
                           f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
 
                     y_b, z_b, a_b = self.run_bqq_compile_batched(
-                        x_batch, rank_scale=rank_scale_copy,
+                        x_batch, rank_scale=rs_j,
                         zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                         Nstep=Nstep, device_id=main_gpu_id, seed=seed
                     )
