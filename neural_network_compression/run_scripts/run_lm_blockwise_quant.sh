@@ -43,6 +43,9 @@ NO_IO_CACHE="${NO_IO_CACHE:-1}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
+LDLQ_ACT_ORDER="${LDLQ_ACT_ORDER:-0}"
+LDLQ_ACT_ORDER_SCORE="${LDLQ_ACT_ORDER_SCORE:-maxdiag}"
+RANK_ALLOC_MODE="${RANK_ALLOC_MODE:-none}"
 STE_REFINE="${STE_REFINE:-0}"
 STE_REFINE_STEPS="${STE_REFINE_STEPS:-200}"
 STE_REFINE_WEIGHT_DECAY="${STE_REFINE_WEIGHT_DECAY:-0.0}"
@@ -96,6 +99,11 @@ run_one_block() {
     else
       layerwise_cmd+=(--no_use_multibqq)
     fi
+    if [[ "${LDLQ_ACT_ORDER}" == "1" ]]; then
+      layerwise_cmd+=(--ldlq_act_order)
+    fi
+    layerwise_cmd+=(--ldlq_act_order_score "${LDLQ_ACT_ORDER_SCORE}")
+    layerwise_cmd+=(--rank_alloc_mode "${RANK_ALLOC_MODE}")
     if [[ "${LAYERWISE_FIX_THETA}" == "1" ]]; then
       layerwise_cmd+=(--fix_theta)
     fi
@@ -137,6 +145,11 @@ run_one_block() {
     blockwise_cmd+=(--no_use_multibqq)
   fi
   blockwise_cmd+=(--compensation_mode "${COMPENSATION_MODE}")
+  if [[ "${LDLQ_ACT_ORDER}" == "1" ]]; then
+    blockwise_cmd+=(--ldlq_act_order)
+  fi
+  blockwise_cmd+=(--ldlq_act_order_score "${LDLQ_ACT_ORDER_SCORE}")
+  blockwise_cmd+=(--rank_alloc_mode "${RANK_ALLOC_MODE}")
   if [[ "${STE_REFINE}" == "1" ]]; then
     blockwise_cmd+=(--ste_refine_steps "${STE_REFINE_STEPS}")
     blockwise_cmd+=(--ste_refine_weight_decay "${STE_REFINE_WEIGHT_DECAY}")

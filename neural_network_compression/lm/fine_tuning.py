@@ -204,7 +204,7 @@ def train(
         lr_scheduler_type="cosine",
         report_to="none",
         bf16=False,
-        fp16=True,
+        fp16=False,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True)

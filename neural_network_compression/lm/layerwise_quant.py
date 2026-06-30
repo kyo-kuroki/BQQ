@@ -317,6 +317,9 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ste_refine_optimize_beta=not common['fix_beta'],
             ste_refine_row_group_batch_size=common['row_group_batch_size'],
             ste_refine_log_interval=common['ste_refine_log_interval'],
+            ldlq_act_order=common.get('ldlq_act_order', False),
+            ldlq_act_order_score=common.get('ldlq_act_order_score', 'maxdiag'),
+            rank_alloc_mode=common.get('rank_alloc_mode', 'none'),
         )
         if save_reconstructed:
             torch.save(reconstructed.cpu(), tensor_path)
@@ -511,6 +514,9 @@ def layerwise_quantize_block(
     workers_per_gpu: int,
     calibration_loader,
     save_reconstructed: bool = False,
+    ldlq_act_order: bool = False,
+    ldlq_act_order_score: str = 'maxdiag',
+    rank_alloc_mode: str = 'none',
 ):
     """
     Quantize all Linear layers in one or more transformer blocks `block_indices`.
@@ -636,6 +642,9 @@ def layerwise_quantize_block(
         compensation_mode=compensation_mode,
         save_reconstructed=save_reconstructed,
         n_gpus=n_gpus,
+        ldlq_act_order=ldlq_act_order,
+        ldlq_act_order_score=ldlq_act_order_score,
+        rank_alloc_mode=rank_alloc_mode,
     )
 
     if n_workers == 1:
@@ -847,6 +856,12 @@ def main():
                         help='Disable joint multibqq optimization and quantize bits sequentially')
     parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
                         help='Column compensation mode for Hessian-aware BQQ')
+    parser.add_argument('--ldlq_act_order', action='store_true', default=False,
+                        help='Enable LDLQ activation-order (reorder column groups by score before quantizing)')
+    parser.add_argument('--ldlq_act_order_score', type=str, default='maxdiag', choices=['maxdiag', 'trace', 'static'],
+                        help='Score function for LDLQ activation-order')
+    parser.add_argument('--rank_alloc_mode', type=str, default='none', choices=['none', 'pivot-log'],
+                        help='Per-column-group rank allocation mode')
 
     # STE refinement
     parser.add_argument('--ste_refine_steps', type=int, default=1000)
@@ -1029,6 +1044,9 @@ def main():
             workers_per_gpu=args.workers_per_gpu,
             calibration_loader=train_loader,
             save_reconstructed=args.save_reconstructed,
+            ldlq_act_order=args.ldlq_act_order,
+            ldlq_act_order_score=args.ldlq_act_order_score,
+            rank_alloc_mode=args.rank_alloc_mode,
         )
         if args.assemble_full_model:
             save_bqq_model(

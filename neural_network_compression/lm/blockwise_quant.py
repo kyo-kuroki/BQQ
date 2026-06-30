@@ -405,6 +405,9 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             scale_refine=True, damping=1e-6,
                             use_multibqq=True,
                             compensation_mode='ldlq',
+                            ldlq_act_order=False,
+                            ldlq_act_order_score='maxdiag',
+                            rank_alloc_mode='none',
                             ste_refine_steps=0,
                             ste_refine_lr=1e-3,
                             ste_refine_weight_decay=0.0,
@@ -438,6 +441,9 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                           scale_refine=scale_refine, damping=damping,
                           use_multibqq=use_multibqq,
                           compensation_mode=compensation_mode,
+                          ldlq_act_order=ldlq_act_order,
+                          ldlq_act_order_score=ldlq_act_order_score,
+                          rank_alloc_mode=rank_alloc_mode,
                           ste_refine_steps=ste_refine_steps,
                           ste_refine_lr=ste_refine_lr,
                           ste_refine_weight_decay=ste_refine_weight_decay,
@@ -1301,6 +1307,9 @@ def quantize_block_progressive_closed_form(
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    ldlq_act_order=False,
+    ldlq_act_order_score='maxdiag',
+    rank_alloc_mode='none',
 ):
     """Front-to-back layer quantization with closed-form continuous recentering.
 
@@ -1414,6 +1423,9 @@ def quantize_block_progressive_closed_form(
             damping=damping,
             use_multibqq=use_multibqq,
             compensation_mode=compensation_mode,
+            ldlq_act_order=ldlq_act_order,
+            ldlq_act_order_score=ldlq_act_order_score,
+            rank_alloc_mode=rank_alloc_mode,
             ste_refine_steps=ste_refine_steps,
             ste_refine_lr=ste_refine_lr,
             ste_refine_weight_decay=ste_refine_weight_decay,
@@ -1563,6 +1575,12 @@ def main():
                         help='Disable joint multibqq optimization and quantize bits sequentially')
     parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
                         help='Column compensation mode for Hessian-aware BQQ')
+    parser.add_argument('--ldlq_act_order', action='store_true', default=False,
+                        help='Enable LDLQ activation-order (reorder column groups by score before quantizing)')
+    parser.add_argument('--ldlq_act_order_score', type=str, default='maxdiag', choices=['maxdiag', 'trace', 'static'],
+                        help='Score function for LDLQ activation-order')
+    parser.add_argument('--rank_alloc_mode', type=str, default='none', choices=['none', 'pivot-log'],
+                        help='Per-column-group rank allocation mode')
     parser.add_argument('--ste_refine_steps', type=int, default=0,
                         help='Steps of STE refinement after Hessian-aware BQQ (0 disables)')
     parser.add_argument('--ste_refine_lr', type=float, default=1e-3)
@@ -1676,7 +1694,10 @@ def main():
 
     if args.progressive:
         if args.progressive_mode == 'patch':
-            quantize_block_progressive(**common_kwargs,
+            import inspect
+            _patch_keys = set(inspect.signature(quantize_block_progressive).parameters)
+            patch_kwargs = {k: v for k, v in common_kwargs.items() if k in _patch_keys}
+            quantize_block_progressive(**patch_kwargs,
                                        num_rounds=args.num_rounds,
                                        schedule=args.schedule)
         else:
@@ -1719,6 +1740,9 @@ def main():
                 ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
                 use_multibqq=args.use_multibqq,
                 compensation_mode=args.compensation_mode,
+                ldlq_act_order=args.ldlq_act_order,
+                ldlq_act_order_score=args.ldlq_act_order_score,
+                rank_alloc_mode=args.rank_alloc_mode,
             )
     else:
         quantize_block(
