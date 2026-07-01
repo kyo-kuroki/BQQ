@@ -441,8 +441,11 @@ def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode=
     The orthogonal transform leaves tr((W-Wq) H (W-Wq)^T) unchanged in value but
     makes Wr/Hr incoherent so the quantizer's error is spread benignly.
     """
-    _import_quip_sharp(args.quip_sharp_root)
-    from lib.algo.quip import RHT_H, RHT_W, incoherence_process
+    # Self-contained incoherence (copied from QUIP-Sharp into matrix_compression/incoherence.py).
+    _here = os.path.dirname(os.path.abspath(__file__))
+    if _here not in sys.path:
+        sys.path.insert(0, _here)
+    from incoherence import RHT_H, RHT_W, incoherence_process
 
     dev = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
     Wd = W.to(dev).float()
@@ -463,8 +466,7 @@ def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode=
         rank_alloc_mode=rank_alloc_mode,
     ).to(dev)
 
-    ns = SimpleNamespace(incoh_mode='had', rescale_WH=False)
-    Wq = incoherence_process(hatWr, SU.cpu(), SV.cpu(), None, ns)
+    Wq = incoherence_process(hatWr, SU.cpu(), SV.cpu())
     return Wq.detach().cpu().float()
 
 
