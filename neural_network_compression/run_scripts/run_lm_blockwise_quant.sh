@@ -47,6 +47,7 @@ LDLQ_ACT_ORDER="${LDLQ_ACT_ORDER:-0}"
 LDLQ_ACT_ORDER_SCORE="${LDLQ_ACT_ORDER_SCORE:-maxdiag}"
 RANK_ALLOC_MODE="${RANK_ALLOC_MODE:-none}"
 INCOHERENT="${INCOHERENT:-0}"
+FINETUNE_FROM_DIR="${FINETUNE_FROM_DIR:-}"
 STE_REFINE="${STE_REFINE:-0}"
 STE_REFINE_STEPS="${STE_REFINE_STEPS:-200}"
 STE_REFINE_WEIGHT_DECAY="${STE_REFINE_WEIGHT_DECAY:-0.0}"
@@ -180,6 +181,9 @@ run_one_block() {
   fi
   if [[ "${INCOHERENT}" == "1" ]]; then
     blockwise_cmd+=(--use_incoherent)
+  fi
+  if [[ -n "${FINETUNE_FROM_DIR}" ]]; then
+    blockwise_cmd+=(--finetune_from_dir "${FINETUNE_FROM_DIR}")
   fi
   blockwise_cmd+=("$@")
   "${blockwise_cmd[@]}"

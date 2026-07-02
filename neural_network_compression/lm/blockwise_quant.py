@@ -1731,6 +1731,97 @@ def quantize_block_attn_mlp_split(
 
 
 # ---------------------------------------------------------------------------
+# Post-quantization continuous-param fine-tune
+# ---------------------------------------------------------------------------
+
+def finetune_block_continuous_params(
+    model_name,
+    block_idx,
+    dataloader,
+    *,
+    source_dir,
+    save_dir,
+    epochs,
+    lr,
+    continuous_lr=None,
+    max_grad_norm=1.0,
+    optimizer_name='adamw',
+    momentum=0.0,
+    tune_batch_size=1,
+    device,
+    io_cache_dir=None,
+    dataset=None,
+    seqlen=None,
+    nsamples=None,
+    use_disk_cache=True,
+    seed=0,
+):
+    """Load a saved quantized block and fine-tune only its continuous params (binary frozen)."""
+    dev = torch.device(device)
+
+    source_path = Path(source_dir) / f'block_{block_idx}.pth'
+    print(f'\nLoading quantized block {block_idx} from {source_path}')
+    current_block = torch.load(source_path, map_location='cpu', weights_only=False).float()
+
+    if use_disk_cache:
+        if io_cache_dir is None:
+            io_cache_dir = default_block_io_cache_dir(model_name, dataset or 'dataset', seqlen or 0, nsamples or 0)
+        artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            prepare_block_artifacts(
+                model_name, dataloader,
+                block_indices=[block_idx],
+                device=dev,
+                io_cache_dir=io_cache_dir,
+                dataset=dataset or 'dataset',
+                seqlen=seqlen or 0,
+                nsamples=nsamples or 0,
+                seed=seed,
+            )
+            artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            raise RuntimeError(f'Failed to load block artifacts for block {block_idx}')
+        print(f"Loaded cached block {block_idx} I/O: {len(artifacts['inputs_cache'])} samples from {io_cache_dir}")
+    else:
+        artifacts = prepare_single_block_artifact_in_memory(
+            model_name, block_idx, dataloader,
+            device=dev,
+            dataset=dataset or 'dataset',
+            seqlen=seqlen or 0,
+            nsamples=nsamples or 0,
+            seed=seed,
+        )
+
+    inputs_cache = artifacts['inputs_cache']
+    targets_cache = artifacts['targets_cache']
+
+    pre_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE before finetune')
+    print(f'Block {block_idx} MSE before fine-tune: {pre_mse:.6f}')
+    pre_opt_state = {k: v.cpu().clone() for k, v in current_block.state_dict().items()}
+
+    optimize_block_params(
+        current_block, inputs_cache, targets_cache,
+        epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+        optimizer_name=optimizer_name, momentum=momentum,
+        binary_lr=0.0, continuous_lr=continuous_lr, tune_batch_size=tune_batch_size,
+    )
+
+    post_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE after finetune')
+    if post_mse > pre_mse:
+        current_block.load_state_dict(pre_opt_state)
+        current_block.to(dev)
+        post_mse = pre_mse
+        print('  Fine-tuning diverged, reverted to source state')
+
+    save_path = Path(save_dir) / f'block_{block_idx}.pth'
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(current_block.cpu(), save_path, pickle_module=dill)
+    print(f'Block {block_idx} MSE after fine-tune: {post_mse:.6f} (Δ={post_mse - pre_mse:+.6f})')
+    print(f'Saved to: {save_path}')
+    return current_block
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1855,6 +1946,8 @@ def main():
                         help='Prepare and save all block I/O/source-block artifacts, then exit')
     parser.add_argument('--no_io_cache', action='store_true',
                         help='Do not save/load block I/O artifacts on disk; keep them in memory per block process')
+    parser.add_argument('--finetune_from_dir', type=str, default=None,
+                        help='Skip quantization; load saved blocks from this dir and fine-tune continuous params only')
 
     args = parser.parse_args()
 
@@ -1884,6 +1977,30 @@ def main():
             dataset=args.dataset,
             seqlen=args.seqlen,
             nsamples=args.nsamples,
+            seed=args.seed,
+        )
+        return
+
+    if args.finetune_from_dir is not None:
+        finetune_block_continuous_params(
+            model_name=args.model_name,
+            block_idx=args.block_idx,
+            dataloader=train_loader,
+            source_dir=args.finetune_from_dir,
+            save_dir=args.save_dir,
+            epochs=args.epochs,
+            lr=args.lr,
+            continuous_lr=args.continuous_lr,
+            max_grad_norm=args.max_grad_norm,
+            optimizer_name=args.optimizer,
+            momentum=args.momentum,
+            tune_batch_size=args.tune_batch_size,
+            device=args.device,
+            io_cache_dir=io_cache_dir,
+            dataset=args.dataset,
+            seqlen=args.seqlen,
+            nsamples=args.nsamples,
+            use_disk_cache=not args.no_io_cache,
             seed=args.seed,
         )
         return
