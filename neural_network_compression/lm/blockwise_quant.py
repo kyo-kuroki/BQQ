@@ -1707,7 +1707,7 @@ def quantize_block_attn_mlp_split(
             current_block, inputs_cache, targets_cache,
             epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
             optimizer_name=optimizer_name, momentum=momentum,
-            binary_lr=0.0, continuous_lr=continuous_lr, tune_batch_size=tune_batch_size,
+            binary_lr=binary_lr, continuous_lr=continuous_lr, tune_batch_size=tune_batch_size,
         )
         post_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE after final tune')
         if post_mse > pre_mse:
