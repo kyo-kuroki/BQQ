@@ -1500,6 +1500,173 @@ def quantize_block_progressive_closed_form(
     return current_block
 
 
+def quantize_block_attn_mlp_split(
+    model_name,
+    block_idx,
+    dataloader,
+    *,
+    bit_width,
+    group_size,
+    num_steps,
+    rank_scale,
+    seed,
+    damping=1e-6,
+    epochs=0,
+    lr=1e-5,
+    max_grad_norm=1.0,
+    optimizer_name='adamw',
+    momentum=0.0,
+    binary_lr=None,
+    continuous_lr=None,
+    tune_batch_size=1,
+    scale_refine=True,
+    fix_theta=False,
+    fix_beta=False,
+    device,
+    save_dir,
+    io_cache_dir=None,
+    dataset=None,
+    seqlen=None,
+    nsamples=None,
+    use_disk_cache=True,
+    ste_refine_steps=0,
+    ste_refine_lr=1e-3,
+    ste_refine_weight_decay=0.0,
+    ste_refine_binary_lr=None,
+    ste_refine_continuous_lr=None,
+    ste_refine_log_interval=20,
+    ste_refine_row_group_batch_size=None,
+    use_multibqq=True,
+    compensation_mode='ldlq',
+    ldlq_act_order=False,
+    ldlq_act_order_score='maxdiag',
+    rank_alloc_mode='none',
+):
+    """Attention-then-MLP blockwise quantization.
+
+    Flow: attention quantization -> MLP fine-tuning -> MLP quantization.
+      1. Quantize the attention weights (q/k/v/o) independently (each with its own
+         Hessian, no block tuning between them). Attention is frozen as
+         BinaryQuadratic, so its binary factors Y/Z are fixed but the continuous
+         scale factors (a,b,c,d) remain trainable.
+      2. Fine-tune the block to recover its output error, training only the MLP
+         (still full-precision) weights and the continuous parameters (attention
+         scale factors + LayerNorms). Attention binary factors stay frozen.
+      3. Quantize the (fine-tuned) MLP weights.
+    """
+    dev = torch.device(device)
+    device_id = dev.index if dev.type == 'cuda' else 0
+
+    if use_disk_cache:
+        if io_cache_dir is None:
+            io_cache_dir = default_block_io_cache_dir(model_name, dataset or 'dataset', seqlen or 0, nsamples or 0)
+        artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            prepare_block_artifacts(
+                model_name, dataloader, block_indices=[block_idx], device=dev,
+                io_cache_dir=io_cache_dir, dataset=dataset or 'dataset',
+                seqlen=seqlen or 0, nsamples=nsamples or 0, seed=seed,
+            )
+            artifacts = load_block_artifacts(io_cache_dir, block_idx)
+        if artifacts is None:
+            raise RuntimeError(f'Failed to prepare/load block artifacts for block {block_idx}')
+        print(f"Loaded cached block {block_idx} I/O: {len(artifacts['inputs_cache'])} samples from {io_cache_dir}")
+    else:
+        artifacts = prepare_single_block_artifact_in_memory(
+            model_name, block_idx, dataloader, device=dev, dataset=dataset or 'dataset',
+            seqlen=seqlen or 0, nsamples=nsamples or 0, seed=seed,
+        )
+
+    inputs_cache = artifacts['inputs_cache']
+    targets_cache = artifacts['targets_cache']
+    current_block = copy.deepcopy(artifacts['source_block']).float()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    linear_names = get_quantizable_linears(current_block)
+    attn_names = [n for n in linear_names if 'attn' in n.lower()]
+    mlp_names = [n for n in linear_names if n not in attn_names]
+    print(f'\nBlock {block_idx}: attn-mlp split progressive '
+          f'(attention: {attn_names}; mlp/other: {mlp_names})')
+
+    def _quantize_layer(lname):
+        H_current = collect_single_hessian(current_block, lname, inputs_cache, dev)
+        if H_current is None:
+            raise RuntimeError(f'Failed to collect current Hessian for {lname}')
+        cur_linear = _get_submodule(current_block, lname)
+        quant_weight = cur_linear.weight.data.detach().float().clone()
+        bias = cur_linear.bias.data.clone().float() if cur_linear.bias is not None else None
+        A, Y, Z = quantize_weight_to_bqq(
+            quant_weight.cpu(),
+            bit_width=bit_width, group_size=group_size, num_steps=num_steps,
+            rank_scale=rank_scale, seed=seed, device_id=device_id, H=H_current,
+            scale_refine=scale_refine, damping=damping, use_multibqq=use_multibqq,
+            compensation_mode=compensation_mode, ldlq_act_order=ldlq_act_order,
+            ldlq_act_order_score=ldlq_act_order_score, rank_alloc_mode=rank_alloc_mode,
+            ste_refine_steps=ste_refine_steps, ste_refine_lr=ste_refine_lr,
+            ste_refine_weight_decay=ste_refine_weight_decay,
+            ste_refine_binary_lr=ste_refine_binary_lr,
+            ste_refine_continuous_lr=ste_refine_continuous_lr,
+            ste_refine_log_interval=ste_refine_log_interval,
+            ste_refine_optimize_factors=(binary_lr != 0),
+            ste_refine_optimize_coeffs=True,
+            ste_refine_optimize_theta=not fix_theta,
+            ste_refine_optimize_beta=not fix_beta,
+            ste_refine_row_group_batch_size=ste_refine_row_group_batch_size,
+        )
+        # Freeze binary factors (BinaryQuadratic): only the continuous scale
+        # factors a,b,c,d stay trainable for the subsequent MLP fine-tuning.
+        replace_linear_in_block(current_block, lname, A, Y, Z, bias=bias, trainable_ste=False)
+        del H_current
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # --- Phase 1: quantize attention weights independently ---
+    print('\n[Phase 1] Quantizing attention weights (q/k/v/o) independently')
+    for lname in attn_names:
+        _quantize_layer(lname)
+        mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'MSE after {lname}')
+        print(f'  Block MSE after quantizing {lname}: {mse:.6f}')
+
+    # --- Phase 2: fine-tune MLP (FP) weights + continuous params (attn frozen binary) ---
+    if epochs > 0 and mlp_names:
+        print('\n[Phase 2] Fine-tuning MLP weights + continuous params (attention binary frozen)')
+        pre_opt_state = {k: v.cpu().clone() for k, v in current_block.state_dict().items()}
+        pre_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE before MLP tune')
+        optimize_block_params(
+            current_block, inputs_cache, targets_cache,
+            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+            optimizer_name=optimizer_name, momentum=momentum,
+            binary_lr=binary_lr, continuous_lr=continuous_lr, tune_batch_size=tune_batch_size,
+        )
+        tuned_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE after MLP tune')
+        if tuned_mse > pre_mse:
+            current_block.load_state_dict(pre_opt_state)
+            current_block.to(dev)
+            tuned_mse = pre_mse
+            print('  MLP fine-tuning diverged, reverted to pre-tuning state')
+        print(f'  Block MSE after MLP fine-tuning: {tuned_mse:.6f} (Δ={tuned_mse - pre_mse:+.6f})')
+    else:
+        print('\n[Phase 2] MLP fine-tuning skipped (epochs=0 or no MLP layers)')
+
+    # --- Phase 3: quantize the (fine-tuned) MLP weights ---
+    print('\n[Phase 3] Quantizing MLP weights')
+    for lname in mlp_names:
+        _quantize_layer(lname)
+        mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'MSE after {lname}')
+        print(f'  Block MSE after quantizing {lname}: {mse:.6f}')
+
+    save_path = Path(save_dir) / f'block_{block_idx}.pth'
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(current_block.cpu(), save_path, pickle_module=dill)
+
+    final_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='Final block MSE')
+    print(f'\n=== Block {block_idx} done (attn-mlp split) ===')
+    print(f'  Final MSE:   {final_mse:.6f}')
+    print(f'  Saved to: {save_path}')
+    return current_block
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -1547,10 +1714,11 @@ def main():
     parser.add_argument('--progressive', action='store_true',
                         help='Use a progressive quantization mode instead of loading layerwise results')
     parser.add_argument('--progressive_mode', type=str, default='patch',
-                        choices=['patch', 'closed-form-layer', 'layer-tune'],
+                        choices=['patch', 'closed-form-layer', 'layer-tune', 'attn-mlp'],
                         help='Progressive mode: patch = existing patch-wise alternating quantize/tune; '
                              'closed-form-layer = front-to-back layer quantization with closed-form recentering; '
-                             'layer-tune = front-to-back layer quantization of current float layers with block tuning after each layer')
+                             'layer-tune = front-to-back layer quantization of current float layers with block tuning after each layer; '
+                             'attn-mlp = quantize attention -> fine-tune MLP+continuous params -> quantize MLP')
     parser.add_argument('--layerwise_dir', type=str, default=None,
                         help='Directory containing layerwise quantization outputs. Defaults to the standard layerwise output path.')
     parser.add_argument('--refine_coeffs_only', action='store_true',
@@ -1700,6 +1868,48 @@ def main():
             quantize_block_progressive(**patch_kwargs,
                                        num_rounds=args.num_rounds,
                                        schedule=args.schedule)
+        elif args.progressive_mode == 'attn-mlp':
+            quantize_block_attn_mlp_split(
+                model_name=args.model_name,
+                block_idx=args.block_idx,
+                dataloader=train_loader,
+                bit_width=args.bit_width,
+                group_size=args.group_size,
+                num_steps=args.num_steps,
+                rank_scale=args.rank_scale,
+                seed=args.seed,
+                damping=args.damping,
+                epochs=args.epochs,
+                lr=args.lr,
+                max_grad_norm=args.max_grad_norm,
+                optimizer_name=args.optimizer,
+                momentum=args.momentum,
+                binary_lr=args.binary_lr,
+                continuous_lr=args.continuous_lr,
+                tune_batch_size=args.tune_batch_size,
+                scale_refine=not args.no_scale_refine,
+                fix_theta=args.fix_theta,
+                fix_beta=args.fix_beta,
+                device=args.device,
+                save_dir=args.save_dir,
+                io_cache_dir=io_cache_dir,
+                dataset=args.dataset,
+                seqlen=args.seqlen,
+                nsamples=args.nsamples,
+                use_disk_cache=not args.no_io_cache,
+                ste_refine_steps=args.ste_refine_steps,
+                ste_refine_lr=args.ste_refine_lr,
+                ste_refine_weight_decay=args.ste_refine_weight_decay,
+                ste_refine_binary_lr=args.ste_refine_binary_lr,
+                ste_refine_continuous_lr=args.ste_refine_continuous_lr,
+                ste_refine_log_interval=args.ste_refine_log_interval,
+                ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
+                use_multibqq=args.use_multibqq,
+                compensation_mode=args.compensation_mode,
+                ldlq_act_order=args.ldlq_act_order,
+                ldlq_act_order_score=args.ldlq_act_order_score,
+                rank_alloc_mode=args.rank_alloc_mode,
+            )
         else:
             quantize_block_progressive_closed_form(
                 model_name=args.model_name,
