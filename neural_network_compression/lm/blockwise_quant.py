@@ -1243,7 +1243,7 @@ def quantize_block_progressive(
             layer = _get_submodule(block, lname)
             print(f'  [{lname}] BQQ quantize full layer '
                   f'{tuple(layer.float_weight.shape)} → activating {len(ij_list)} patches')
-            A_all, Y_all, Z_all = quantize_weight_to_bqq(
+            A_all, Y_all, Z_all, _SU, _SV = quantize_weight_to_bqq(
                 layer.float_weight.data.clone(),
                 bit_width=bit_width,
                 group_size=group_size,
