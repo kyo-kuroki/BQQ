@@ -55,6 +55,68 @@ class BinaryQuadratic(nn.Module):
         return W
 
 
+_HADAMARD_FNS = None
+
+
+def _hadamard_transforms():
+    """Lazily import the (heavy) Hadamard transform tables, only when an
+    incoherence-processed layer is actually used."""
+    global _HADAMARD_FNS
+    if _HADAMARD_FNS is None:
+        try:
+            from .hadamard import matmul_hadU, matmul_hadUt
+        except ImportError:
+            from hadamard import matmul_hadU, matmul_hadUt
+        _HADAMARD_FNS = (matmul_hadU, matmul_hadUt)
+    return _HADAMARD_FNS
+
+
+class IncoherentBinaryQuadratic(BinaryQuadratic):
+    """BQQ layer whose stored weight lives in the incoherent (RHT) space.
+
+    At quantization time the weight was randomized-Hadamard transformed,
+    Wr = RHT_W(W, SU, SV), and BQQ-quantized in that space. This module stores the
+    BQQ factors of the transformed quantized weight Wr_q plus the sign vectors
+    SU (in-side) and SV (out-side), and applies the Hadamard transform to the input
+    and the inverse to the output so the effective linear map equals the
+    original-space quantized weight W_q = incoherence_process(Wr_q, SU, SV):
+
+        W_q = diag(SV) G_out  Wr_q  G_in^T diag(SU)
+        y = W_q x  =>  v = hadUt(x ⊙ SU);  w = v @ Wr_q^T;  y = hadU(w) ⊙ SV
+
+    where G_in / G_out are the (orthonormal) Hadamard transforms applied by
+    matmul_hadU / matmul_hadUt. This matches QUIP-Sharp's incoherent inference.
+    """
+
+    def __init__(self, Y, Z, A, SU, SV, bias=None):
+        super().__init__(Y, Z, A, bias=bias)
+        self.register_buffer("SU", SU.detach().float().reshape(-1))  # [in_features]
+        self.register_buffer("SV", SV.detach().float().reshape(-1))  # [out_features]
+
+    def forward(self, X):
+        matmul_hadU, matmul_hadUt = _hadamard_transforms()
+        dtype = X.dtype
+        device = self.Y.device
+        Wr_q = self.get_weight(dtype=dtype)                      # transformed-space weight [out, in]
+        SU = self.SU.to(device=device, dtype=dtype)
+        SV = self.SV.to(device=device, dtype=dtype)
+        Xt = matmul_hadUt(X.to(device) * SU)                     # [..., in]
+        out = Xt @ Wr_q.T                                        # [..., out]
+        out = matmul_hadU(out) * SV
+        if self.bias is not None:
+            out = out + self.bias.type(dtype).to(device)
+        return out
+
+    def get_dense_weight(self, dtype=torch.float32):
+        """Return the effective original-space quantized weight W_q [out, in]."""
+        matmul_hadU, _ = _hadamard_transforms()
+        Wr_q = self.get_weight(dtype=dtype)
+        SU = self.SU.to(device=Wr_q.device, dtype=dtype)
+        SV = self.SV.to(device=Wr_q.device, dtype=dtype)
+        # incoherence_process(Wr_q, SU, SV)
+        return (matmul_hadU((matmul_hadU(Wr_q) * SU).T) * SV).T
+
+
 class BinarySTE01(Function):
     """Binary {0,1} quantization with learnable threshold and sigmoid STE."""
 
