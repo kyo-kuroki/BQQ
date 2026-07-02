@@ -37,13 +37,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from quantizer import BinaryQuadraticQuantization
 
 try:
-    from .src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from .src.build_bqq_model import BinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from .src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from .src.datautils import get_loaders
     from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
     from .layerwise_quant import layerwise_quantize_block
 except ImportError:
-    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from neural_network_compression.lm.src.datautils import get_loaders
     from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
@@ -405,6 +405,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             scale_refine=True, damping=1e-6,
                             use_multibqq=True,
                             compensation_mode='ldlq',
+                            use_incoherent=False,
                             ldlq_act_order=False,
                             ldlq_act_order_score='maxdiag',
                             rank_alloc_mode='none',
@@ -423,10 +424,36 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
 
     If H is provided, uses intra-layer Hessian-aware BQQ (column-wise compensation).
     Otherwise falls back to standard BQQ.
+    If use_incoherent is True and H is provided, applies a randomized Hadamard transform
+    (RHT) to W and H before quantization and returns (A, Y, Z, SU, SV).
     """
+    SU = SV = None
+    quant_weight = weight
+    quant_H = H
+
+    if use_incoherent and H is not None:
+        import sys as _sys
+        import os as _os
+        _mc = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                            '..', '..', 'matrix_compression')
+        if _mc not in _sys.path:
+            _sys.path.insert(0, _mc)
+        from incoherence import RHT_H, RHT_W
+        dev = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+        Wd = weight.to(dev).float()
+        Hd = H.to(dev).float()
+        m, n = Wd.shape
+        g = torch.Generator().manual_seed(seed + 99999)
+        SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(dev)
+        SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().float().to(dev)
+        quant_H = RHT_H(Hd, SU).detach().cpu()
+        quant_weight = RHT_W(Wd, SU, SV).detach().cpu()
+        SU = SU.cpu()
+        SV = SV.cpu()
+
     with tempfile.TemporaryDirectory() as tmpdir:
         consolidated_path = os.path.join(tmpdir, 'temp.pth')
-        quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
+        quantizer = BinaryQuadraticQuantization(quant_weight, rank_scale=rank_scale)
 
         kwargs = dict(
             max_patch_size=group_size,
@@ -436,8 +463,8 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
             seed=seed,
             main_gpu_id=device_id,
         )
-        if H is not None:
-            kwargs.update(H=H, hessian_mode='intra-layer-ste',
+        if quant_H is not None:
+            kwargs.update(H=quant_H, hessian_mode='intra-layer-ste',
                           scale_refine=scale_refine, damping=damping,
                           use_multibqq=use_multibqq,
                           compensation_mode=compensation_mode,
@@ -460,7 +487,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
         patches = torch.load(consolidated_path, weights_only=False, map_location='cpu')
 
     A, Y, Z = get_bqq_matrices(patches, bit_width)
-    return A, Y, Z
+    return A, Y, Z, SU, SV
 
 
 
@@ -596,9 +623,16 @@ def _set_submodule(module, dotted_name, new_child):
     setattr(parent, parts[-1], new_child)
 
 
-def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True):
-    """Replace a specific Linear in block with a BQQ module."""
-    if trainable_ste:
+def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True, SU=None, SV=None):
+    """Replace a specific Linear in block with a BQQ module.
+
+    If SU and SV are provided the layer is wrapped as IncoherentBinaryQuadratic
+    (factors encode the weight in RHT space; forward applies the inverse Hadamard
+    transform to recover the original-space weight-times-input product).
+    """
+    if SU is not None and SV is not None:
+        bqq_module = IncoherentBinaryQuadratic(Y, Z, A, SU=SU, SV=SV, bias=bias)
+    elif trainable_ste:
         bqq_module = TrainableSTEBinaryQuadratic(
             Y, Z, A, bias=bias,
             optimize_factors=optimize_factors,
@@ -1307,6 +1341,7 @@ def quantize_block_progressive_closed_form(
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    use_incoherent=False,
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
@@ -1410,7 +1445,7 @@ def quantize_block_progressive_closed_form(
             quant_weight = current_linear.weight.data.detach().float().clone()
             bias = current_linear.bias.data.clone().float() if current_linear.bias is not None else None
 
-        A, Y, Z = quantize_weight_to_bqq(
+        A, Y, Z, SU, SV = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width,
             group_size=group_size,
@@ -1423,6 +1458,7 @@ def quantize_block_progressive_closed_form(
             damping=damping,
             use_multibqq=use_multibqq,
             compensation_mode=compensation_mode,
+            use_incoherent=use_incoherent,
             ldlq_act_order=ldlq_act_order,
             ldlq_act_order_score=ldlq_act_order_score,
             rank_alloc_mode=rank_alloc_mode,
@@ -1450,6 +1486,8 @@ def quantize_block_progressive_closed_form(
             optimize_coeffs=True,
             optimize_theta=not fix_theta,
             optimize_beta=not fix_beta,
+            SU=SU,
+            SV=SV,
         )
         del H_current
         if use_closed_form:
@@ -1538,6 +1576,7 @@ def quantize_block_attn_mlp_split(
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    use_incoherent=False,
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
@@ -1596,12 +1635,13 @@ def quantize_block_attn_mlp_split(
         cur_linear = _get_submodule(current_block, lname)
         quant_weight = cur_linear.weight.data.detach().float().clone()
         bias = cur_linear.bias.data.clone().float() if cur_linear.bias is not None else None
-        A, Y, Z = quantize_weight_to_bqq(
+        A, Y, Z, SU, SV = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width, group_size=group_size, num_steps=num_steps,
             rank_scale=rank_scale, seed=seed, device_id=device_id, H=H_current,
             scale_refine=scale_refine, damping=damping, use_multibqq=use_multibqq,
-            compensation_mode=compensation_mode, ldlq_act_order=ldlq_act_order,
+            compensation_mode=compensation_mode, use_incoherent=use_incoherent,
+            ldlq_act_order=ldlq_act_order,
             ldlq_act_order_score=ldlq_act_order_score, rank_alloc_mode=rank_alloc_mode,
             ste_refine_steps=ste_refine_steps, ste_refine_lr=ste_refine_lr,
             ste_refine_weight_decay=ste_refine_weight_decay,
@@ -1616,7 +1656,8 @@ def quantize_block_attn_mlp_split(
         )
         # Freeze binary factors (BinaryQuadratic): only the continuous scale
         # factors a,b,c,d stay trainable for the subsequent MLP fine-tuning.
-        replace_linear_in_block(current_block, lname, A, Y, Z, bias=bias, trainable_ste=False)
+        replace_linear_in_block(current_block, lname, A, Y, Z, bias=bias,
+                                trainable_ste=False, SU=SU, SV=SV)
         del H_current
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1743,6 +1784,8 @@ def main():
                         help='Disable joint multibqq optimization and quantize bits sequentially')
     parser.add_argument('--compensation_mode', type=str, default='ldlq', choices=['gptq', 'ldlq', 'none'],
                         help='Column compensation mode for Hessian-aware BQQ')
+    parser.add_argument('--use_incoherent', action='store_true', default=False,
+                        help='Apply randomized Hadamard (RHT) incoherence transform before BQQ quantization')
     parser.add_argument('--ldlq_act_order', action='store_true', default=False,
                         help='Enable LDLQ activation-order (reorder column groups by score before quantizing)')
     parser.add_argument('--ldlq_act_order_score', type=str, default='maxdiag', choices=['maxdiag', 'trace', 'static'],
@@ -1906,6 +1949,7 @@ def main():
                 ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
                 use_multibqq=args.use_multibqq,
                 compensation_mode=args.compensation_mode,
+                use_incoherent=args.use_incoherent,
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,
@@ -1950,6 +1994,7 @@ def main():
                 ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
                 use_multibqq=args.use_multibqq,
                 compensation_mode=args.compensation_mode,
+                use_incoherent=args.use_incoherent,
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,

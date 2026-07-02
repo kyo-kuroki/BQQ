@@ -46,6 +46,7 @@ COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
 LDLQ_ACT_ORDER="${LDLQ_ACT_ORDER:-0}"
 LDLQ_ACT_ORDER_SCORE="${LDLQ_ACT_ORDER_SCORE:-maxdiag}"
 RANK_ALLOC_MODE="${RANK_ALLOC_MODE:-none}"
+INCOHERENT="${INCOHERENT:-0}"
 STE_REFINE="${STE_REFINE:-0}"
 STE_REFINE_STEPS="${STE_REFINE_STEPS:-200}"
 STE_REFINE_WEIGHT_DECAY="${STE_REFINE_WEIGHT_DECAY:-0.0}"
@@ -176,6 +177,9 @@ run_one_block() {
   fi
   if [[ "${PROGRESSIVE}" == "1" ]]; then
     blockwise_cmd+=(--progressive --progressive_mode "${PROGRESSIVE_MODE}")
+  fi
+  if [[ "${INCOHERENT}" == "1" ]]; then
+    blockwise_cmd+=(--use_incoherent)
   fi
   blockwise_cmd+=("$@")
   "${blockwise_cmd[@]}"
