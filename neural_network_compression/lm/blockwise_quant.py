@@ -1580,6 +1580,7 @@ def quantize_block_attn_mlp_split(
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
+    tune_after_quantize=True,
 ):
     """Attention-then-MLP blockwise quantization.
 
@@ -1697,6 +1698,27 @@ def quantize_block_attn_mlp_split(
         mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc=f'MSE after {lname}')
         print(f'  Block MSE after quantizing {lname}: {mse:.6f}')
 
+    # --- Phase 4: fine-tune continuous params only (all binary weights frozen) ---
+    if tune_after_quantize and epochs > 0:
+        print('\n[Phase 4] Fine-tuning continuous params only (all binary weights frozen)')
+        pre_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE before final tune')
+        pre_opt_state = {k: v.cpu().clone() for k, v in current_block.state_dict().items()}
+        optimize_block_params(
+            current_block, inputs_cache, targets_cache,
+            epochs=epochs, lr=lr, max_grad_norm=max_grad_norm, device=dev,
+            optimizer_name=optimizer_name, momentum=momentum,
+            binary_lr=0.0, continuous_lr=continuous_lr, tune_batch_size=tune_batch_size,
+        )
+        post_mse = compute_block_mse(current_block, inputs_cache, targets_cache, dev, desc='MSE after final tune')
+        if post_mse > pre_mse:
+            current_block.load_state_dict(pre_opt_state)
+            current_block.to(dev)
+            post_mse = pre_mse
+            print('  Final fine-tuning diverged, reverted to pre-tuning state')
+        print(f'  Block MSE after final tune: {post_mse:.6f} (Δ={post_mse - pre_mse:+.6f})')
+    else:
+        print('\n[Phase 4] Final fine-tuning skipped (tune_after_quantize=False or epochs=0)')
+
     save_path = Path(save_dir) / f'block_{block_idx}.pth'
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(current_block.cpu(), save_path, pickle_module=dill)
@@ -1786,6 +1808,8 @@ def main():
                         help='Column compensation mode for Hessian-aware BQQ')
     parser.add_argument('--use_incoherent', action='store_true', default=False,
                         help='Apply randomized Hadamard (RHT) incoherence transform before BQQ quantization')
+    parser.add_argument('--no_tune_after_quantize', action='store_true', default=False,
+                        help='Skip Phase 4 final continuous-param fine-tune after all weights are quantized (attn-mlp mode only)')
     parser.add_argument('--ldlq_act_order', action='store_true', default=False,
                         help='Enable LDLQ activation-order (reorder column groups by score before quantizing)')
     parser.add_argument('--ldlq_act_order_score', type=str, default='maxdiag', choices=['maxdiag', 'trace', 'static'],
@@ -1953,6 +1977,7 @@ def main():
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,
+                tune_after_quantize=not args.no_tune_after_quantize,
             )
         else:
             quantize_block_progressive_closed_form(
