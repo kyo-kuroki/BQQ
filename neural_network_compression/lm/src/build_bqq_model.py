@@ -134,19 +134,24 @@ def dequantize_bqq_model(model: nn.Module, dtype: torch.dtype = torch.bfloat16) 
     Safe to call on non-BQQ models (no-op if no BQQ layers are found).
     """
     for child_name, child_module in list(model.named_children()):
-        if isinstance(child_module, (BinaryQuadratic, PackedBinaryQuadratic, TrainableSTEBinaryQuadratic)):
-            W = child_module.get_weight(dtype=dtype)          # [out, in]
-            has_bias = child_module.bias is not None
-            linear = nn.Linear(
-                W.shape[1], W.shape[0], bias=has_bias,
-                device=W.device, dtype=dtype,
-            )
-            linear.weight = nn.Parameter(W)
-            if has_bias:
-                linear.bias = nn.Parameter(child_module.bias.to(dtype=dtype))
-            setattr(model, child_name, linear)
+        if isinstance(child_module, IncoherentBinaryQuadratic):
+            # Must check before BinaryQuadratic (parent class): get_weight() returns
+            # RHT-space weight W_r; get_dense_weight() applies inverse-RHT to recover W.
+            W = child_module.get_dense_weight(dtype=dtype)
+        elif isinstance(child_module, (BinaryQuadratic, PackedBinaryQuadratic, TrainableSTEBinaryQuadratic)):
+            W = child_module.get_weight(dtype=dtype)
         else:
             dequantize_bqq_model(child_module, dtype=dtype)
+            continue
+        has_bias = child_module.bias is not None
+        linear = nn.Linear(
+            W.shape[1], W.shape[0], bias=has_bias,
+            device=W.device, dtype=dtype,
+        )
+        linear.weight = nn.Parameter(W)
+        if has_bias:
+            linear.bias = nn.Parameter(child_module.bias.to(dtype=dtype))
+        setattr(model, child_name, linear)
     return model
 
 
