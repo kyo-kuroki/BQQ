@@ -623,6 +623,94 @@ class PartialBQQLinear(nn.Module):
         return bqq
 
 
+class TrainableIncoherentSTEBinaryQuadratic(TrainableSTEBinaryQuadratic):
+    """TrainableSTEBinaryQuadratic that keeps the RHT transform (SU/SV).
+
+    The weight is stored and optimized in the incoherent (RHT) space, exactly
+    like IncoherentBinaryQuadratic, but the binary factors Y/Z are continuous
+    STE parameters so that continuous-param fine-tuning can update a/b/c/d.
+    """
+
+    def __init__(self, Y, Z, A, SU, SV, bias=None, **ste_kwargs):
+        super().__init__(Y, Z, A, bias=bias, **ste_kwargs)
+        self.register_buffer("SU", SU.detach().float().reshape(-1))
+        self.register_buffer("SV", SV.detach().float().reshape(-1))
+
+    @classmethod
+    def from_incoherent_binaryquadratic(
+        cls,
+        layer: 'IncoherentBinaryQuadratic',
+        *,
+        optimize_factors: bool = True,
+        optimize_coeffs: bool = True,
+        optimize_theta: bool = True,
+        optimize_beta: bool = True,
+        init_theta: float = 0.5,
+    ) -> 'TrainableIncoherentSTEBinaryQuadratic':
+        d_terms = torch.zeros(
+            layer.bit_width, layer.row_width, layer.col_width, 1,
+            dtype=layer.d.dtype, device=layer.d.device,
+        )
+        d_terms[0] = layer.d.detach()[..., 0, 0].unsqueeze(-1)
+        A = torch.cat([
+            layer.a.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            layer.b.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            layer.c.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+            d_terms,
+        ], dim=-1)
+        bias = layer.bias.detach().clone() if layer.bias is not None else None
+        return cls(
+            layer.Y.detach().float(),
+            layer.Z.detach().float(),
+            A,
+            SU=layer.SU.detach().clone(),
+            SV=layer.SV.detach().clone(),
+            bias=bias,
+            optimize_factors=optimize_factors,
+            optimize_coeffs=optimize_coeffs,
+            optimize_theta=optimize_theta,
+            optimize_beta=optimize_beta,
+            init_theta=init_theta,
+        )
+
+    def forward(self, X):
+        matmul_hadU, matmul_hadUt = _hadamard_transforms()
+        dtype = X.dtype
+        device = self.Y_fp.device
+        Wr_q = self.get_weight(dtype=dtype)
+        SU = self.SU.to(device=device, dtype=dtype)
+        SV = self.SV.to(device=device, dtype=dtype)
+        Xt = matmul_hadUt(X.to(device) * SU)
+        out = Xt @ Wr_q.T
+        out = matmul_hadU(out) * SV
+        if self.bias is not None:
+            out = out + self.bias.to(dtype=dtype, device=device)
+        return out
+
+    def to_incoherent_binaryquadratic(self) -> 'IncoherentBinaryQuadratic':
+        with torch.no_grad():
+            Y_q = (self.Y_fp > self.Y_theta).bool()
+            Z_q = (self.Z_fp > self.Z_theta).bool()
+            d_terms = torch.zeros(
+                self.bit_width, self.row_width, self.col_width, 1,
+                dtype=self.d.dtype, device=self.d.device,
+            )
+            d_terms[0] = self.d.detach()[..., 0, 0].unsqueeze(-1)
+            A = torch.cat([
+                self.a.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                self.b.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                self.c.detach().squeeze(-1).squeeze(-1).unsqueeze(-1),
+                d_terms,
+            ], dim=-1)
+            bias = self.bias.detach().clone() if self.bias is not None else None
+            return IncoherentBinaryQuadratic(
+                Y_q.float(), Z_q.float(), A,
+                SU=self.SU.detach().clone(),
+                SV=self.SV.detach().clone(),
+                bias=bias,
+            )
+
+
 def convert_binaryquadratic_model_to_ste(
     model: nn.Module,
     *,
@@ -632,9 +720,23 @@ def convert_binaryquadratic_model_to_ste(
     optimize_beta: bool = True,
     init_theta: float = 0.5,
 ) -> nn.Module:
-    """Recursively replace BinaryQuadratic layers with TrainableSTEBinaryQuadratic."""
+    """Recursively replace BinaryQuadratic/IncoherentBinaryQuadratic with trainable STE variants."""
     for name, module in list(model.named_children()):
-        if isinstance(module, BinaryQuadratic):
+        if isinstance(module, IncoherentBinaryQuadratic):
+            # Must check before BinaryQuadratic (parent class).
+            setattr(
+                model,
+                name,
+                TrainableIncoherentSTEBinaryQuadratic.from_incoherent_binaryquadratic(
+                    module,
+                    optimize_factors=optimize_factors,
+                    optimize_coeffs=optimize_coeffs,
+                    optimize_theta=optimize_theta,
+                    optimize_beta=optimize_beta,
+                    init_theta=init_theta,
+                ),
+            )
+        elif isinstance(module, BinaryQuadratic):
             setattr(
                 model,
                 name,
@@ -660,9 +762,12 @@ def convert_binaryquadratic_model_to_ste(
 
 
 def convert_ste_model_to_binaryquadratic(model: nn.Module) -> nn.Module:
-    """Recursively replace TrainableSTEBinaryQuadratic layers with BinaryQuadratic."""
+    """Recursively replace trainable STE layers with their frozen BQQ counterparts."""
     for name, module in list(model.named_children()):
-        if isinstance(module, TrainableSTEBinaryQuadratic):
+        if isinstance(module, TrainableIncoherentSTEBinaryQuadratic):
+            # Must check before TrainableSTEBinaryQuadratic (parent class).
+            setattr(model, name, module.to_incoherent_binaryquadratic())
+        elif isinstance(module, TrainableSTEBinaryQuadratic):
             setattr(model, name, module.to_binaryquadratic())
         else:
             convert_ste_model_to_binaryquadratic(module)

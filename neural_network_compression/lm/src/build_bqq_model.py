@@ -71,6 +71,7 @@ from neural_network_compression.bqqkernel.bqq_modules import (  # noqa: F401
     PackedBinaryQuadratic,
     PartialBQQLinear,
     TrainableSTEBinaryQuadratic,
+    TrainableIncoherentSTEBinaryQuadratic,
     convert_binaryquadratic_model_to_ste,
     convert_ste_model_to_binaryquadratic,
     get_matrices,
