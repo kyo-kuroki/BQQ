@@ -166,7 +166,8 @@ def train(
     test_dataset,
     output_dir: str = "./output_sft",
     num_train_epochs: int = 1,
-    learning_rate: float = 2e-5,
+    continuous_learning_rate: float = 1e-6,
+    binary_learning_rate: float = 0.0,
     gradient_accumulation_steps: int = 4,
     max_seq_length: int = 512,
     teacher_model_name: Optional[str] = None,
@@ -177,8 +178,6 @@ def train(
     optimize_bqq_coeffs: bool = True,
     optimize_bqq_theta: bool = True,
     optimize_bqq_beta: bool = True,
-    binary_learning_rate: Optional[float] = None,
-    continuous_learning_rate: Optional[float] = None,
 ):
     model = torch.load(model_path, weights_only=False, map_location="cpu", pickle_module=dill)
     model = convert_binaryquadratic_model_to_ste(
@@ -194,7 +193,7 @@ def train(
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        learning_rate=learning_rate,
+        learning_rate=continuous_learning_rate,
         num_train_epochs=num_train_epochs,
         logging_steps=50,
         save_strategy="epoch",
@@ -275,11 +274,10 @@ def main():
     parser.add_argument("--num_steps", type=int, default=50000)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--binary_learning_rate", type=float, default=None,
-                        help="Learning rate for trainable binary factors Y/Z during fine-tuning")
-    parser.add_argument("--continuous_learning_rate", type=float, default=None,
-                        help="Learning rate for continuous parameters during fine-tuning")
+    parser.add_argument("--continuous_lr", type=float, default=1e-6,
+                        help="Learning rate for continuous parameters (a/b/c/d, LayerNorm)")
+    parser.add_argument("--binary_lr", type=float, default=0.0,
+                        help="Learning rate for binary factors Y/Z (0 to freeze)")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=512)
     # Distillation
@@ -337,7 +335,8 @@ def main():
         test_dataset=test_dataset,
         output_dir=str(output_dir),
         num_train_epochs=args.num_train_epochs,
-        learning_rate=args.learning_rate,
+        continuous_learning_rate=args.continuous_lr,
+        binary_learning_rate=args.binary_lr,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_length=args.max_seq_length,
         teacher_model_name=args.teacher_model_name,
@@ -348,8 +347,6 @@ def main():
         optimize_bqq_coeffs=True,
         optimize_bqq_theta=not args.fix_theta,
         optimize_bqq_beta=not args.fix_beta,
-        binary_learning_rate=args.binary_learning_rate,
-        continuous_learning_rate=args.continuous_learning_rate,
     )
 
 
