@@ -171,6 +171,7 @@ def train(
     gradient_accumulation_steps: int = 4,
     max_seq_length: int = 512,
     optim: str = "adamw_torch",
+    weight_decay: float = 0.0,
     teacher_model_name: Optional[str] = None,
     ce_alpha: float = 1.0,
     kl_alpha: float = 1.0,
@@ -203,6 +204,7 @@ def train(
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
         optim=optim,
+        weight_decay=weight_decay,
         report_to="none",
         bf16=False,
         fp16=False,
@@ -283,7 +285,9 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=512)
     parser.add_argument("--optim", type=str, default="adamw_torch",
-                        help="Optimizer: adamw_torch, adam_torch, sgd, etc. (HuggingFace optim names)")
+                        help="Optimizer: adamw_torch, sgd, etc. (HuggingFace optim names)")
+    parser.add_argument("--weight_decay", type=float, default=0.0,
+                        help="Weight decay (0.0 = plain Adam behavior)")
     # Distillation
     parser.add_argument("--teacher_model_name", type=str, default=None,
                         help="HuggingFace model name for KL distillation teacher. "
@@ -344,6 +348,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_length=args.max_seq_length,
         optim=args.optim,
+        weight_decay=args.weight_decay,
         teacher_model_name=args.teacher_model_name,
         ce_alpha=args.ce_alpha,
         kl_alpha=args.kl_alpha,
