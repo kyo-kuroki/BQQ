@@ -204,6 +204,7 @@ def train(
         warmup_ratio=0.03,
         gradient_checkpointing=True,
         lr_scheduler_type="cosine",
+        max_grad_norm=1.0,
         optim=optim,
         weight_decay=weight_decay,
         report_to="none",
