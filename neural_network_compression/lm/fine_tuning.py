@@ -168,6 +168,7 @@ def train(
     num_train_epochs: int = 1,
     continuous_learning_rate: float = 1e-6,
     binary_learning_rate: float = 0.0,
+    train_batch_size: int = 1,
     gradient_accumulation_steps: int = 4,
     max_seq_length: int = 512,
     optim: str = "adamw_torch",
@@ -192,8 +193,8 @@ def train(
 
     training_args = SFTConfig(
         output_dir=output_dir,
-        per_device_train_batch_size=1,
-        per_device_eval_batch_size=1,
+        per_device_train_batch_size=train_batch_size,
+        per_device_eval_batch_size=train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=continuous_learning_rate,
         num_train_epochs=num_train_epochs,
@@ -278,6 +279,8 @@ def main():
     parser.add_argument("--num_steps", type=int, default=50000)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--train_batch_size", type=int, default=1,
+                        help="Per-device training batch size")
     parser.add_argument("--continuous_lr", type=float, default=1e-6,
                         help="Learning rate for continuous parameters (a/b/c/d, LayerNorm)")
     parser.add_argument("--binary_lr", type=float, default=0.0,
@@ -345,6 +348,7 @@ def main():
         num_train_epochs=args.num_train_epochs,
         continuous_learning_rate=args.continuous_lr,
         binary_learning_rate=args.binary_lr,
+        train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_seq_length=args.max_seq_length,
         optim=args.optim,
