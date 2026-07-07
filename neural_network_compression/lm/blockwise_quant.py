@@ -666,6 +666,71 @@ def run_block_forward(block, inp, device):
     return output[0] if isinstance(output, tuple) else output
 
 
+def _same_tensor(a, b):
+    return a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b)
+
+
+def _batch_cached_values(values, *, hidden_batch_sizes, key_path='value'):
+    """Batch cached block inputs along dim 0 when safe.
+
+    Most decoder block kwargs have batch as dim 0.  Some values may be
+    broadcast-style constants without a batch dimension; those are reused only
+    if all cached samples are identical.
+    """
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        if all(isinstance(v, torch.Tensor) and v.shape == first.shape for v in values):
+            if first.dim() > 0 and all(v.shape[0] == bs for v, bs in zip(values, hidden_batch_sizes)):
+                return torch.cat(values, dim=0)
+            if all(_same_tensor(first, v) for v in values[1:]):
+                return first
+        raise ValueError(f'Cannot batch cached tensor at {key_path}: incompatible shapes')
+    if isinstance(first, tuple):
+        if not all(isinstance(v, tuple) and len(v) == len(first) for v in values):
+            raise ValueError(f'Cannot batch cached tuple at {key_path}: incompatible structure')
+        return tuple(
+            _batch_cached_values([v[i] for v in values],
+                                 hidden_batch_sizes=hidden_batch_sizes,
+                                 key_path=f'{key_path}[{i}]')
+            for i in range(len(first))
+        )
+    if isinstance(first, list):
+        if not all(isinstance(v, list) and len(v) == len(first) for v in values):
+            raise ValueError(f'Cannot batch cached list at {key_path}: incompatible structure')
+        return [
+            _batch_cached_values([v[i] for v in values],
+                                 hidden_batch_sizes=hidden_batch_sizes,
+                                 key_path=f'{key_path}[{i}]')
+            for i in range(len(first))
+        ]
+    if all(v == first for v in values[1:]):
+        return first
+    raise ValueError(f'Cannot batch cached value at {key_path}: incompatible values')
+
+
+def make_block_batch(inputs, targets):
+    """Combine cached samples into one block replay batch."""
+    if not inputs:
+        raise ValueError('Cannot batch an empty input list')
+    keys = set(inputs[0])
+    if not all(set(inp) == keys for inp in inputs):
+        raise ValueError('Cannot batch cached inputs with different keys')
+    hidden_batch_sizes = [inp['hidden_states'].shape[0] for inp in inputs]
+    batched = {}
+    for key in inputs[0]:
+        batched[key] = _batch_cached_values(
+            [inp[key] for inp in inputs],
+            hidden_batch_sizes=hidden_batch_sizes,
+            key_path=key,
+        )
+    batched_target = _batch_cached_values(
+        targets,
+        hidden_batch_sizes=hidden_batch_sizes,
+        key_path='target',
+    )
+    return batched, batched_target
+
+
 def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None):
     """Compute mean block output MSE over all cached samples."""
     block.to(device).eval()
@@ -682,7 +747,7 @@ def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None):
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
                           epochs, lr, device, max_grad_norm=1.0, optimizer_name='adamw', momentum=0.0,
-                          binary_lr=None, continuous_lr=None, tune_batch_size=1):
+                          binary_lr=None, continuous_lr=None, tune_batch_size=16):
     """
     Optimize all trainable parameters in block to minimize
     ||block(cached_input) - pretrained_output||^2.
@@ -728,6 +793,14 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
     best_state = None
     n = len(inputs_cache)
     acc = max(1, tune_batch_size)
+    use_batched_replay = acc > 1
+    if use_batched_replay:
+        try:
+            make_block_batch(inputs_cache[:min(acc, n)], targets_cache[:min(acc, n)])
+            print(f'    Using true batched block replay (tune_batch_size={acc})')
+        except ValueError as exc:
+            print(f'    [WARN] Batched block replay unavailable; using sequential grad accumulation: {exc}')
+            use_batched_replay = False
 
     # Checkpoint every CKPT_WINDOW samples (finer than per-epoch).
     # This catches the best parameter state within an epoch, not just at
@@ -741,23 +814,71 @@ def optimize_block_params(block, inputs_cache, targets_cache, *,
 
     for epoch in tqdm(range(epochs), desc='Blockwise optimization', unit='epoch'):
         optimizer.zero_grad()
-        for step, (inp, target) in enumerate(zip(inputs_cache, targets_cache)):
-            with torch.enable_grad():
-                output = run_block_forward(block, inp, device)
-                target_hs = target.to(device)
-                # Scale loss so the effective gradient equals the mean over the mini-batch
-                loss = ((output - target_hs) ** 2).mean() / acc
-                loss.backward()
-            window_loss += loss.item() * acc
-            window_n += 1
-            global_sample += 1
+        if use_batched_replay:
+            step_ranges = [(start, min(start + acc, n)) for start in range(0, n, acc)]
+            for start, end in step_ranges:
+                batch_inputs = inputs_cache[start:end]
+                batch_targets = targets_cache[start:end]
+                batch_n = end - start
+                try:
+                    batched_inp, batched_target = make_block_batch(batch_inputs, batch_targets)
+                    with torch.enable_grad():
+                        output = run_block_forward(block, batched_inp, device)
+                        target_hs = batched_target.to(device)
+                        loss = ((output - target_hs) ** 2).mean()
+                        loss.backward()
+                except ValueError as exc:
+                    print(f'    [WARN] Falling back to sequential grad accumulation: {exc}')
+                    use_batched_replay = False
+                    optimizer.zero_grad()
+                    break
 
-            is_last = (step == n - 1)
-            if (step + 1) % acc == 0 or is_last:
                 if max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad()
+
+                window_loss += loss.item() * batch_n
+                window_n += batch_n
+                global_sample += batch_n
+                is_last = (end == n)
+
+                if global_sample % CKPT_WINDOW == 0 or is_last:
+                    window_avg = window_loss / window_n
+                    ckpt_idx += 1
+                    is_best = window_avg < best_mse
+                    if is_best:
+                        best_mse = window_avg
+                        best_state = {k: v.cpu().clone() for k, v in block.state_dict().items()}
+                    print(f'    Ckpt {ckpt_idx}/{total_ckpts} (ep{epoch + 1}, s{global_sample}): '
+                          f'loss={window_avg:.6f}{" *" if is_best else ""}')
+                    window_loss = 0.0
+                    window_n = 0
+            if use_batched_replay:
+                continue
+
+        for start in range(0, n, acc):
+            end = min(start + acc, n)
+            batch_n = end - start
+            batch_loss = 0.0
+            for inp, target in zip(inputs_cache[start:end], targets_cache[start:end]):
+                with torch.enable_grad():
+                    output = run_block_forward(block, inp, device)
+                    target_hs = target.to(device)
+                    # Scale by the actual microbatch size, including the final remainder.
+                    loss = ((output - target_hs) ** 2).mean() / batch_n
+                    loss.backward()
+                batch_loss += loss.item() * batch_n
+
+            is_last = (end == n)
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            window_loss += batch_loss
+            window_n += batch_n
+            global_sample += batch_n
 
             if global_sample % CKPT_WINDOW == 0 or is_last:
                 window_avg = window_loss / window_n
@@ -926,7 +1047,7 @@ def quantize_block(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
-    tune_batch_size=1,
+    tune_batch_size=16,
     use_disk_cache=True,
     ste_refine_steps=0,
     ste_refine_lr=1e-3,
@@ -1101,6 +1222,7 @@ def quantize_block_progressive(
     epochs,
     lr,
     max_grad_norm=1.0,
+    tune_batch_size=16,
     num_rounds=4,
     schedule='geometric',
     device,
@@ -1319,7 +1441,7 @@ def quantize_block_progressive_closed_form(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
-    tune_batch_size=1,
+    tune_batch_size=16,
     tune_after_each_layer=False,
     use_closed_form=True,
     scale_refine=True,
@@ -1556,7 +1678,7 @@ def quantize_block_attn_mlp_split(
     momentum=0.0,
     binary_lr=None,
     continuous_lr=None,
-    tune_batch_size=1,
+    tune_batch_size=16,
     scale_refine=True,
     fix_theta=False,
     fix_beta=False,
@@ -1747,7 +1869,7 @@ def finetune_block_continuous_params(
     max_grad_norm=1.0,
     optimizer_name='adamw',
     momentum=0.0,
-    tune_batch_size=1,
+    tune_batch_size=16,
     device,
     io_cache_dir=None,
     dataset=None,
@@ -1861,7 +1983,7 @@ def main():
                         help='Momentum used when --optimizer sgd')
     parser.add_argument('--max_grad_norm', type=float, default=1.0,
                         help='Max gradient norm for clipping (0 to disable)')
-    parser.add_argument('--tune_batch_size', type=int, default=8,
+    parser.add_argument('--tune_batch_size', type=int, default=16,
                         help='Number of calibration samples per optimizer step during block tuning')
 
     # Mode
