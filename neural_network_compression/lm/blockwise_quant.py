@@ -731,18 +731,54 @@ def make_block_batch(inputs, targets):
     return batched, batched_target
 
 
-def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None):
+def compute_block_mse(block, inputs_cache, targets_cache, device, *, desc=None, batch_size=16):
     """Compute mean block output MSE over all cached samples."""
     block.to(device).eval()
     total_mse = 0.0
-    iterator = zip(inputs_cache, targets_cache)
+    total_n = 0
+    n = len(inputs_cache)
+    batch_size = max(1, int(batch_size))
+    use_batched_replay = batch_size > 1
+    if use_batched_replay:
+        try:
+            make_block_batch(
+                inputs_cache[:min(batch_size, n)],
+                targets_cache[:min(batch_size, n)],
+            )
+        except ValueError:
+            use_batched_replay = False
+
+    iterator = range(0, n, batch_size) if use_batched_replay else range(n)
     if desc is not None:
-        iterator = tqdm(iterator, total=len(inputs_cache), desc=desc, unit='sample', leave=False)
+        total = (n + batch_size - 1) // batch_size if use_batched_replay else n
+        unit = 'batch' if use_batched_replay else 'sample'
+        iterator = tqdm(iterator, total=total, desc=desc, unit=unit, leave=False)
+
     with torch.no_grad():
-        for inp, target in iterator:
-            output = run_block_forward(block, inp, device)
-            total_mse += ((output - target.to(device)) ** 2).mean().item()
-    return total_mse / len(inputs_cache)
+        if use_batched_replay:
+            for start in iterator:
+                end = min(start + batch_size, n)
+                try:
+                    batched_inp, batched_target = make_block_batch(
+                        inputs_cache[start:end],
+                        targets_cache[start:end],
+                    )
+                    output = run_block_forward(block, batched_inp, device)
+                    mse = ((output - batched_target.to(device)) ** 2).mean().item()
+                    batch_n = end - start
+                    total_mse += mse * batch_n
+                    total_n += batch_n
+                except ValueError:
+                    for inp, target in zip(inputs_cache[start:end], targets_cache[start:end]):
+                        output = run_block_forward(block, inp, device)
+                        total_mse += ((output - target.to(device)) ** 2).mean().item()
+                        total_n += 1
+        else:
+            for idx in iterator:
+                output = run_block_forward(block, inputs_cache[idx], device)
+                total_mse += ((output - targets_cache[idx].to(device)) ** 2).mean().item()
+                total_n += 1
+    return total_mse / max(1, total_n)
 
 
 def optimize_block_params(block, inputs_cache, targets_cache, *,
