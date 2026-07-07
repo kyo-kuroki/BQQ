@@ -11,6 +11,7 @@ neural_network_compression/cv/scripts/
 # LM data/output directories
 neural_network_compression/lm/src/bqq_compressed_data/
 neural_network_compression/lm/src/quantized_models/
+neural_network_compression/lm/src/results/
 neural_network_compression/lm/blockwise_output/
 neural_network_compression/lm/results/
 neural_network_compression/lm/cache/
