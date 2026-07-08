@@ -52,6 +52,7 @@ Notes:
 
 - Default calibration dataset in the wrapper scripts: `slimpajama`
 - Default assembled quantized model directory: `lm/src/quantized_models/<model>/`
+- Assembled models are saved **packed** by default (`PackedBinaryQuadratic`, uint8 bit-packed Y/Z, fast CUDA decode kernel); pass `--no-pack` to `build_bqq_model.py assemble` to keep the unpacked layout
 - Default fine-tuned model directory: `lm/fine_tuned_models/<model>/`
 - Default Hessian-aware compensation mode: `ldlq`
 - Layerwise outputs are saved under `lm/src/bqq_compressed_data/<model>-<bit>bit-<gs>gs-<steps>step/`
@@ -68,7 +69,7 @@ neural_network_compression/
 │   │   │   └── _consolidated/<full_layer_name>.pth
 │   │   └── quantized_models/<model>/
 │   │       ├── <model>-<bit>bit-<gs>gs.pth
-│   │       └── <model>-<bit>bit-<gs>gs-blockwise.pth
+│   │       └── <model>-<bit>bit-<gs>gs-blockwise-packed.pth
 │   ├── blockwise_output/<model>/
 │   │   ├── block_0.pth
 │   │   ├── block_1.pth
@@ -388,13 +389,75 @@ python lm/src/evaluation.py \
 
 Results are written under `lm/src/results/`.
 
+## Packed Models and Fast Decode
+
+`build_bqq_model.py assemble` saves packed models by default. Packed layers
+(`PackedBinaryQuadratic`) store Y/Z as bit-packed uint8 (8x smaller than bool;
+e.g. Qwen3.5-4B 1-bit: 4.85 GB → 1.95 GB) and run a fused AND+popcount CUDA
+kernel at inference. Related commands:
+
+```bash
+cd neural_network_compression/lm/src
+
+# Pack an existing unpacked .pth
+python build_bqq_model.py pack --input quantized_models/M/M-1bit-64gs-blockwise.pth
+
+# Convert a packed .pth back to unpacked BinaryQuadratic
+# (needed by tools that read .Y/.Z directly, e.g. scale_refine_bqq.py)
+python build_bqq_model.py unpack --input quantized_models/M/M-1bit-64gs-blockwise-packed.pth
+
+# Keep the old unpacked layout at assemble time
+python build_bqq_model.py assemble --model_name ... --block_dir ... --no-pack
+```
+
+Key properties of the packed forward path:
+
+- The fused decode kernels require **fp16 activations** (`model.half()`);
+  with bf16/fp32 inputs a slower generic kernel path is used.
+- Scaling coefficients `a,b,c,d` are consumed as fp16; accumulation stays fp32.
+- **Packed models remain trainable**: when gradients are required
+  (`torch.is_grad_enabled()` and any of `a/b/c/d/bias/X` requires grad),
+  `forward` automatically switches to a differentiable W-reconstruction path,
+  so fine-tuning of coefficients/bias works directly on packed models.
+  With all parameters frozen (e.g. LoRA on other modules) the fast kernel
+  is still used.
+
+Decode latency benchmark (compares a BQQ `.pth` against the fp16 HF model):
+
+```bash
+cd neural_network_compression
+
+# Autoregressive decode, 1 token at a time after a 2048-token prefill
+python bqqkernel/benchmark_decode.py \
+  --benchmark-mode model \
+  --model-name Qwen/Qwen3.5-4B \
+  --model-path lm/src/quantized_models/Qwen3.5-4B/Qwen3.5-4B-1bit-64gs-blockwise-packed.pth \
+  --bqq-dtype float16
+
+# Same, timing CUDA-graph replay of one decode step (no launch overhead)
+python bqqkernel/benchmark_decode.py --benchmark-mode model ... --use-cuda-graph
+```
+
+Reference numbers (Qwen3.5-4B 1-bit 64gs, RTX A6000, ms/token):
+
+| Mode | BQQ packed fp16 | fp16 baseline |
+|------|-----------------|---------------|
+| Eager decode | 28.6 (35 tok/s) | 30.6 (33 tok/s) |
+| CUDA-graph replay | 5.8 (172 tok/s) | 17.4 (58 tok/s) |
+
+Eager decode is CPU launch-bound for both models; under CUDA-graph replay the
+BQQ kernels are ~3x faster than fp16 GEMV. A serving integration needs a
+static KV cache + CUDA graphs (or `torch.compile` reduce-overhead) to realize
+the graph-replay numbers.
+
 ## Legacy / Auxiliary LM Tools
 
 The following tools remain useful for experiments, but they are no longer the main recommended LM path.
 
 - `lm/weight_aware_quant_cached.py`
 - `lm/weight_aware_quant.py`
-- `lm/scale_refine_bqq.py`
+- `lm/scale_refine_bqq.py` (operates on the unpacked `.Y/.Z` layout; run
+  `build_bqq_model.py unpack` first when starting from a packed model)
 
 `extend-target` style bit-depth extension is now best viewed as an auxiliary workflow for comparisons or reuse of older low-bit results.
 In the current implementation, `bit_width` is optimized directly in layerwise, blockwise, and fine-tuning stages.

@@ -18,9 +18,10 @@ BQQ/
     │   ├── layerwise_quant.py           # Hessian-aware layerwise quantization
     │   ├── blockwise_quant.py           # Blockwise/progressive quantization and tuning
     │   ├── fine_tuning.py               # STE fine-tuning for assembled BQQ models
-    │   ├── src/build_bqq_model.py       # Replace Linear→BinaryQuadratic, build model from patches or blocks
+    │   ├── src/build_bqq_model.py       # Replace Linear→BinaryQuadratic, build model from patches or blocks, pack/unpack
     │   ├── scale_refine_bqq.py          # Post-quantization scale refinement
     │   └── src/evaluation.py            # PPL / downstream evaluation
+    ├── bqqkernel/                       # BQQ layer modules, CUDA decode kernels, decode benchmark
     ├── run_layerwise_quant.sh           # Fast layerwise wrapper
     ├── run_blockwise_quant.sh           # Medium blockwise wrapper
     ├── run_fine_tuning.sh               # Slow/high-accuracy fine-tuning wrapper
@@ -181,41 +182,27 @@ Results are written under `neural_network_compression/lm/src/results/`.
 
 ## Inference kernels
 
-BQQ models use `PackedBinaryQuadratic` layers where Y, Z are stored as packed uint8 (8x smaller than bool). Three inference backends are available:
+BQQ models are saved with `PackedBinaryQuadratic` layers by default: Y, Z are stored as bit-packed uint8 (8x smaller than bool) and the forward pass runs through a single CUDA extension entry point (`bqq_forward_flat` in `neural_network_compression/bqqkernel/bqq_cuda.cu`, compiled on first import via `torch.utils.cpp_extension`). The layer caches flattened weights, fp16 `a,b,c,d` coefficients and a pre-zeroed fp32 accumulation workspace, so a decode step costs only two kernel launches per layer.
 
-| Backend | Kernel | Description |
-|---------|--------|-------------|
-| **CUDA** (default) | `bqq_cuda.cu` mode=3 | Multi-warp shuffle: 4 warps split `col_width`, conditional-add inner loop. Compiled on first import via `torch.utils.cpp_extension`. |
-| **Triton** | `bqq_triton_kernel.py` v1/v2 | Fused kernel with `t_aug = a*t + b*xsum` optimisation. v2 parallelises `bit_width` via 2D tensor ops. |
-| **W-reconstruction** | `bqq_modules.py` | Unpack Y/Z → cuBLAS matmul for W, then `X @ W.T`. Fallback for large batch. |
+`PackedBinaryQuadratic.forward()` dispatches automatically:
 
-Auto-selection in `PackedBinaryQuadratic.forward()`:
-- `use_zy_x_kernel = True`: tries CUDA → Triton → W-reconstruction
-- seq_len > `zy_x_recon_threshold` (default 32): W-reconstruction + cuBLAS
+| Path | When | Description |
+|------|------|-------------|
+| Fused decode kernels | batch·seq = 1, fp16 activations | AND+popcount warp kernels (`bqq_forward_byte4/byte2/byte`); no W materialisation. Coefficients read as fp16, accumulation in fp32, fused fp16 epilogue. |
+| Generic fused kernel | batch·seq = 1, bf16/fp32 activations | Same structure, slower fp32 input path. |
+| W-reconstruction + cuBLAS | batch·seq > 1 (prefill, large batch) | `reconstruct_W_kernel` (popcount) rebuilds fp16 W, then Tensor-Core matmul. |
+| Differentiable fallback | gradients required | Rebuilds W with autograd-visible ops; gradients flow to `a,b,c,d`, bias and X. Packed models therefore remain trainable. |
 
-### CUDA kernel modes
+Environment overrides for kernel selection: `BQQ_CUDA_DECODE_KERNEL` (`bitblas_byte4`, `bitblas_byte2`, `bitblas_byte`, `two_stage_warp`, ...) and `BQQ_CUDA_COL_SPLITS`. Defaults are chosen from `bit_width`/shape and are usually best.
 
-```python
-from bqq_cuda_ext import cuda_bqq_forward
+### Performance (Qwen3.5-4B, 1-bit, gs=64, RTX A6000, autoregressive decode)
 
-# mode=0 (auto=5), mode=1 (1-warp shuffle), mode=3 (multi-warp shuffle),
-# mode=5 (grid-split + uint32), mode=6 (SRAM-tiled)
-out = cuda_bqq_forward(Y_packed, Z_packed, X, a, b, c, d, mode=5)
-```
+| Mode | BQQ packed fp16 | fp16 baseline | Ratio |
+|------|-----------------|---------------|-------|
+| Eager, ms/token | 28.6 (35 tok/s) | 30.6 (33 tok/s) | 1.07x faster |
+| CUDA-graph replay, ms/token | 5.8 (172 tok/s) | 17.4 (58 tok/s) | **3.0x faster** |
 
-### Performance (2048x2048, 4-bit, gs=32, RTX 4500 Ada)
-
-| seq_len | FP16 cuBLAS | Best BQQ kernel | Kernel | FP16 ratio |
-|---------|-------------|-----------------|--------|------------|
-| 1       | 33 us       | 47 us           | CUDA v5 | 1.4x      |
-| 4       | 36 us       | 169 us          | CUDA v5 | 4.7x      |
-| 16      | 36 us       | 682 us          | CUDA v5 | 19x       |
-| 64      | 35 us       | 1,621 us        | W-recon | 46x       |
-| 256     | 40 us       | 1,715 us        | W-recon | 43x       |
-
-At seq_len=1 (autoregressive decode), BQQ is only 1.4x slower than FP16.
-At seq_len≥32, W-reconstruction + cuBLAS Tensor Core becomes faster.
-BQQ's primary value is **2-4x model size reduction**, enabling larger models on smaller GPUs.
+Eager decode is CPU launch-bound for both models; with kernel-launch overhead removed (CUDA graphs / static KV cache) the BQQ kernels beat fp16 GEMV by ~3x while also shrinking the model ~2.5x on disk. Benchmark with `neural_network_compression/bqqkernel/benchmark_decode.py --benchmark-mode model --bqq-dtype float16 [--use-cuda-graph]`.
 
 ## `quantizer.py`
 
