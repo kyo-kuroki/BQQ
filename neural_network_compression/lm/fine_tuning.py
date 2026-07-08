@@ -149,7 +149,13 @@ class DistillationTrainer(BQQLearningRateTrainer):
         T = self.kl_temperature
         student_logp = F.log_softmax(outputs.logits / T, dim=-1)
         teacher_p = F.softmax(teacher_outputs.logits / T, dim=-1)
-        kl_loss = F.kl_div(student_logp, teacher_p, reduction="batchmean") * (T * T)
+        # Normalize per token: reshape [B, S, V] -> [B*S, V] so batchmean divides by B*S
+        B, S, V = student_logp.shape
+        kl_loss = F.kl_div(
+            student_logp.view(B * S, V),
+            teacher_p.view(B * S, V),
+            reduction="batchmean",
+        ) * (T * T)
 
         loss = self.ce_alpha * outputs.loss + self.kl_alpha * kl_loss
         return (loss, outputs) if return_outputs else loss
