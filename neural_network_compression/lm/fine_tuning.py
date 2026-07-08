@@ -221,7 +221,7 @@ def train(
     if teacher_model_name is not None:
         print(f"Loading teacher model: {teacher_model_name}")
         teacher_model = AutoModelForCausalLM.from_pretrained(
-            teacher_model_name, dtype="auto"
+            teacher_model_name, dtype="auto", device_map="auto"
         )
 
     TrainerClass = DistillationTrainer if teacher_model is not None else BQQLearningRateTrainer
