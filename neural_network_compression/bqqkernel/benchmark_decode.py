@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 
 import torch
+import dill
+from transformers import AutoModelForCausalLM
 
 
 def _add_repo_to_path() -> None:
@@ -151,8 +153,105 @@ def _parse_ints(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
+def _load_bqq_model(model_path: str) -> torch.nn.Module:
+    model = torch.load(model_path, map_location="cpu", weights_only=False, pickle_module=dill)
+    if not hasattr(model, "eval"):
+        raise TypeError(f"{model_path} did not deserialize to a torch.nn.Module")
+    return model
+
+
+def _load_fp16_model(model_name: str) -> torch.nn.Module:
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            attn_implementation="flash_attention_2",
+        )
+    except Exception:
+        return AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+
+
+def _run_decode_benchmark(
+    *,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    warmup: int,
+    iters: int,
+    inner_iters: int,
+) -> tuple[float, float, float]:
+    model.eval()
+    model.to(input_ids.device)
+
+    with torch.inference_mode():
+        pref = model(input_ids=input_ids, use_cache=True)
+        past_key_values = pref.past_key_values
+        step_ids = input_ids[:, -1:]
+
+        for _ in range(warmup):
+            model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+        torch.cuda.synchronize()
+
+        samples = []
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        for _ in range(iters):
+            start.record()
+            for _ in range(inner_iters):
+                model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+            end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end) / inner_iters)
+
+    mean_ms = statistics.fmean(samples)
+    p50_ms = statistics.median(samples)
+    p90_ms = sorted(samples)[int(0.9 * (len(samples) - 1))]
+    return mean_ms, p50_ms, p90_ms
+
+
+def _run_model_benchmark(args) -> None:
+    if not args.model_path:
+        raise ValueError("--model-path is required in model benchmark mode")
+    if not args.model_name:
+        raise ValueError("--model-name is required in model benchmark mode")
+
+    device = torch.device("cuda")
+    bqq_model = _load_bqq_model(args.model_path)
+    fp16_model = _load_fp16_model(args.model_name)
+
+    vocab_size = getattr(getattr(fp16_model, "config", None), "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(bqq_model, "config", None), "vocab_size", None)
+    if vocab_size is None:
+        raise RuntimeError("Could not determine vocab_size from either model")
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(args.seed)
+    input_ids = torch.randint(0, int(vocab_size), (1, args.seq_len), dtype=torch.long, generator=generator)
+    input_ids = input_ids.to(device=device)
+
+    for name, model in (("bqq", bqq_model), ("fp16", fp16_model)):
+        mean_ms, p50_ms, p90_ms = _run_decode_benchmark(
+            model=model,
+            input_ids=input_ids,
+            warmup=args.warmup,
+            iters=args.iters,
+            inner_iters=args.inner_iters,
+        )
+        toks = 1000.0 / mean_ms
+        print(f"{name},{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--benchmark-mode",
+        choices=["microbench", "model"],
+        default="microbench",
+        help="microbench keeps the existing packed-layer benchmark; model compares BQQ .pth vs fp16 HF model.",
+    )
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-4B")
+    parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--out-features", type=int, default=4096)
     parser.add_argument("--in-features", type=int, default=4096)
     parser.add_argument("--bit-width", type=int, default=1)
@@ -188,6 +287,11 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
+
+    if args.benchmark_mode == "model":
+        print("method,mean_ms,p50_ms,p90_ms,tokens_per_s")
+        _run_model_benchmark(args)
+        return
 
     device = torch.device("cuda")
     dtype = getattr(torch, args.dtype)
