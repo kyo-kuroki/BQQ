@@ -28,6 +28,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -64,6 +65,26 @@ __device__ __forceinline__ float load_activation<float>(const float* ptr, size_t
 template <>
 __device__ __forceinline__ float load_activation<__half>(const __half* ptr, size_t idx) {
     return __half2float(__ldg(&ptr[idx]));
+}
+
+template <>
+__device__ __forceinline__ float load_activation<__nv_bfloat16>(
+    const __nv_bfloat16* ptr, size_t idx) {
+    return __bfloat162float(__ldg(&ptr[idx]));
+}
+
+/* fp32 → OUT_T store used by the fused decode epilogue. */
+template <typename T>
+__device__ __forceinline__ T store_activation(float v);
+
+template <>
+__device__ __forceinline__ __half store_activation<__half>(float v) {
+    return __float2half(v);
+}
+
+template <>
+__device__ __forceinline__ __nv_bfloat16 store_activation<__nv_bfloat16>(float v) {
+    return __float2bfloat16(v);
 }
 
 
@@ -1597,15 +1618,21 @@ static inline const __half* half_ptr(const torch::Tensor& t) {
     return reinterpret_cast<const __half*>(t.data_ptr<at::Half>());
 }
 
-/* Decode-path epilogue: emit the fp32 workspace as fp16 and re-zero it in
- * the same pass, so the accumulation workspace can live in the layer's
- * flat cache and no per-call zeros/fill/cast aten ops are needed. */
-__global__ void bqq_ws_store_half_zero_kernel(
-    float* __restrict__ ws, __half* __restrict__ out, int n)
+static inline const __nv_bfloat16* bf16_ptr(const torch::Tensor& t) {
+    return reinterpret_cast<const __nv_bfloat16*>(t.data_ptr<at::BFloat16>());
+}
+
+/* Decode-path epilogue: emit the fp32 workspace as OUT_T (fp16/bf16) and
+ * re-zero it in the same pass, so the accumulation workspace can live in
+ * the layer's flat cache and no per-call zeros/fill/cast aten ops are
+ * needed. */
+template <typename OUT_T>
+__global__ void bqq_ws_store_zero_kernel(
+    float* __restrict__ ws, OUT_T* __restrict__ out, int n)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        out[i] = __float2half(ws[i]);
+        out[i] = store_activation<OUT_T>(ws[i]);
         ws[i] = 0.0f;
     }
 }
@@ -1669,7 +1696,9 @@ torch::Tensor bqq_forward_core(
 
     torch::Tensor result;
 
-    if (batch <= 1 && y_row > 128 && X.scalar_type() == torch::kFloat16 &&
+    const bool x_large_bf16 = X.scalar_type() == torch::kBFloat16;
+    if (batch <= 1 && y_row > 128 &&
+        (X.scalar_type() == torch::kFloat16 || x_large_bf16) &&
         z_col > 32 && k8 > 3) {
         constexpr int NW = 4;
         constexpr int NI = 4;
@@ -1707,13 +1736,24 @@ torch::Tensor bqq_forward_core(
             int smem = NW * 32 * sizeof(float);
 
             #define LAUNCH_ROWTILE(K8M) \
-                bqq_forward_byte4_rowtile_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits, row_tiles)
+                do { \
+                    if (x_large_bf16) \
+                        bqq_forward_byte4_rowtile_kernel<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem>>>( \
+                            Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                            bf16_ptr(X_view_half), \
+                            half_ptr(a_flat), half_ptr(b_flat), \
+                            half_ptr(c_flat), half_ptr(d_flat), \
+                            out.data_ptr<float>(), \
+                            row_width, col_width, bit_width, y_row, z_col, k8, col_splits, row_tiles); \
+                    else \
+                        bqq_forward_byte4_rowtile_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
+                            Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                            half_ptr(X_view_half), \
+                            half_ptr(a_flat), half_ptr(b_flat), \
+                            half_ptr(c_flat), half_ptr(d_flat), \
+                            out.data_ptr<float>(), \
+                            row_width, col_width, bit_width, y_row, z_col, k8, col_splits, row_tiles); \
+                } while (0)
 
             if      (k8 <= 4)  LAUNCH_ROWTILE(4);
             else if (k8 <= 8)  LAUNCH_ROWTILE(8);
@@ -1734,13 +1774,22 @@ torch::Tensor bqq_forward_core(
 
             dim3 s1_block(NW * 32);
             dim3 s1_grid((B_total * n_inner + NW - 1) / NW);
-            bqq_stage1_ztx_kernel<__half, NW><<<s1_grid, s1_block>>>(
-                Z_flat.data_ptr<uint8_t>(),
-                reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()),
-                T.data_ptr<float>(),
-                Tsum.data_ptr<float>(),
-                Xsum.data_ptr<float>(),
-                B_total, col_width, z_col, k8);
+            if (x_large_bf16)
+                bqq_stage1_ztx_kernel<__nv_bfloat16, NW><<<s1_grid, s1_block>>>(
+                    Z_flat.data_ptr<uint8_t>(),
+                    bf16_ptr(X_view_half),
+                    T.data_ptr<float>(),
+                    Tsum.data_ptr<float>(),
+                    Xsum.data_ptr<float>(),
+                    B_total, col_width, z_col, k8);
+            else
+                bqq_stage1_ztx_kernel<__half, NW><<<s1_grid, s1_block>>>(
+                    Z_flat.data_ptr<uint8_t>(),
+                    half_ptr(X_view_half),
+                    T.data_ptr<float>(),
+                    Tsum.data_ptr<float>(),
+                    Xsum.data_ptr<float>(),
+                    B_total, col_width, z_col, k8);
 
             const bool use_parallel_bits = bit_width >= 2 && k8 >= 64;
             const bool use_t_lut = k8 >= 128;
@@ -1827,21 +1876,26 @@ torch::Tensor bqq_forward_core(
     } else if (batch <= 1) {
         /* ── small seq: fused warp-shuffle kernel ──────────────── */
         const char* decode_kernel = std::getenv("BQQ_CUDA_DECODE_KERNEL");
+        /* fp16 and bf16 activations both take the fused 16-bit kernels;
+         * load_activation converts to fp32 in-register either way. */
+        const bool x_is_bf16 = X.scalar_type() == torch::kBFloat16;
+        const bool x_is_16bit =
+            X.scalar_type() == torch::kFloat16 || x_is_bf16;
         const bool use_bitblas_fp16 =
             decode_kernel && std::strcmp(decode_kernel, "bitblas_fp16") == 0 &&
-            X.scalar_type() == torch::kFloat16;
+            x_is_16bit;
         const bool use_bitblas_byte4 =
             ((decode_kernel && std::strcmp(decode_kernel, "bitblas_byte4") == 0) ||
              (decode_kernel == nullptr && bit_width <= 2)) &&
-            X.scalar_type() == torch::kFloat16 && z_col > 32 && k8 > 3;
+            x_is_16bit && z_col > 32 && k8 > 3;
         const bool use_bitblas_byte2 =
             ((decode_kernel && std::strcmp(decode_kernel, "bitblas_byte2") == 0) ||
              (decode_kernel == nullptr && !use_bitblas_byte4 && bit_width <= 2)) &&
-            X.scalar_type() == torch::kFloat16 && z_col > 32 && k8 > 1;
+            x_is_16bit && z_col > 32 && k8 > 1;
         const bool use_bitblas_byte =
             ((decode_kernel && std::strcmp(decode_kernel, "bitblas_byte") == 0) ||
              (decode_kernel == nullptr && !use_bitblas_byte4 && !use_bitblas_byte2)) &&
-            X.scalar_type() == torch::kFloat16 && z_col > 32;
+            x_is_16bit && z_col > 32;
 
         auto X_view = (use_bitblas_fp16 || use_bitblas_byte || use_bitblas_byte2 || use_bitblas_byte4)
             ? torch::Tensor()
@@ -1880,8 +1934,7 @@ torch::Tensor bqq_forward_core(
          * fp32 workspace, then one epilogue kernel emits fp16 and re-zeroes.
          * Replaces per-call zeros+fill and the fp32→fp16 aten cast. */
         const bool fuse_out =
-            ws.defined() && batch == 1 &&
-            X.scalar_type() == torch::kFloat16 &&
+            ws.defined() && batch == 1 && x_is_16bit &&
             ws.is_cuda() && ws.scalar_type() == torch::kFloat32 &&
             ws.dim() == 3 && ws.size(0) == 1 &&
             ws.size(1) == row_width && ws.size(2) == y_row;
@@ -1963,41 +2016,32 @@ torch::Tensor bqq_forward_core(
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
-            #define LAUNCH_HALF(NI, K8M) \
-                bqq_forward_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+            /* Each 16-bit macro dispatches on the runtime activation dtype;
+             * the kernels only differ in the X_T template argument. */
+            #define LAUNCH_X16(KERNEL, NI, K8M) \
+                do { \
+                    if (x_is_bf16) \
+                        KERNEL<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem>>>( \
+                            Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                            bf16_ptr(X_view_half), \
+                            half_ptr(a_flat), half_ptr(b_flat), \
+                            half_ptr(c_flat), half_ptr(d_flat), \
+                            out.data_ptr<float>(), \
+                            row_width, col_width, bit_width, y_row, z_col, k8, col_splits); \
+                    else \
+                        KERNEL<__half, NW, NI, K8M><<<grid, block, smem>>>( \
+                            Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
+                            half_ptr(X_view_half), \
+                            half_ptr(a_flat), half_ptr(b_flat), \
+                            half_ptr(c_flat), half_ptr(d_flat), \
+                            out.data_ptr<float>(), \
+                            row_width, col_width, bit_width, y_row, z_col, k8, col_splits); \
+                } while (0)
 
-            #define LAUNCH_BYTE_HALF(NI, K8M) \
-                bqq_forward_byte_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
-
-            #define LAUNCH_BYTE2_HALF(NI, K8M) \
-                bqq_forward_byte2_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
-
-            #define LAUNCH_BYTE4_HALF(NI, K8M) \
-                bqq_forward_byte4_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
+            #define LAUNCH_HALF(NI, K8M)  LAUNCH_X16(bqq_forward_kernel, NI, K8M)
+            #define LAUNCH_BYTE_HALF(NI, K8M)  LAUNCH_X16(bqq_forward_byte_kernel, NI, K8M)
+            #define LAUNCH_BYTE2_HALF(NI, K8M) LAUNCH_X16(bqq_forward_byte2_kernel, NI, K8M)
+            #define LAUNCH_BYTE4_HALF(NI, K8M) LAUNCH_X16(bqq_forward_byte4_kernel, NI, K8M)
 
             if (use_bitblas_byte4) {
                 if (ni == 1) {
@@ -2049,18 +2093,26 @@ torch::Tensor bqq_forward_core(
             #undef LAUNCH_BYTE2_HALF
             #undef LAUNCH_BYTE_HALF
             #undef LAUNCH_HALF
+            #undef LAUNCH_X16
             #undef LAUNCH_FLOAT
         }
 
         if (fuse_out) {
             auto out_h = torch::empty({1, out_f},
-                torch::dtype(torch::kFloat16).device(X.device()));
+                torch::dtype(x_is_bf16 ? torch::kBFloat16 : torch::kFloat16)
+                    .device(X.device()));
             const int threads = 256;
             const int blocks = (out_f + threads - 1) / threads;
-            bqq_ws_store_half_zero_kernel<<<blocks, threads>>>(
-                ws.data_ptr<float>(),
-                reinterpret_cast<__half*>(out_h.data_ptr<at::Half>()),
-                out_f);
+            if (x_is_bf16)
+                bqq_ws_store_zero_kernel<__nv_bfloat16><<<blocks, threads>>>(
+                    ws.data_ptr<float>(),
+                    reinterpret_cast<__nv_bfloat16*>(out_h.data_ptr<at::BFloat16>()),
+                    out_f);
+            else
+                bqq_ws_store_zero_kernel<__half><<<blocks, threads>>>(
+                    ws.data_ptr<float>(),
+                    reinterpret_cast<__half*>(out_h.data_ptr<at::Half>()),
+                    out_f);
             result = out_h;
         } else {
             result = out.reshape({(int)batch, out_f});

@@ -188,8 +188,8 @@ BQQ models are saved with `PackedBinaryQuadratic` layers by default: Y, Z are st
 
 | Path | When | Description |
 |------|------|-------------|
-| Fused decode kernels | batch·seq = 1, fp16 activations | AND+popcount warp kernels (`bqq_forward_byte4/byte2/byte`); no W materialisation. Coefficients read as fp16, accumulation in fp32, fused fp16 epilogue. |
-| Generic fused kernel | batch·seq = 1, bf16/fp32 activations | Same structure, slower fp32 input path. |
+| Fused decode kernels | batch·seq = 1, fp16 or bf16 activations | AND+popcount warp kernels (`bqq_forward_byte4/byte2/byte`); no W materialisation. Activations and coefficients read as 16-bit, accumulation in fp32, fused 16-bit epilogue. fp16 and bf16 are equally fast. |
+| Generic fused kernel | batch·seq = 1, fp32 activations | Same structure, slower fp32 input path. |
 | W-reconstruction + cuBLAS | batch·seq > 1 (prefill, large batch) | `reconstruct_W_kernel` (popcount) rebuilds fp16 W, then Tensor-Core matmul. |
 | Differentiable fallback | gradients required | Rebuilds W with autograd-visible ops; gradients flow to `a,b,c,d`, bias and X. Packed models therefore remain trainable. |
 

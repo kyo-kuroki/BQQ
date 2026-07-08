@@ -412,8 +412,10 @@ python build_bqq_model.py assemble --model_name ... --block_dir ... --no-pack
 
 Key properties of the packed forward path:
 
-- The fused decode kernels require **fp16 activations** (`model.half()`);
-  with bf16/fp32 inputs a slower generic kernel path is used.
+- The fused decode kernels support **fp16 and bf16 activations** natively
+  (identical speed; both convert to fp32 in-register). Models saved in bf16
+  by `assemble` therefore hit the fast path without casting. fp32 inputs use
+  a slower generic kernel path.
 - Scaling coefficients `a,b,c,d` are consumed as fp16; accumulation stays fp32.
 - **Packed models remain trainable**: when gradients are required
   (`torch.is_grad_enabled()` and any of `a/b/c/d/bias/X` requires grad),
@@ -428,11 +430,11 @@ Decode latency benchmark (compares a BQQ `.pth` against the fp16 HF model):
 cd neural_network_compression
 
 # Autoregressive decode, 1 token at a time after a 2048-token prefill
+# (--bqq-dtype float16 optional; the saved bf16 dtype is equally fast)
 python bqqkernel/benchmark_decode.py \
   --benchmark-mode model \
   --model-name Qwen/Qwen3.5-4B \
-  --model-path lm/src/quantized_models/Qwen3.5-4B/Qwen3.5-4B-1bit-64gs-blockwise-packed.pth \
-  --bqq-dtype float16
+  --model-path lm/src/quantized_models/Qwen3.5-4B/Qwen3.5-4B-1bit-64gs-blockwise-packed.pth
 
 # Same, timing CUDA-graph replay of one decode step (no launch overhead)
 python bqqkernel/benchmark_decode.py --benchmark-mode model ... --use-cuda-graph
