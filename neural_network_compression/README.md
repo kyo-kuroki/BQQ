@@ -436,21 +436,25 @@ python bqqkernel/benchmark_decode.py \
   --model-name Qwen/Qwen3.5-4B \
   --model-path lm/src/quantized_models/Qwen3.5-4B/Qwen3.5-4B-1bit-64gs-blockwise-packed.pth
 
-# Same, timing CUDA-graph replay of one decode step (no launch overhead)
+# Same, timing CUDA-graph replay of one decode step (no launch overhead).
+# The graph capture is applied to BOTH the BQQ model and the fp16 baseline,
+# so the reported comparison is like-for-like.
 python bqqkernel/benchmark_decode.py --benchmark-mode model ... --use-cuda-graph
 ```
 
-Reference numbers (Qwen3.5-4B 1-bit 64gs, RTX A6000, ms/token):
+Reference numbers (Qwen3.5-4B 1-bit 64gs, RTX A6000, ms/token; fp16 and bf16
+BQQ models measure the same):
 
-| Mode | BQQ packed fp16 | fp16 baseline |
-|------|-----------------|---------------|
-| Eager decode | 28.6 (35 tok/s) | 30.6 (33 tok/s) |
-| CUDA-graph replay | 5.8 (172 tok/s) | 17.4 (58 tok/s) |
+| Mode | BQQ packed (fp16/bf16) | fp16 baseline |
+|------|------------------------|---------------|
+| Eager decode | 28.4–28.6 (35 tok/s) | 30.6 (33 tok/s) |
+| CUDA-graph replay | 5.8–5.9 (~170 tok/s) | 17.4 (58 tok/s) |
 
-Eager decode is CPU launch-bound for both models; under CUDA-graph replay the
-BQQ kernels are ~3x faster than fp16 GEMV. A serving integration needs a
-static KV cache + CUDA graphs (or `torch.compile` reduce-overhead) to realize
-the graph-replay numbers.
+Eager decode is CPU launch-bound for both models; under CUDA-graph replay
+(both models replayed) the BQQ kernels are ~3x faster than fp16 GEMV, which
+is bandwidth-bound reading ~2 bytes/weight per token. A serving integration
+needs a static KV cache + CUDA graphs (or `torch.compile` reduce-overhead) to
+realize the graph-replay numbers.
 
 ## Legacy / Auxiliary LM Tools
 

@@ -197,12 +197,14 @@ Environment overrides for kernel selection: `BQQ_CUDA_DECODE_KERNEL` (`bitblas_b
 
 ### Performance (Qwen3.5-4B, 1-bit, gs=64, RTX A6000, autoregressive decode)
 
-| Mode | BQQ packed fp16 | fp16 baseline | Ratio |
-|------|-----------------|---------------|-------|
-| Eager, ms/token | 28.6 (35 tok/s) | 30.6 (33 tok/s) | 1.07x faster |
-| CUDA-graph replay, ms/token | 5.8 (172 tok/s) | 17.4 (58 tok/s) | **3.0x faster** |
+Both rows apply the same measurement to both models — with `--use-cuda-graph`, the BQQ model **and** the fp16 baseline are each captured as a CUDA graph and timed by graph replay, so the comparison is like-for-like.
 
-Eager decode is CPU launch-bound for both models; with kernel-launch overhead removed (CUDA graphs / static KV cache) the BQQ kernels beat fp16 GEMV by ~3x while also shrinking the model ~2.5x on disk. Benchmark with `neural_network_compression/bqqkernel/benchmark_decode.py --benchmark-mode model --bqq-dtype float16 [--use-cuda-graph]`.
+| Mode | BQQ packed (fp16/bf16) | fp16 baseline | Ratio |
+|------|------------------------|---------------|-------|
+| Eager, ms/token | 28.4–28.6 (35 tok/s) | 30.6 (33 tok/s) | 1.07x faster |
+| CUDA-graph replay, ms/token | 5.8–5.9 (~170 tok/s) | 17.4 (58 tok/s) | **3.0x faster** |
+
+Eager decode is CPU launch-bound for both models (transformers Python overhead + kernel launches dominate). Graph replay removes that overhead for both, exposing the pure GPU-time difference: fp16 GEMV is bandwidth-bound reading ~2 bytes/weight per token (~13 ms at A6000 bandwidth), while BQQ's packed representation reads roughly a tenth of the bytes. A serving integration needs a static KV cache + CUDA graphs (or `torch.compile` reduce-overhead) to realize the graph-replay numbers. Benchmark with `neural_network_compression/bqqkernel/benchmark_decode.py --benchmark-mode model [--use-cuda-graph]`.
 
 ## `quantizer.py`
 
