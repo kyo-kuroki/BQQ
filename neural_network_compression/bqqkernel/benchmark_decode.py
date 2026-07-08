@@ -153,10 +153,12 @@ def _parse_ints(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
-def _load_bqq_model(model_path: str) -> torch.nn.Module:
+def _load_bqq_model(model_path: str, dtype: torch.dtype | None) -> torch.nn.Module:
     model = torch.load(model_path, map_location="cpu", weights_only=False, pickle_module=dill)
     if not hasattr(model, "eval"):
         raise TypeError(f"{model_path} did not deserialize to a torch.nn.Module")
+    if dtype is not None:
+        model = model.to(dtype=dtype)
     return model
 
 
@@ -178,6 +180,7 @@ def _run_decode_benchmark(
     warmup: int,
     iters: int,
     inner_iters: int,
+    use_cuda_graph: bool = False,
 ) -> tuple[float, float, float]:
     model.eval()
     model.to(input_ids.device)
@@ -187,9 +190,31 @@ def _run_decode_benchmark(
         past_key_values = pref.past_key_values
         step_ids = input_ids[:, -1:]
 
-        for _ in range(warmup):
+        def step():
             model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+
+        for _ in range(warmup):
+            step()
         torch.cuda.synchronize()
+
+        if use_cuda_graph:
+            # Capture one decode step and replay it.  The DynamicCache is
+            # frozen at capture time, so this measures fixed-context decode
+            # with zero kernel-launch overhead — what a serving stack with
+            # CUDA graphs / static cache would see.
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                for _ in range(3):
+                    step()
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                step()
+            run_step = graph.replay
+            torch.cuda.synchronize()
+        else:
+            run_step = step
 
         samples = []
         start = torch.cuda.Event(enable_timing=True)
@@ -197,7 +222,7 @@ def _run_decode_benchmark(
         for _ in range(iters):
             start.record()
             for _ in range(inner_iters):
-                model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+                run_step()
             end.record()
             torch.cuda.synchronize()
             samples.append(start.elapsed_time(end) / inner_iters)
@@ -215,7 +240,8 @@ def _run_model_benchmark(args) -> None:
         raise ValueError("--model-name is required in model benchmark mode")
 
     device = torch.device("cuda")
-    bqq_model = _load_bqq_model(args.model_path)
+    bqq_dtype = None if args.bqq_dtype == "keep" else getattr(torch, args.bqq_dtype)
+    bqq_model = _load_bqq_model(args.model_path, bqq_dtype)
     fp16_model = _load_fp16_model(args.model_name)
 
     vocab_size = getattr(getattr(fp16_model, "config", None), "vocab_size", None)
@@ -236,6 +262,7 @@ def _run_model_benchmark(args) -> None:
             warmup=args.warmup,
             iters=args.iters,
             inner_iters=args.inner_iters,
+            use_cuda_graph=args.use_cuda_graph,
         )
         toks = 1000.0 / mean_ms
         print(f"{name},{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
@@ -251,6 +278,19 @@ def main() -> None:
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--model-path", type=str, default=None)
+    parser.add_argument(
+        "--bqq-dtype",
+        choices=["keep", "float16", "bfloat16", "float32"],
+        default="keep",
+        help="Cast the loaded BQQ model to this dtype. float16 is required for "
+        "the fused CUDA decode kernels (bitblas_byte*); keep preserves the saved dtype.",
+    )
+    parser.add_argument(
+        "--use-cuda-graph",
+        action="store_true",
+        help="Capture one decode step as a CUDA graph and time graph replay. "
+        "Removes kernel-launch overhead; context is frozen at capture time.",
+    )
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--out-features", type=int, default=4096)
     parser.add_argument("--in-features", type=int, default=4096)

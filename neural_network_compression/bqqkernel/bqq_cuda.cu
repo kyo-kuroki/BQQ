@@ -76,10 +76,10 @@ __global__ void bqq_forward_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const X_T*     __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,        /* PRE-ZEROED */
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -116,9 +116,9 @@ __global__ void bqq_forward_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int   B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             /* uint32 bulk load: Z/Y bytes → registers */
@@ -168,7 +168,7 @@ __global__ void bqq_forward_kernel(
             for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         #pragma unroll
         for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
     }
@@ -201,10 +201,10 @@ __global__ void bqq_forward_byte_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const X_T*     __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -240,9 +240,9 @@ __global__ void bqq_forward_byte_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             #pragma unroll
@@ -293,7 +293,7 @@ __global__ void bqq_forward_byte_kernel(
             for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         #pragma unroll
         for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
     }
@@ -325,10 +325,10 @@ __global__ void bqq_forward_byte2_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const X_T*     __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -364,9 +364,9 @@ __global__ void bqq_forward_byte2_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             #pragma unroll
@@ -427,7 +427,7 @@ __global__ void bqq_forward_byte2_kernel(
             for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         #pragma unroll
         for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
     }
@@ -459,10 +459,10 @@ __global__ void bqq_forward_byte4_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const X_T*     __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -498,9 +498,9 @@ __global__ void bqq_forward_byte4_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             #pragma unroll
@@ -569,7 +569,7 @@ __global__ void bqq_forward_byte4_kernel(
             for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         #pragma unroll
         for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
     }
@@ -601,10 +601,10 @@ __global__ void bqq_forward_byte4_rowtile_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const X_T*     __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -645,9 +645,9 @@ __global__ void bqq_forward_byte4_rowtile_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             #pragma unroll
@@ -716,7 +716,7 @@ __global__ void bqq_forward_byte4_rowtile_kernel(
             for (int it = 0; it < N_I_TILES; it++) acc[it] += c_term;
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         #pragma unroll
         for (int it = 0; it < N_I_TILES; it++) acc[it] += d_term;
     }
@@ -790,10 +790,10 @@ __global__ void bqq_stage2_yt_kernel(
     const float*   __restrict__ T,
     const float*   __restrict__ Tsum,
     const float*   __restrict__ Xsum,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int k8, int row_tiles)
@@ -835,10 +835,10 @@ __global__ void bqq_stage2_yt_kernel(
                     }
                 }
                 const float xsum = Xsum[B_idx];
-                acc += a_ptr[B_idx] * part
-                     + b_ptr[B_idx] * xsum * (float)y_count
-                     + c_ptr[B_idx] * Tsum[B_idx];
-                d_xsum = d_ptr[rc] * xsum;
+                acc += __half2float(a_ptr[B_idx]) * part
+                     + __half2float(b_ptr[B_idx]) * xsum * (float)y_count
+                     + __half2float(c_ptr[B_idx]) * Tsum[B_idx];
+                d_xsum = __half2float(d_ptr[rc]) * xsum;
             }
             acc += d_xsum;
         }
@@ -853,9 +853,9 @@ __global__ void bqq_stage2_yt_partial_kernel(
     const float*   __restrict__ T,
     const float*   __restrict__ Tsum,
     const float*   __restrict__ Xsum,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
     float*         __restrict__ partial,
     int row_width, int col_width, int bit_width,
     int y_row, int k8, int row_tiles)
@@ -896,9 +896,9 @@ __global__ void bqq_stage2_yt_partial_kernel(
                 }
             }
             const float xsum = Xsum[B_idx];
-            acc += a_ptr[B_idx] * part
-                 + b_ptr[B_idx] * xsum * (float)y_count
-                 + c_ptr[B_idx] * Tsum[B_idx];
+            acc += __half2float(a_ptr[B_idx]) * part
+                 + __half2float(b_ptr[B_idx]) * xsum * (float)y_count
+                 + __half2float(c_ptr[B_idx]) * Tsum[B_idx];
         }
 
         partial[(size_t)p * row_width * y_row + r * y_row + i] = acc;
@@ -908,7 +908,7 @@ __global__ void bqq_stage2_yt_partial_kernel(
 __global__ void bqq_stage3_reduce_kernel(
     const float* __restrict__ partial,
     const float* __restrict__ Xsum,
-    const float* __restrict__ d_ptr,
+    const __half* __restrict__ d_ptr,
     float*       __restrict__ out,
     int row_width, int col_width, int bit_width, int y_row)
 {
@@ -924,7 +924,7 @@ __global__ void bqq_stage3_reduce_kernel(
     }
     for (int ci = 0; ci < col_width; ci++) {
         const int rc = r * col_width + ci;
-        acc += d_ptr[rc] * Xsum[rc];
+        acc += __half2float(d_ptr[rc]) * Xsum[rc];
     }
     out[idx] = acc;
 }
@@ -934,8 +934,8 @@ __global__ void bqq_stage2_yt_ksplit_lut_kernel(
     const uint8_t* __restrict__ Y,
     const float*   __restrict__ TLut,
     const float*   __restrict__ Xsum,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
     float*         __restrict__ partial,
     int row_width, int col_width, int bit_width,
     int y_row, int k8, int row_tiles, int k_splits)
@@ -973,8 +973,8 @@ __global__ void bqq_stage2_yt_ksplit_lut_kernel(
                 part += lut[bk * 256 + (int)yb];
             }
             const float xsum = Xsum[B_idx];
-            acc += a_ptr[B_idx] * part
-                 + b_ptr[B_idx] * xsum * (float)y_count;
+            acc += __half2float(a_ptr[B_idx]) * part
+                 + __half2float(b_ptr[B_idx]) * xsum * (float)y_count;
         }
 
         partial[(((size_t)p * k_splits + ks) * row_width + r) * y_row + i] = acc;
@@ -985,8 +985,8 @@ __global__ void bqq_stage3_reduce_ksplit_kernel(
     const float* __restrict__ partial,
     const float* __restrict__ Tsum,
     const float* __restrict__ Xsum,
-    const float* __restrict__ c_ptr,
-    const float* __restrict__ d_ptr,
+    const __half* __restrict__ c_ptr,
+    const __half* __restrict__ d_ptr,
     float*       __restrict__ out,
     int row_width, int col_width, int bit_width, int y_row, int k_splits)
 {
@@ -1004,12 +1004,12 @@ __global__ void bqq_stage3_reduce_ksplit_kernel(
         }
         for (int ci = 0; ci < col_width; ci++) {
             const int B_idx = p * row_width * col_width + r * col_width + ci;
-            acc += c_ptr[B_idx] * Tsum[B_idx];
+            acc += __half2float(c_ptr[B_idx]) * Tsum[B_idx];
         }
     }
     for (int ci = 0; ci < col_width; ci++) {
         const int rc = r * col_width + ci;
-        acc += d_ptr[rc] * Xsum[rc];
+        acc += __half2float(d_ptr[rc]) * Xsum[rc];
     }
     out[idx] = acc;
 }
@@ -1044,9 +1044,9 @@ __global__ void bqq_stage2_yt_partial_lut_kernel(
     const float*   __restrict__ TLut,
     const float*   __restrict__ Tsum,
     const float*   __restrict__ Xsum,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
     float*         __restrict__ partial,
     int row_width, int col_width, int bit_width,
     int y_row, int k8, int row_tiles)
@@ -1080,9 +1080,9 @@ __global__ void bqq_stage2_yt_partial_lut_kernel(
                 part += lut[bk * 256 + (int)yb];
             }
             const float xsum = Xsum[B_idx];
-            acc += a_ptr[B_idx] * part
-                 + b_ptr[B_idx] * xsum * (float)y_count
-                 + c_ptr[B_idx] * Tsum[B_idx];
+            acc += __half2float(a_ptr[B_idx]) * part
+                 + __half2float(b_ptr[B_idx]) * xsum * (float)y_count
+                 + __half2float(c_ptr[B_idx]) * Tsum[B_idx];
         }
 
         partial[(size_t)p * row_width * y_row + r * y_row + i] = acc;
@@ -1095,9 +1095,9 @@ __global__ void bqq_stage2_yt_rowwarp_lut_partial_kernel(
     const float*   __restrict__ TLut,
     const float*   __restrict__ Tsum,
     const float*   __restrict__ Xsum,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
     float*         __restrict__ partial,
     int row_width, int col_width, int bit_width,
     int y_row, int k8, int row_tiles)
@@ -1133,9 +1133,9 @@ __global__ void bqq_stage2_yt_rowwarp_lut_partial_kernel(
         const float y_count = warp_reduce_sum(ycount_local);
         if (lane == 0) {
             const float xsum = Xsum[B_idx];
-            acc += a_ptr[B_idx] * part
-                 + b_ptr[B_idx] * xsum * y_count
-                 + c_ptr[B_idx] * Tsum[B_idx];
+            acc += __half2float(a_ptr[B_idx]) * part
+                 + __half2float(b_ptr[B_idx]) * xsum * y_count
+                 + __half2float(c_ptr[B_idx]) * Tsum[B_idx];
         }
     }
 
@@ -1154,10 +1154,10 @@ __global__ void bqq_decode_two_stage_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const float*   __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -1194,9 +1194,9 @@ __global__ void bqq_decode_two_stage_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
             float t_sum = 0.0f;
 
             for (int l = 0; l < K_MAX; l++) {
@@ -1230,7 +1230,7 @@ __global__ void bqq_decode_two_stage_kernel(
             __syncthreads();
         }
 
-        if (has_i) acc += d_ptr[rc] * xsum;
+        if (has_i) acc += __half2float(d_ptr[rc]) * xsum;
     }
 
     if (has_i) {
@@ -1247,10 +1247,10 @@ __global__ void bqq_decode_two_stage_warp_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const float*   __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -1290,9 +1290,9 @@ __global__ void bqq_decode_two_stage_warp_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
 
             for (int l_base = 0; l_base < K_MAX; l_base += N_WARPS) {
                 const int l = l_base + warp_id;
@@ -1342,7 +1342,7 @@ __global__ void bqq_decode_two_stage_warp_kernel(
             __syncthreads();
         }
 
-        if (has_i) acc += d_ptr[rc] * xsum;
+        if (has_i) acc += __half2float(d_ptr[rc]) * xsum;
     }
 
     if (has_i) {
@@ -1359,10 +1359,10 @@ __global__ void bqq_decode_grouped_scatter_kernel(
     const uint8_t* __restrict__ Y,
     const uint8_t* __restrict__ Z,
     const float*   __restrict__ X,
-    const float*   __restrict__ a_ptr,
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,
+    const __half*  __restrict__ a_ptr,
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,
     float*         __restrict__ out,
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8,
@@ -1405,9 +1405,9 @@ __global__ void bqq_decode_grouped_scatter_kernel(
 
         for (int p = 0; p < bit_width; p++) {
             const int B_idx = p * row_width * col_width + rc;
-            const float a_val = a_ptr[B_idx];
-            const float b_val = b_ptr[B_idx];
-            const float c_val = c_ptr[B_idx];
+            const float a_val = __half2float(a_ptr[B_idx]);
+            const float b_val = __half2float(b_ptr[B_idx]);
+            const float c_val = __half2float(c_ptr[B_idx]);
 
             for (int i = tid; i < N_WARPS * y_row; i += blockDim.x) {
                 warp_partials[i] = 0.0f;
@@ -1463,7 +1463,7 @@ __global__ void bqq_decode_grouped_scatter_kernel(
             __syncthreads();
         }
 
-        const float d_term = d_ptr[rc] * xsum;
+        const float d_term = __half2float(d_ptr[rc]) * xsum;
         for (int i = tid; i < y_row; i += blockDim.x) {
             row_acc[i] += d_term;
         }
@@ -1498,10 +1498,10 @@ __global__ void bqq_decode_grouped_scatter_kernel(
 __global__ void reconstruct_W_kernel(
     const uint8_t* __restrict__ Y,      /* [B_total, y_row, k8] */
     const uint8_t* __restrict__ Z,      /* [B_total, z_col, k8] */
-    const float*   __restrict__ a_ptr,  /* [B_total] */
-    const float*   __restrict__ b_ptr,
-    const float*   __restrict__ c_ptr,
-    const float*   __restrict__ d_ptr,  /* [row_width * col_width] */
+    const __half*  __restrict__ a_ptr,  /* [B_total] */
+    const __half*  __restrict__ b_ptr,
+    const __half*  __restrict__ c_ptr,
+    const __half*  __restrict__ d_ptr,  /* [row_width * col_width] */
     __half*        __restrict__ W_out,  /* [out_features, in_features] fp16 */
     int row_width, int col_width, int bit_width,
     int y_row, int z_col, int k8)
@@ -1537,11 +1537,11 @@ __global__ void reconstruct_W_kernel(
                 zs    += __popc(static_cast<unsigned>(zp[bk]));
             }
         }
-        val += a_ptr[B] * (float)inner
-             + b_ptr[B] * (float)ys
-             + c_ptr[B] * (float)zs;
+        val += __half2float(a_ptr[B]) * (float)inner
+             + __half2float(b_ptr[B]) * (float)ys
+             + __half2float(c_ptr[B]) * (float)zs;
     }
-    val += d_ptr[r * col_width + c];
+    val += __half2float(d_ptr[r * col_width + c]);
     W_out[out_idx * in_features + in_idx] = __float2half(val);
 }
 
@@ -1561,11 +1561,18 @@ torch::Tensor reconstruct_W(
     dim3 block(16, 16);
     dim3 grid((out_f + 15) / 16, (in_f + 15) / 16);
 
+    auto a_h = a.to(torch::kFloat16).contiguous();
+    auto b_h = b.to(torch::kFloat16).contiguous();
+    auto c_h = c.to(torch::kFloat16).contiguous();
+    auto d_h = d.to(torch::kFloat16).contiguous();
+
     reconstruct_W_kernel<<<grid, block>>>(
         Y_packed.data_ptr<uint8_t>(),
         Z_packed.data_ptr<uint8_t>(),
-        a.data_ptr<float>(), b.data_ptr<float>(),
-        c.data_ptr<float>(), d.data_ptr<float>(),
+        reinterpret_cast<const __half*>(a_h.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(b_h.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(c_h.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(d_h.data_ptr<at::Half>()),
         reinterpret_cast<__half*>(W.data_ptr<at::Half>()),
         row_width, col_width, bit_width,
         y_row, z_col, k8);
@@ -1586,23 +1593,69 @@ torch::Tensor reconstruct_W(
  * seq_len >  32 → reconstruct_W (popcount) + cuBLAS FP16 matmul
  */
 
-torch::Tensor bqq_forward(
-    torch::Tensor Y_packed,     /* [bit, row, col, y_row, k8]  uint8 */
-    torch::Tensor Z_packed,     /* [bit, row, col, z_col, k8]  uint8 */
-    torch::Tensor X,            /* [..., in_features]                */
-    torch::Tensor a,            /* [bit, row, col, 1, 1]             */
-    torch::Tensor b,            /* [bit, row, col, 1, 1]             */
-    torch::Tensor c,            /* [bit, row, col, 1, 1]             */
-    torch::Tensor d,            /* [row, col, 1, 1]                  */
-    torch::Tensor bias)         /* [out_features] or empty           */
+static inline const __half* half_ptr(const torch::Tensor& t) {
+    return reinterpret_cast<const __half*>(t.data_ptr<at::Half>());
+}
+
+/* Decode-path epilogue: emit the fp32 workspace as fp16 and re-zero it in
+ * the same pass, so the accumulation workspace can live in the layer's
+ * flat cache and no per-call zeros/fill/cast aten ops are needed. */
+__global__ void bqq_ws_store_half_zero_kernel(
+    float* __restrict__ ws, __half* __restrict__ out, int n)
 {
-    /* ── extract dimensions from tensor shapes ─────────────── */
-    const int bit_width = Y_packed.size(0);
-    const int row_width = Y_packed.size(1);
-    const int col_width = Y_packed.size(2);
-    const int y_row     = Y_packed.size(3);
-    const int k8        = Y_packed.size(4);
-    const int z_col     = Z_packed.size(3);
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = __float2half(ws[i]);
+        ws[i] = 0.0f;
+    }
+}
+
+/* Cached multiprocessor count per device (cudaDeviceGetAttribute is
+ * surprisingly expensive to call on every decode step). */
+static int cached_sm_count() {
+    constexpr int kMaxDevices = 64;
+    static int sm_cache[kMaxDevices] = {0};
+    int device = 0;
+    cudaGetDevice(&device);
+    if (device < 0 || device >= kMaxDevices) device = 0;
+    if (sm_cache[device] == 0) {
+        int sm = 0;
+        cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device);
+        sm_cache[device] = sm > 0 ? sm : 1;
+    }
+    return sm_cache[device];
+}
+
+/* Core entry point taking pre-flattened weights.  Callers that hold the
+ * layer state (PackedBinaryQuadratic) cache these flat fp32 tensors once,
+ * so per-call reshape/dtype-conversion work disappears from the decode
+ * hot path. */
+torch::Tensor bqq_forward_core(
+    torch::Tensor Y_flat,       /* [B_total, y_row, k8]  uint8, contiguous */
+    torch::Tensor Z_flat,       /* [B_total, z_col, k8]  uint8, contiguous */
+    torch::Tensor X,            /* [..., in_features]                      */
+    torch::Tensor a_flat,       /* [B_total]             float16           */
+    torch::Tensor b_flat,       /* [B_total]             float16           */
+    torch::Tensor c_flat,       /* [B_total]             float16           */
+    torch::Tensor d_flat,       /* [row_width*col_width] float16           */
+    torch::Tensor bias,         /* [out_features] or empty                 */
+    torch::Tensor ws,           /* [1, row_width, y_row] float32 zeroed
+                                   workspace, or undefined.  Must be zero on
+                                   entry; the fused epilogue re-zeroes it.  */
+    int64_t bit_width_, int64_t row_width_, int64_t col_width_,
+    int64_t y_row_, int64_t z_col_)
+{
+    TORCH_CHECK(a_flat.scalar_type() == torch::kHalf &&
+                b_flat.scalar_type() == torch::kHalf &&
+                c_flat.scalar_type() == torch::kHalf &&
+                d_flat.scalar_type() == torch::kHalf,
+                "bqq_forward_flat: a/b/c/d must be float16");
+    const int bit_width = (int)bit_width_;
+    const int row_width = (int)row_width_;
+    const int col_width = (int)col_width_;
+    const int y_row     = (int)y_row_;
+    const int z_col     = (int)z_col_;
+    const int k8        = Y_flat.size(2);
     const int out_f     = row_width * y_row;
     const int in_f      = col_width * z_col;
     const int B_total   = bit_width * row_width * col_width;
@@ -1613,14 +1666,6 @@ torch::Tensor bqq_forward(
     int64_t batch = 1;
     for (int i = 0; i < (int)X_shape.size() - 1; i++) batch *= X_shape[i];
     auto X_2d = X.reshape({batch, in_f});
-
-    /* ── flatten weights (views, no copy if contiguous) ─────── */
-    auto Y_flat = Y_packed.reshape({B_total, y_row, k8}).contiguous();
-    auto Z_flat = Z_packed.reshape({B_total, z_col, k8}).contiguous();
-    auto a_flat = a.reshape({B_total}).to(torch::kFloat32).contiguous();
-    auto b_flat = b.reshape({B_total}).to(torch::kFloat32).contiguous();
-    auto c_flat = c.reshape({B_total}).to(torch::kFloat32).contiguous();
-    auto d_flat = d.reshape({row_width * col_width}).to(torch::kFloat32).contiguous();
 
     torch::Tensor result;
 
@@ -1634,12 +1679,7 @@ torch::Tensor bqq_forward(
         const bool use_large_rowtile =
             large_kernel && std::strcmp(large_kernel, "rowtile") == 0 && k8 <= 16;
 
-        int device = 0;
-        int sm_count = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(
-            &sm_count, cudaDevAttrMultiProcessorCount, device);
-        if (sm_count <= 0) sm_count = 1;
+        const int sm_count = cached_sm_count();
 
         auto X_view_half = X_2d.reshape({(int)batch, col_width, z_col}).contiguous();
 
@@ -1670,8 +1710,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_byte4_rowtile_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits, row_tiles)
 
@@ -1730,8 +1770,8 @@ torch::Tensor bqq_forward(
                         TLut.data_ptr<float>(),
                         Tsum.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
-                        a_flat.data_ptr<float>(), b_flat.data_ptr<float>(),
-                        c_flat.data_ptr<float>(),
+                        half_ptr(a_flat), half_ptr(b_flat),
+                        half_ptr(c_flat),
                         partial.data_ptr<float>(),
                         row_width, col_width, bit_width, y_row, k8, rowwarp_row_tiles);
 
@@ -1741,7 +1781,7 @@ torch::Tensor bqq_forward(
                     bqq_stage3_reduce_kernel<<<s3_grid, s3_block>>>(
                         partial.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
-                        d_flat.data_ptr<float>(),
+                        half_ptr(d_flat),
                         out.data_ptr<float>(),
                         row_width, col_width, bit_width, y_row);
                 } else {
@@ -1753,8 +1793,8 @@ torch::Tensor bqq_forward(
                         T.data_ptr<float>(),
                         Tsum.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
-                        a_flat.data_ptr<float>(), b_flat.data_ptr<float>(),
-                        c_flat.data_ptr<float>(),
+                        half_ptr(a_flat), half_ptr(b_flat),
+                        half_ptr(c_flat),
                         partial.data_ptr<float>(),
                         row_width, col_width, bit_width, y_row, k8, row_tiles);
 
@@ -1764,7 +1804,7 @@ torch::Tensor bqq_forward(
                     bqq_stage3_reduce_kernel<<<s3_grid, s3_block>>>(
                         partial.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
-                        d_flat.data_ptr<float>(),
+                        half_ptr(d_flat),
                         out.data_ptr<float>(),
                         row_width, col_width, bit_width, y_row);
                 }
@@ -1775,8 +1815,8 @@ torch::Tensor bqq_forward(
                     T.data_ptr<float>(),
                     Tsum.data_ptr<float>(),
                     Xsum.data_ptr<float>(),
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(),
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(),
+                    half_ptr(a_flat), half_ptr(b_flat),
+                    half_ptr(c_flat), half_ptr(d_flat),
                     out.data_ptr<float>(),
                     row_width, col_width, bit_width, y_row, k8, row_tiles);
             }
@@ -1812,12 +1852,7 @@ torch::Tensor bqq_forward(
             : torch::Tensor();
 
         constexpr int NW = 4;
-        int device = 0;
-        int sm_count = 0;
-        cudaGetDevice(&device);
-        cudaDeviceGetAttribute(
-            &sm_count, cudaDevAttrMultiProcessorCount, device);
-        if (sm_count <= 0) sm_count = 1;
+        const int sm_count = cached_sm_count();
 
         int col_splits = max(1, (72 * sm_count + row_width * NW - 1)
                                 / (row_width * NW));
@@ -1841,11 +1876,26 @@ torch::Tensor bqq_forward(
             decode_kernel && std::strcmp(decode_kernel, "grouped") == 0 &&
             y_row <= 256 && k8 <= 16;
 
-        auto out = (col_splits > 1 || use_grouped_scatter)
-            ? torch::zeros({(int)batch, row_width, y_row},
-                  torch::dtype(torch::kFloat32).device(X.device()))
-            : torch::empty({(int)batch, row_width, y_row},
-                  torch::dtype(torch::kFloat32).device(X.device()));
+        /* Fused-output path: accumulate into the caller-cached, pre-zeroed
+         * fp32 workspace, then one epilogue kernel emits fp16 and re-zeroes.
+         * Replaces per-call zeros+fill and the fp32→fp16 aten cast. */
+        const bool fuse_out =
+            ws.defined() && batch == 1 &&
+            X.scalar_type() == torch::kFloat16 &&
+            ws.is_cuda() && ws.scalar_type() == torch::kFloat32 &&
+            ws.dim() == 3 && ws.size(0) == 1 &&
+            ws.size(1) == row_width && ws.size(2) == y_row;
+
+        torch::Tensor out;
+        if (fuse_out) {
+            out = ws;
+        } else {
+            out = (col_splits > 1 || use_grouped_scatter)
+                ? torch::zeros({(int)batch, row_width, y_row},
+                      torch::dtype(torch::kFloat32).device(X.device()))
+                : torch::empty({(int)batch, row_width, y_row},
+                      torch::dtype(torch::kFloat32).device(X.device()));
+        }
 
         dim3 grid(row_width * col_splits, batch);
         const bool use_auto_decode_kernel = decode_kernel == nullptr;
@@ -1866,8 +1916,8 @@ torch::Tensor bqq_forward(
                 bqq_decode_grouped_scatter_kernel<GW, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1881,8 +1931,8 @@ torch::Tensor bqq_forward(
             bqq_decode_two_stage_warp_kernel<TW><<<grid, block>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits);
         } else if (use_two_stage) {
@@ -1891,8 +1941,8 @@ torch::Tensor bqq_forward(
                 bqq_decode_two_stage_kernel<K8M><<<grid, block>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1908,8 +1958,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_kernel<float, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1917,8 +1967,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1926,8 +1976,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_byte_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1935,8 +1985,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_byte2_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -1944,8 +1994,8 @@ torch::Tensor bqq_forward(
                 bqq_forward_byte4_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     reinterpret_cast<const __half*>(X_view_half.data_ptr<at::Half>()), \
-                    a_flat.data_ptr<float>(), b_flat.data_ptr<float>(), \
-                    c_flat.data_ptr<float>(), d_flat.data_ptr<float>(), \
+                    half_ptr(a_flat), half_ptr(b_flat), \
+                    half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
 
@@ -2002,7 +2052,19 @@ torch::Tensor bqq_forward(
             #undef LAUNCH_FLOAT
         }
 
-        result = out.reshape({(int)batch, out_f});
+        if (fuse_out) {
+            auto out_h = torch::empty({1, out_f},
+                torch::dtype(torch::kFloat16).device(X.device()));
+            const int threads = 256;
+            const int blocks = (out_f + threads - 1) / threads;
+            bqq_ws_store_half_zero_kernel<<<blocks, threads>>>(
+                ws.data_ptr<float>(),
+                reinterpret_cast<__half*>(out_h.data_ptr<at::Half>()),
+                out_f);
+            result = out_h;
+        } else {
+            result = out.reshape({(int)batch, out_f});
+        }
 
     } else {
         /* ── large seq: reconstruct W (popcount) + cuBLAS FP16 ── */
@@ -2014,8 +2076,8 @@ torch::Tensor bqq_forward(
 
         reconstruct_W_kernel<<<rgrid, rblock>>>(
             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(),
-            a_flat.data_ptr<float>(), b_flat.data_ptr<float>(),
-            c_flat.data_ptr<float>(), d_flat.data_ptr<float>(),
+            half_ptr(a_flat), half_ptr(b_flat),
+            half_ptr(c_flat), half_ptr(d_flat),
             reinterpret_cast<__half*>(W_half.data_ptr<at::Half>()),
             row_width, col_width, bit_width, y_row, z_col, k8);
 
@@ -2030,6 +2092,41 @@ torch::Tensor bqq_forward(
     auto out_shape = X_shape;
     out_shape.back() = out_f;
     return result.reshape(out_shape).to(X.dtype());
+}
+
+/* Legacy entry point: takes the 5-D packed layout and per-call converts
+ * the coefficients to flat fp16.  Prefer bqq_forward_flat + caching the
+ * flat tensors on the module — the conversions here cost ~6 extra CUDA
+ * ops per call, which dominates single-token decode. */
+torch::Tensor bqq_forward(
+    torch::Tensor Y_packed,     /* [bit, row, col, y_row, k8]  uint8 */
+    torch::Tensor Z_packed,     /* [bit, row, col, z_col, k8]  uint8 */
+    torch::Tensor X,            /* [..., in_features]                */
+    torch::Tensor a,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor b,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor c,            /* [bit, row, col, 1, 1]             */
+    torch::Tensor d,            /* [row, col, 1, 1]                  */
+    torch::Tensor bias)         /* [out_features] or empty           */
+{
+    const int bit_width = Y_packed.size(0);
+    const int row_width = Y_packed.size(1);
+    const int col_width = Y_packed.size(2);
+    const int y_row     = Y_packed.size(3);
+    const int k8        = Y_packed.size(4);
+    const int z_col     = Z_packed.size(3);
+    const int B_total   = bit_width * row_width * col_width;
+
+    auto Y_flat = Y_packed.reshape({B_total, y_row, k8}).contiguous();
+    auto Z_flat = Z_packed.reshape({B_total, z_col, k8}).contiguous();
+    auto a_flat = a.reshape({B_total}).to(torch::kFloat16).contiguous();
+    auto b_flat = b.reshape({B_total}).to(torch::kFloat16).contiguous();
+    auto c_flat = c.reshape({B_total}).to(torch::kFloat16).contiguous();
+    auto d_flat = d.reshape({row_width * col_width}).to(torch::kFloat16).contiguous();
+
+    return bqq_forward_core(Y_flat, Z_flat, X,
+                            a_flat, b_flat, c_flat, d_flat, bias,
+                            torch::Tensor(),
+                            bit_width, row_width, col_width, y_row, z_col);
 }
 
 
@@ -2095,6 +2192,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("Y_packed"), py::arg("Z_packed"), py::arg("X"),
           py::arg("a"), py::arg("b"), py::arg("c"), py::arg("d"),
           py::arg("bias"));
+    m.def("bqq_forward_flat", &bqq_forward_core,
+          "BQQ forward with pre-flattened uint8 weights and fp16 coefficients "
+          "(cache these on the module to keep dtype conversions off the decode path)",
+          py::arg("Y_flat"), py::arg("Z_flat"), py::arg("X"),
+          py::arg("a_flat"), py::arg("b_flat"), py::arg("c_flat"),
+          py::arg("d_flat"), py::arg("bias"), py::arg("ws"),
+          py::arg("bit_width"), py::arg("row_width"), py::arg("col_width"),
+          py::arg("y_row"), py::arg("z_col"));
     m.def("prefetch_tensors_to_l2", &prefetch_tensors_to_l2,
           "Prefetch weight tensors into L2 cache");
     m.def("set_l2_persistence", &set_l2_persistence,

@@ -78,6 +78,7 @@ from neural_network_compression.bqqkernel.bqq_modules import (  # noqa: F401
     merge_binary_quadratic,
     merge_binaryquadratic_recursive,
     pack_binaryquadratic_model,
+    unpack_binaryquadratic_model,
 )
 
 
@@ -234,7 +235,7 @@ def save_bqq_model(model_name, compressed_data_dir, bit_width, group_size, num_s
 # ---------------------------------------------------------------------------
 
 def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None,
-                          output_dir=None, pack=False, name_suffix=""):
+                          output_dir=None, pack=True, name_suffix=""):
     """Assemble full model from block_*.pth files (blockwise_quant output)."""
     block_dir = Path(block_dir)
     output_dir = Path(output_dir) if output_dir is not None else default_quantized_model_dir(model_name)
@@ -288,6 +289,26 @@ def assemble_from_blocks(model_name, block_dir, bit_width=None, group_size=None,
 # ---------------------------------------------------------------------------
 # Pack an existing assembled model
 # ---------------------------------------------------------------------------
+
+def unpack_existing_model(input_path, output_path=None):
+    """Convert all PackedBinaryQuadratic layers in a saved .pth back to
+    BinaryQuadratic, for tools that need the unpacked .Y/.Z layout
+    (e.g. scale_refine_bqq.py)."""
+    input_path = Path(input_path)
+    if output_path is None:
+        output_path = input_path.with_name(input_path.stem + "-unpacked.pth")
+    output_path = Path(output_path)
+
+    print(f"Loading model from {input_path} ...")
+    model = torch.load(input_path, map_location="cpu", weights_only=False, pickle_module=dill)
+
+    print("Unpacking PackedBinaryQuadratic layers ...")
+    unpack_binaryquadratic_model(model)
+
+    torch.save(model, output_path, pickle_module=dill)
+    print(f"Saved unpacked model to {output_path}")
+    return output_path
+
 
 def pack_existing_model(input_path, output_path=None):
     """Convert all BinaryQuadratic layers in a saved .pth to PackedBinaryQuadratic."""
@@ -350,8 +371,11 @@ def main():
     p_asm.add_argument("--bit_width", type=int, default=None)
     p_asm.add_argument("--group_size", type=int, default=None)
     p_asm.add_argument("--output_dir", type=Path, default=None)
-    p_asm.add_argument("--pack", action="store_true",
-                        help="Convert BinaryQuadratic to PackedBinaryQuadratic (8x smaller Y/Z)")
+    p_asm.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True,
+                        help="Convert BinaryQuadratic to PackedBinaryQuadratic "
+                             "(8x smaller Y/Z, fast CUDA decode kernel; the "
+                             "differentiable fallback keeps it trainable). "
+                             "Use --no-pack to keep the unpacked layout.")
     p_asm.add_argument("--name_suffix", type=str, default="",
                         help="Extra suffix appended before .pth (e.g. 'revH' -> ...-blockwise-revH.pth)")
 
@@ -361,6 +385,16 @@ def main():
                          help="Path to existing assembled .pth file")
     p_pack.add_argument("--output", type=Path, default=None,
                          help="Output path (default: <input>-packed.pth)")
+
+    # --- unpack ---
+    p_unpack = sub.add_parser(
+        "unpack",
+        help="Convert a packed .pth back to unpacked BinaryQuadratic "
+             "(for tools needing .Y/.Z, e.g. scale refinement)")
+    p_unpack.add_argument("--input", type=Path, required=True,
+                          help="Path to packed .pth file")
+    p_unpack.add_argument("--output", type=Path, default=None,
+                          help="Output path (default: <input>-unpacked.pth)")
 
     # --- export-hf ---
     p_hf = sub.add_parser("export-hf", help="Export BQQ model to HuggingFace format")
@@ -381,6 +415,9 @@ def main():
 
     elif args.command == "pack":
         pack_existing_model(args.input, args.output)
+
+    elif args.command == "unpack":
+        unpack_existing_model(args.input, args.output)
 
     elif args.command == "export-hf":
         export_hf(args.bqq_model, args.model_name, args.output_dir)

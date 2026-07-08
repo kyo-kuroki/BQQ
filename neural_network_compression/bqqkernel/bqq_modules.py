@@ -417,9 +417,72 @@ class PackedBinaryQuadratic(nn.Module):
 
     _empty_bias = None  # cached empty tensor for no-bias case
 
+    def _get_flat_cache(self) -> dict:
+        """Flat uint8 weights + fp16 coefficients for the CUDA kernel.
+
+        The kernel consumes [B, y_row/z_col, k8] uint8 and flat fp16 a/b/c/d
+        (converted to fp32 in-kernel; accumulation stays fp32).
+        Rebuilding those views and dtype-converting the coefficients on every
+        call adds ~6 CUDA ops per layer, which dominates single-token decode,
+        so cache them here.  The cache key is the data_ptr of Y_packed and a,
+        which changes whenever .to()/.half()/.cuda() rebuilds storage.
+        In-place edits of a/b/c/d (e.g. fine-tuning) are NOT detected — call
+        _invalidate_flat_cache() after mutating coefficients.
+        """
+        cache = self.__dict__.get("_flat_cache")
+        key = (self.Y_packed.data_ptr(), self.a.data_ptr())
+        if cache is not None and cache["key"] == key:
+            return cache
+        B = self.bit_width * self.row_width * self.col_width
+        cache = {
+            "key": key,
+            "Y_flat": self.Y_packed.reshape(B, self.y_row, self._k8).contiguous(),
+            "Z_flat": self.Z_packed.reshape(B, self.z_col, self._k8).contiguous(),
+            "a_flat": self.a.detach().reshape(B).half().contiguous(),
+            "b_flat": self.b.detach().reshape(B).half().contiguous(),
+            "c_flat": self.c.detach().reshape(B).half().contiguous(),
+            "d_flat": self.d.detach().reshape(
+                self.row_width * self.col_width).half().contiguous(),
+            # Pre-zeroed fp32 accumulation workspace for the fused decode
+            # epilogue (bqq_ws_store_half_zero_kernel re-zeroes after use).
+            "ws": torch.zeros(1, self.row_width, self.y_row,
+                              dtype=torch.float32,
+                              device=self.Y_packed.device),
+        }
+        self.__dict__["_flat_cache"] = cache
+        return cache
+
+    def _invalidate_flat_cache(self) -> None:
+        self.__dict__.pop("_flat_cache", None)
+
+    _forward_flat = None  # cached ext.bqq_forward_flat (avoids per-call lookup)
+
+    def _needs_grad(self, X: torch.Tensor) -> bool:
+        return torch.is_grad_enabled() and (
+            X.requires_grad
+            or self.a.requires_grad or self.b.requires_grad
+            or self.c.requires_grad or self.d.requires_grad
+            or (self.bias is not None and self.bias.requires_grad))
+
     def forward(self, X):
-        from .bqq_cuda_ext import _get_ext
-        ext = _get_ext()
+        if self._needs_grad(X):
+            # Differentiable fallback: the CUDA kernel has no autograd
+            # support and reads detached fp16 coefficient caches, so when
+            # gradients are needed rebuild W from a/b/c/d (Y/Z stay frozen
+            # bits) exactly like BinaryQuadratic's training forward.
+            # Gradients flow to a/b/c/d, bias and X.  The flat cache is
+            # dropped here because the optimizer updates a/b/c/d in place,
+            # which the data_ptr cache key cannot detect.
+            self._invalidate_flat_cache()
+            W = self.get_weight(X.dtype)
+            out = X @ W.T
+            if self.bias is not None:
+                out = out + self.bias.type(X.dtype)
+            return out
+        fwd = PackedBinaryQuadratic._forward_flat
+        if fwd is None:
+            from .bqq_cuda_ext import _get_ext
+            fwd = PackedBinaryQuadratic._forward_flat = _get_ext().bqq_forward_flat
         if self.bias is not None:
             b = self.bias
         else:
@@ -428,9 +491,13 @@ class PackedBinaryQuadratic(nn.Module):
                 PackedBinaryQuadratic._empty_bias = torch.empty(
                     0, device=self.Y_packed.device)
             b = PackedBinaryQuadratic._empty_bias
-        return ext.bqq_forward(
-            self.Y_packed, self.Z_packed, X,
-            self.a, self.b, self.c, self.d, b)
+        cache = self._get_flat_cache()
+        return fwd(
+            cache["Y_flat"], cache["Z_flat"], X,
+            cache["a_flat"], cache["b_flat"], cache["c_flat"], cache["d_flat"],
+            b, cache["ws"],
+            self.bit_width, self.row_width, self.col_width,
+            self.y_row, self.z_col)
 
     def get_weight(self, dtype=torch.float32):
         W_core = self._compute_W_core(dtype)
@@ -444,6 +511,34 @@ class PackedBinaryQuadratic(nn.Module):
             self.row_width * self.y_row, self.col_width * self.z_col
         )
         return W
+
+    def to_unpacked(self) -> 'BinaryQuadratic':
+        """Convert back to BinaryQuadratic (inverse of from_unpacked).
+
+        For tools that operate on the unpacked layout (.Y/.Z bool tensors),
+        e.g. scale refinement.  Numerically exact: bits are unpacked
+        losslessly and A is reassembled so that BinaryQuadratic.__init__
+        reproduces a/b/c/d (d is split evenly across bits before the
+        sum(dim=0) in __init__).
+        """
+        Y = self._unpack_to_bool(self.Y_packed, self.inter_dimension)
+        # Z was stored transposed as [..., z_col, inter_dim]; transpose back
+        Z = self._unpack_to_bool(self.Z_packed, self.inter_dimension) \
+            .transpose(-2, -1).contiguous()
+
+        A = torch.empty(
+            self.bit_width, self.row_width, self.col_width, 4,
+            dtype=self.a.dtype, device=self.a.device)
+        A[..., 0] = self.a.detach()[..., 0, 0]
+        A[..., 1] = self.b.detach()[..., 0, 0]
+        A[..., 2] = self.c.detach()[..., 0, 0]
+        A[..., 3] = (self.d.detach()[..., 0, 0] / self.bit_width).expand(
+            self.bit_width, -1, -1)
+
+        return BinaryQuadratic(
+            Y, Z, A,
+            bias=self.bias.data.clone() if self.bias is not None else None,
+        )
 
 
 class PartialBQQLinear(nn.Module):
@@ -781,6 +876,16 @@ def pack_binaryquadratic_model(model: nn.Module) -> nn.Module:
             setattr(model, name, PackedBinaryQuadratic.from_unpacked(module))
         else:
             pack_binaryquadratic_model(module)
+    return model
+
+
+def unpack_binaryquadratic_model(model: nn.Module) -> nn.Module:
+    """Recursively replace all PackedBinaryQuadratic layers with BinaryQuadratic."""
+    for name, module in list(model.named_children()):
+        if isinstance(module, PackedBinaryQuadratic):
+            setattr(model, name, module.to_unpacked())
+        else:
+            unpack_binaryquadratic_model(module)
     return model
 
 
