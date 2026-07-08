@@ -140,11 +140,15 @@ def _parse_decode_kernels(value: str) -> list[str | None]:
             continue
         if item.lower() in {"default", "current", "fused"}:
             result.append(None)
-        elif item in {"original", "two_stage", "two_stage_warp"}:
+        elif item in {"bitblas_byte", "bitblas_byte2", "bitblas_byte4"}:
             result.append(item)
         else:
             raise ValueError(f"unknown decode kernel: {item}")
     return result
+
+
+def _parse_ints(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
 
 
 def main() -> None:
@@ -152,7 +156,8 @@ def main() -> None:
     parser.add_argument("--out-features", type=int, default=4096)
     parser.add_argument("--in-features", type=int, default=4096)
     parser.add_argument("--bit-width", type=int, default=1)
-    parser.add_argument("--group-size", type=int, default=64)
+    parser.add_argument("--bit-widths", default="1,2,3")
+    parser.add_argument("--group-size", type=int, default=None)
     parser.add_argument("--y-row", type=int, default=None)
     parser.add_argument("--z-col", type=int, default=None)
     parser.add_argument("--inter-dim", type=int, default=64)
@@ -173,8 +178,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--decode-kernels",
-        default="default,two_stage,two_stage_warp",
-        help="Comma-separated decode kernels: default,original,two_stage,two_stage_warp.",
+        default="default,bitblas_byte4,bitblas_byte2,bitblas_byte",
+        help="Comma-separated decode kernels: default,bitblas_byte4,bitblas_byte2,bitblas_byte.",
     )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -186,89 +191,87 @@ def main() -> None:
 
     device = torch.device("cuda")
     dtype = getattr(torch, args.dtype)
-    y_row = args.y_row if args.y_row is not None else args.group_size
-    z_col = args.z_col if args.z_col is not None else args.group_size
-    layer, x = _make_layer(
-        out_features=args.out_features,
-        in_features=args.in_features,
-        bit_width=args.bit_width,
-        y_row=y_row,
-        z_col=z_col,
-        inter_dim=args.inter_dim,
-        device=device,
-        dtype=dtype,
-        seed=args.seed,
-    )
+    default_group = args.group_size if args.group_size is not None else 2 * args.inter_dim
+    y_row = args.y_row if args.y_row is not None else default_group
+    z_col = args.z_col if args.z_col is not None else default_group
+    bit_widths = _parse_ints(args.bit_widths) if args.bit_widths else [args.bit_width]
 
-    print(
-        "decode benchmark: "
-        f"out={args.out_features} in={args.in_features} "
-        f"bits={args.bit_width} y_row={y_row} z_col={z_col} inter={args.inter_dim} "
-        f"dtype={args.dtype}"
-    )
-    print("method,col_splits,mean_ms,p50_ms,p90_ms,tokens_per_s")
-
-    dense_baselines: list[tuple[str, torch.Tensor]] = []
-    if args.baseline in {"dense-bf16", "all"}:
-        dense_baselines.append((
-            "dense-bf16",
-            torch.randn(
-                (args.out_features, args.in_features),
-                device=device,
-                dtype=torch.bfloat16,
-            ),
-        ))
-    if args.baseline in {"dense-fp16", "all"}:
-        dense_baselines.append((
-            "dense-fp16",
-            torch.randn(
-                (args.out_features, args.in_features),
-                device=device,
-                dtype=torch.float16,
-            ),
-        ))
-
-    for name, weight in dense_baselines:
-        dense_x = x.to(weight.dtype)
-        mean_ms, p50_ms, p90_ms = _time_forward(
-            lambda weight=weight, dense_x=dense_x: torch.nn.functional.linear(dense_x, weight),
-            warmup=args.warmup,
-            iters=args.iters,
-            inner_iters=args.inner_iters,
-        )
-        toks = 1000.0 / mean_ms
-        print(f"{name},n/a,{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+    print("method,bits,col_splits,mean_ms,p50_ms,p90_ms,tokens_per_s")
 
     old_splits_env = os.environ.get("BQQ_CUDA_COL_SPLITS")
     old_kernel_env = os.environ.get("BQQ_CUDA_DECODE_KERNEL")
     try:
-        for kernel in _parse_decode_kernels(args.decode_kernels):
-            if kernel is None:
-                os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
-                kernel_label = "default"
-            else:
-                os.environ["BQQ_CUDA_DECODE_KERNEL"] = kernel
-                kernel_label = kernel
+        for bit_width in bit_widths:
+            layer, x = _make_layer(
+                out_features=args.out_features,
+                in_features=args.in_features,
+                bit_width=bit_width,
+                y_row=y_row,
+                z_col=z_col,
+                inter_dim=args.inter_dim,
+                device=device,
+                dtype=dtype,
+                seed=args.seed + bit_width,
+            )
 
-            for splits in _parse_splits(args.col_splits):
-                if splits is None:
-                    os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
-                    split_label = "auto"
-                else:
-                    os.environ["BQQ_CUDA_COL_SPLITS"] = str(splits)
-                    split_label = str(splits)
+            dense_baselines: list[tuple[str, torch.Tensor]] = []
+            if args.baseline in {"dense-bf16", "all"}:
+                dense_baselines.append((
+                    "dense-bf16",
+                    torch.randn(
+                        (args.out_features, args.in_features),
+                        device=device,
+                        dtype=torch.bfloat16,
+                    ),
+                ))
+            if args.baseline in {"dense-fp16", "all"}:
+                dense_baselines.append((
+                    "dense-fp16",
+                    torch.randn(
+                        (args.out_features, args.in_features),
+                        device=device,
+                        dtype=torch.float16,
+                    ),
+                ))
 
+            for name, weight in dense_baselines:
+                dense_x = x.to(weight.dtype)
                 mean_ms, p50_ms, p90_ms = _time_forward(
-                    lambda: layer(x),
+                    lambda weight=weight, dense_x=dense_x: torch.nn.functional.linear(dense_x, weight),
                     warmup=args.warmup,
                     iters=args.iters,
                     inner_iters=args.inner_iters,
                 )
                 toks = 1000.0 / mean_ms
-                print(
-                    f"bqq-{kernel_label},{split_label},"
-                    f"{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}"
-                )
+                print(f"{name},{bit_width},n/a,{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+
+            for kernel in _parse_decode_kernels(args.decode_kernels):
+                if kernel is None:
+                    os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
+                    kernel_label = "default"
+                else:
+                    os.environ["BQQ_CUDA_DECODE_KERNEL"] = kernel
+                    kernel_label = kernel
+
+                for splits in _parse_splits(args.col_splits):
+                    if splits is None:
+                        os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
+                        split_label = "auto"
+                    else:
+                        os.environ["BQQ_CUDA_COL_SPLITS"] = str(splits)
+                        split_label = str(splits)
+
+                    mean_ms, p50_ms, p90_ms = _time_forward(
+                        lambda: layer(x),
+                        warmup=args.warmup,
+                        iters=args.iters,
+                        inner_iters=args.inner_iters,
+                    )
+                    toks = 1000.0 / mean_ms
+                    print(
+                        f"bqq-{kernel_label},{bit_width},{split_label},"
+                        f"{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}"
+                    )
     finally:
         if old_splits_env is None:
             os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
