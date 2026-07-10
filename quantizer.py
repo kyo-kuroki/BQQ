@@ -1681,7 +1681,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none'):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none', importance_weight=False, importance_score='diag', diag_power=1.0):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -1700,7 +1700,9 @@ class BinaryQuadraticQuantization():
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
                 ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
-                rank_alloc_mode=rank_alloc_mode)
+                rank_alloc_mode=rank_alloc_mode,
+                importance_weight=importance_weight, importance_score=importance_score,
+                diag_power=diag_power)
             if ste_refine_steps > 0:
                 refined_weight, _, _ = self.refine_decomposition_with_ste(
                     all_decomposed=consolidated_path,
@@ -1726,7 +1728,9 @@ class BinaryQuadraticQuantization():
                 max_patch_size, bit_width, H, consolidated_path,
                 zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id, damping, scale_refine, use_multibqq, compensation_mode,
                 ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
-                rank_alloc_mode=rank_alloc_mode)
+                rank_alloc_mode=rank_alloc_mode,
+                importance_weight=importance_weight, importance_score=importance_score,
+                diag_power=diag_power)
         elif use_batch:
             return self._large_matrix_batched(
                 max_patch_size, bit_width, consolidated_path,
@@ -2237,7 +2241,7 @@ class BinaryQuadraticQuantization():
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
         damping=1e-6, scale_refine=True, use_multibqq=True, compensation_mode='ldlq',
         ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none',
-        importance_weight=False, importance_score='diag',
+        importance_weight=False, importance_score='diag', diag_power=1.0,
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -2291,6 +2295,18 @@ class BinaryQuadraticQuantization():
         x_tensor = torch.tensor(x_copy, device=compute_device).float()
         H = H.to(dtype=torch.float32, device=x_tensor.device)
         H = 0.5 * (H + H.T)
+        # Optional metric tempering: raise the Hessian eigenvalues to diag_power.
+        # diag_power<1 flattens the eigenvalue spectrum (weights tail directions
+        # more relative to the true metric), which improves the constrained BQQ
+        # solution's true output error; diag_power=1 is the exact output-error
+        # metric. Affects both the LDLQ compensation and the fullchol block metric.
+        if abs(float(diag_power) - 1.0) > 1e-9:
+            _lam, _q = torch.linalg.eigh(H)
+            _lam = _lam.clamp_min(1e-8).pow(float(diag_power))
+            H = (_q * _lam) @ _q.T
+            H = 0.5 * (H + H.T)
+            print(f'Metric tempering: H -> H^{float(diag_power)} '
+                  f'(eig range [{_lam.min().item():.3e}, {_lam.max().item():.3e}])')
         num_col_groups = len(w_ranges)
         compensation_mode = str(compensation_mode).lower()
         valid_modes = {'gptq', 'ldlq', 'none'}

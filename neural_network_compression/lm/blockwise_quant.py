@@ -37,13 +37,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from quantizer import BinaryQuadraticQuantization
 
 try:
-    from .src.build_bqq_model import BinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from .src.build_bqq_model import BinaryQuadratic, DCTBinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from .src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from .src.datautils import get_loaders
     from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
     from .layerwise_quant import layerwise_quantize_block
 except ImportError:
-    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
+    from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, DCTBinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from neural_network_compression.lm.src.datautils import get_loaders
     from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
@@ -406,6 +406,9 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                             use_multibqq=True,
                             compensation_mode='ldlq',
                             use_incoherent=False,
+                            bqq_opt_mode='plain',
+                            diag_power=1.0,
+                            transform='none',
                             ldlq_act_order=False,
                             ldlq_act_order_score='maxdiag',
                             rank_alloc_mode='none',
@@ -428,10 +431,19 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
     (RHT) to W and H before quantization and returns (A, Y, Z, SU, SV).
     """
     SU = SV = None
+    transform_desc = None            # deployment descriptor for non-Hadamard transforms (DCT)
     quant_weight = weight
     quant_H = H
 
-    if use_incoherent and H is not None:
+    # Resolve the input/output transform applied before quantization.
+    #   'none' : no transform (or 'rht' if the legacy use_incoherent flag is set)
+    #   'rht'  : randomized Hadamard (random sign flips)  -> deploy via IncoherentBinaryQuadratic
+    #   'ht'   : plain Hadamard (no sign flips)           -> deploy via IncoherentBinaryQuadratic
+    #   'dct'  : 2D DCT (energy/decorrelation transform)  -> deploy via DCTBinaryQuadratic
+    tkind = str(transform).lower()
+    if tkind == 'none' and use_incoherent:
+        tkind = 'rht'
+    if tkind in ('rht', 'ht') and H is not None:
         import sys as _sys
         import os as _os
         _mc = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
@@ -443,13 +455,34 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
         Wd = weight.to(dev).float()
         Hd = H.to(dev).float()
         m, n = Wd.shape
-        g = torch.Generator().manual_seed(seed + 99999)
-        SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(dev)
-        SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().float().to(dev)
+        if tkind == 'rht':
+            g = torch.Generator().manual_seed(seed + 99999)
+            SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(dev)
+            SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().float().to(dev)
+        else:  # 'ht' -> plain Hadamard, unit sign vectors
+            SU = torch.ones(n, dtype=torch.float32, device=dev)
+            SV = torch.ones(m, dtype=torch.float32, device=dev)
         quant_H = RHT_H(Hd, SU).detach().cpu()
         quant_weight = RHT_W(Wd, SU, SV).detach().cpu()
         SU = SU.cpu()
         SV = SV.cpu()
+    elif tkind == 'dct' and H is not None:
+        from scipy.fft import dct as _dct
+        import numpy as _np
+        dev = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+        Wd = weight.to(dev).float()
+        Hd = H.to(dev).float()
+        m, n = Wd.shape
+        Din = torch.tensor(_dct(_np.eye(n), type=2, norm='ortho', axis=0), dtype=torch.float32, device=dev)
+        Dout = torch.tensor(_dct(_np.eye(m), type=2, norm='ortho', axis=0), dtype=torch.float32, device=dev)
+        quant_weight = (Dout @ Wd @ Din.T).detach().cpu()          # W' = Dout W Din^T
+        quant_H = (Din @ Hd @ Din.T).detach().cpu()                # H' = Din H Din^T
+        transform_desc = ('dct', m, n)
+
+    # Objective mode: 'activation-aware' uses the full-matrix Hessian (fullchol)
+    # weighted block optimization; 'plain' uses the unweighted reconstruction.
+    _imp_weight = str(bqq_opt_mode).lower() in ('activation-aware', 'fullchol')
+    _imp_score = 'fullchol'
 
     with tempfile.TemporaryDirectory() as tmpdir:
         consolidated_path = os.path.join(tmpdir, 'temp.pth')
@@ -471,6 +504,9 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
                           ldlq_act_order=ldlq_act_order,
                           ldlq_act_order_score=ldlq_act_order_score,
                           rank_alloc_mode=rank_alloc_mode,
+                          importance_weight=_imp_weight,
+                          importance_score=_imp_score,
+                          diag_power=diag_power,
                           ste_refine_steps=ste_refine_steps,
                           ste_refine_lr=ste_refine_lr,
                           ste_refine_weight_decay=ste_refine_weight_decay,
@@ -487,7 +523,7 @@ def quantize_weight_to_bqq(weight, *, bit_width, group_size, num_steps,
         patches = torch.load(consolidated_path, weights_only=False, map_location='cpu')
 
     A, Y, Z = get_bqq_matrices(patches, bit_width)
-    return A, Y, Z, SU, SV
+    return A, Y, Z, SU, SV, transform_desc
 
 
 
@@ -623,14 +659,19 @@ def _set_submodule(module, dotted_name, new_child):
     setattr(parent, parts[-1], new_child)
 
 
-def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True, SU=None, SV=None):
+def replace_linear_in_block(block, linear_name, A, Y, Z, bias=None, *, trainable_ste=True, optimize_factors=True, optimize_coeffs=True, optimize_theta=True, optimize_beta=True, SU=None, SV=None, transform_desc=None):
     """Replace a specific Linear in block with a BQQ module.
 
     If SU and SV are provided the layer is wrapped as IncoherentBinaryQuadratic
-    (factors encode the weight in RHT space; forward applies the inverse Hadamard
-    transform to recover the original-space weight-times-input product).
+    (factors encode the weight in RHT/HT space; forward applies the inverse
+    Hadamard transform). If transform_desc is ('dct', n_out, n_in) the layer is
+    wrapped as DCTBinaryQuadratic (factors in 2D-DCT space; forward applies the
+    DCT to the input and inverse DCT to the output).
     """
-    if SU is not None and SV is not None:
+    if transform_desc is not None and transform_desc[0] == 'dct':
+        _, n_out, n_in = transform_desc
+        bqq_module = DCTBinaryQuadratic(Y, Z, A, n_in=n_in, n_out=n_out, bias=bias)
+    elif SU is not None and SV is not None:
         bqq_module = IncoherentBinaryQuadratic(Y, Z, A, SU=SU, SV=SV, bias=bias)
     elif trainable_ste:
         bqq_module = TrainableSTEBinaryQuadratic(
@@ -1401,7 +1442,7 @@ def quantize_block_progressive(
             layer = _get_submodule(block, lname)
             print(f'  [{lname}] BQQ quantize full layer '
                   f'{tuple(layer.float_weight.shape)} → activating {len(ij_list)} patches')
-            A_all, Y_all, Z_all, _SU, _SV = quantize_weight_to_bqq(
+            A_all, Y_all, Z_all, _SU, _SV, _td = quantize_weight_to_bqq(
                 layer.float_weight.data.clone(),
                 bit_width=bit_width,
                 group_size=group_size,
@@ -1500,6 +1541,9 @@ def quantize_block_progressive_closed_form(
     use_multibqq=True,
     compensation_mode='ldlq',
     use_incoherent=False,
+    bqq_opt_mode='plain',
+    diag_power=1.0,
+    transform='none',
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
@@ -1603,7 +1647,7 @@ def quantize_block_progressive_closed_form(
             quant_weight = current_linear.weight.data.detach().float().clone()
             bias = current_linear.bias.data.clone().float() if current_linear.bias is not None else None
 
-        A, Y, Z, SU, SV = quantize_weight_to_bqq(
+        A, Y, Z, SU, SV, transform_desc = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width,
             group_size=group_size,
@@ -1617,6 +1661,9 @@ def quantize_block_progressive_closed_form(
             use_multibqq=use_multibqq,
             compensation_mode=compensation_mode,
             use_incoherent=use_incoherent,
+            bqq_opt_mode=bqq_opt_mode,
+            diag_power=diag_power,
+            transform=transform,
             ldlq_act_order=ldlq_act_order,
             ldlq_act_order_score=ldlq_act_order_score,
             rank_alloc_mode=rank_alloc_mode,
@@ -1646,6 +1693,7 @@ def quantize_block_progressive_closed_form(
             optimize_beta=not fix_beta,
             SU=SU,
             SV=SV,
+            transform_desc=transform_desc,
         )
         del H_current
         if use_closed_form:
@@ -1735,6 +1783,9 @@ def quantize_block_attn_mlp_split(
     use_multibqq=True,
     compensation_mode='ldlq',
     use_incoherent=False,
+    bqq_opt_mode='plain',
+    diag_power=1.0,
+    transform='none',
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
@@ -1794,12 +1845,13 @@ def quantize_block_attn_mlp_split(
         cur_linear = _get_submodule(current_block, lname)
         quant_weight = cur_linear.weight.data.detach().float().clone()
         bias = cur_linear.bias.data.clone().float() if cur_linear.bias is not None else None
-        A, Y, Z, SU, SV = quantize_weight_to_bqq(
+        A, Y, Z, SU, SV, transform_desc = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width, group_size=group_size, num_steps=num_steps,
             rank_scale=rank_scale, seed=seed, device_id=device_id, H=H_current,
             scale_refine=scale_refine, damping=damping, use_multibqq=use_multibqq,
             compensation_mode=compensation_mode, use_incoherent=use_incoherent,
+            bqq_opt_mode=bqq_opt_mode, diag_power=diag_power, transform=transform,
             ldlq_act_order=ldlq_act_order,
             ldlq_act_order_score=ldlq_act_order_score, rank_alloc_mode=rank_alloc_mode,
             ste_refine_steps=ste_refine_steps, ste_refine_lr=ste_refine_lr,
@@ -1816,7 +1868,7 @@ def quantize_block_attn_mlp_split(
         # Freeze binary factors (BinaryQuadratic): only the continuous scale
         # factors a,b,c,d stay trainable for the subsequent MLP fine-tuning.
         replace_linear_in_block(current_block, lname, A, Y, Z, bias=bias,
-                                trainable_ste=False, SU=SU, SV=SV)
+                                trainable_ste=False, SU=SU, SV=SV, transform_desc=transform_desc)
         del H_current
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -2057,6 +2109,15 @@ def main():
                         help='Column compensation mode for Hessian-aware BQQ')
     parser.add_argument('--use_incoherent', action='store_true', default=False,
                         help='Apply randomized Hadamard (RHT) incoherence transform before BQQ quantization')
+    parser.add_argument('--bqq_opt_mode', type=str, default='plain', choices=['plain', 'activation-aware'],
+                        help="BQQ block objective: 'plain' = unweighted reconstruction; "
+                             "'activation-aware' = full-matrix Hessian (fullchol) weighted output error")
+    parser.add_argument('--diag_power', type=float, default=1.0,
+                        help='Metric tempering exponent alpha: quantize with H^alpha (alpha<1 flattens the '
+                             'Hessian eigenvalue spectrum; 1.0 = exact output-error metric)')
+    parser.add_argument('--transform', type=str, default='none', choices=['none', 'rht', 'ht', 'dct'],
+                        help='Input/output transform before quantization: rht/ht = (randomized) Hadamard, '
+                             'dct = 2D DCT. Deployed via IncoherentBinaryQuadratic (rht/ht) or DCTBinaryQuadratic (dct)')
     parser.add_argument('--no_tune_after_quantize', action='store_true', default=False,
                         help='Skip Phase 4 final continuous-param fine-tune after all weights are quantized (attn-mlp mode only)')
     parser.add_argument('--ldlq_act_order', action='store_true', default=False,
@@ -2249,6 +2310,9 @@ def main():
                 use_multibqq=args.use_multibqq,
                 compensation_mode=args.compensation_mode,
                 use_incoherent=args.use_incoherent,
+                bqq_opt_mode=args.bqq_opt_mode,
+                diag_power=args.diag_power,
+                transform=args.transform,
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,
@@ -2295,6 +2359,9 @@ def main():
                 use_multibqq=args.use_multibqq,
                 compensation_mode=args.compensation_mode,
                 use_incoherent=args.use_incoherent,
+                bqq_opt_mode=args.bqq_opt_mode,
+                diag_power=args.diag_power,
+                transform=args.transform,
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,

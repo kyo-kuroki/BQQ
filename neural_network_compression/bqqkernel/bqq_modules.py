@@ -117,6 +117,62 @@ class IncoherentBinaryQuadratic(BinaryQuadratic):
         return (matmul_hadU((matmul_hadU(Wr_q) * SU).T) * SV).T
 
 
+_DCT_MATRIX_CACHE = {}
+
+
+def _dct_matrix(n, device, dtype):
+    """Orthonormal DCT-II matrix D[k,j] (rows=frequencies). D is orthogonal.
+    Cached per dimension (the matrix depends only on n)."""
+    key = (int(n), str(device), str(dtype))
+    M = _DCT_MATRIX_CACHE.get(key)
+    if M is None:
+        j = torch.arange(n, dtype=torch.float64)
+        k = torch.arange(n, dtype=torch.float64).unsqueeze(1)
+        M = torch.cos(torch.pi * (2 * j + 1) * k / (2 * n)) * (2.0 / n) ** 0.5
+        M[0] = M[0] / (2.0 ** 0.5)                        # orthonormal DCT-II
+        M = M.to(device=device, dtype=dtype)
+        _DCT_MATRIX_CACHE[key] = M
+    return M
+
+
+class DCTBinaryQuadratic(BinaryQuadratic):
+    """BQQ layer whose stored weight lives in the 2D-DCT space.
+
+    At quantization time the weight was transformed W' = D_out W D_in^T (D the
+    orthonormal DCT matrix) and BQQ-quantized in that space. This module stores
+    the BQQ factors of W'_q plus the in/out dimensions, and applies the DCT to the
+    input and the inverse DCT to the output so the effective linear map equals the
+    original-space quantized weight W_q = D_out^T W'_q D_in:
+
+        y = W_q x  =>  x' = D_in x;  h = W'_q x';  y = D_out^T h
+    """
+
+    def __init__(self, Y, Z, A, n_in, n_out, bias=None):
+        super().__init__(Y, Z, A, bias=bias)
+        self.n_in = int(n_in)
+        self.n_out = int(n_out)
+
+    def forward(self, X):
+        dtype = X.dtype
+        device = self.Y.device
+        Wq = self.get_weight(dtype=dtype)                       # DCT-space weight [out, in]
+        Din = _dct_matrix(self.n_in, device, dtype)
+        Dout = _dct_matrix(self.n_out, device, dtype)
+        Xp = X.to(device) @ Din.T                              # DCT of input  [..., in]
+        out = Xp @ Wq.T                                        # [..., out]
+        out = out @ Dout                                       # inverse DCT of output (D_out^T)
+        if self.bias is not None:
+            out = out + self.bias.type(dtype).to(device)
+        return out
+
+    def get_dense_weight(self, dtype=torch.float32):
+        """Return the effective original-space quantized weight W_q [out, in]."""
+        Wq = self.get_weight(dtype=dtype)
+        Din = _dct_matrix(self.n_in, Wq.device, dtype)
+        Dout = _dct_matrix(self.n_out, Wq.device, dtype)
+        return Dout.T @ Wq @ Din                               # D_out^T W'_q D_in
+
+
 class BinarySTE01(Function):
     """Binary {0,1} quantization with learnable threshold and sigmoid STE."""
 
