@@ -1,7 +1,9 @@
 import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+sys.path.append(os.path.dirname(__file__))  # sibling modules (comparison_of_optimization)
 import glob
+from types import SimpleNamespace
 import torch
 import numpy as np
 import pandas as pd
@@ -17,6 +19,36 @@ from quantizer import (
     JPEG,
 )
 from lplr.compressors import direct_svd_quant, lplr, lplr_svd, iterative_lplr
+
+
+# --- QUIP-Sharp (weight-error only: H = I) ----------------------------------
+# quip.quantize minimizes tr((W-Wq) H (W-Wq)^T); with H = I this is exactly the
+# weight Frobenius error ||W-Wq||_F^2, so QUIP-Sharp lands on the same weight-MSE
+# vs memory trade-off as BQQ/UQ/VQ/etc. Codebooks are fixed bit-rates.
+QUIP_CODEBOOK_BITS = {'E8P12': 2, 'E8P12RVQ3B': 3, 'E8P12RVQ4B': 4}
+
+
+def _quip_args(codebook, quip_sharp_root, device_id):
+    return SimpleNamespace(
+        quip_sharp_root=quip_sharp_root, quip_codebook=codebook,
+        quip_sigma_reg=1e-2, quip_sigma_reg2=1e-2, quip_incoh_mode='had',
+        quip_lora_rank=0, quip_scale_override=-1, quip_resid_scale_override=-1,
+        quip_tune_iters=10, quip_device_id=device_id, quip_debug_dir='/tmp',
+        quip_use_fp64=False, quip_full_svd=False, quip_no_use_buffered=False,
+        quip_rescale_wh=False, quip_lowmem_ldlq=False,
+    )
+
+
+def quantize_quip_sharp_weight_only(matrix, codebook='E8P12',
+                                    quip_sharp_root='/work2/k-kuroki/quip-sharp', device_id=0):
+    """Quantize a plain weight matrix [out, in] with QUIP-Sharp using H = I.
+
+    Returns Wq (same shape, float, cpu). Raises ValueError if the matrix is not
+    QUIP-compatible (in must be divisible by the codebook codesz, out even)."""
+    from comparison_of_optimization import quantize_quip_sharp_ldlq
+    W = matrix.detach().cpu().float()
+    H = torch.eye(W.shape[1], dtype=torch.float32)
+    return quantize_quip_sharp_ldlq(W, H, _quip_args(codebook, quip_sharp_root, device_id))
 
 
 
@@ -38,18 +70,20 @@ def MSE(matrix1, matrix2):
 
 def load_matrix_data():
     matrix_list = []
+    names = []
     base_dir = os.path.join(os.path.dirname(__file__), 'data')
-    
-    # ディレクトリ内のすべての .pt ファイルを取得
-    pt_files = glob.glob(os.path.join(base_dir, '*.pt'))
-    
+
+    # ディレクトリ内のすべての .pt ファイルを取得（決定的な順序でソート）
+    pt_files = sorted(glob.glob(os.path.join(base_dir, '*.pt')))
+
     # 各ファイルをロードしてリストに追加
     for file_path in pt_files:
         matrix = torch.load(file_path)
         matrix_list.append(matrix)
+        names.append(os.path.splitext(os.path.basename(file_path))[0])
         print(f"[INFO] Loaded: {os.path.basename(file_path)}")
 
-    return matrix_list
+    return matrix_list, names
 
 
     
@@ -95,13 +129,19 @@ def crop_to_max_power_of_two(matrices):
 
 
 
-def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_id=1):
+def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_id=1,
+                  run_quip=True, quip_sharp_root='/work2/k-kuroki/quip-sharp',
+                  quip_codebooks=('E8P12', 'E8P12RVQ3B', 'E8P12RVQ4B'), titles=None):
     num_matrices = len(matrix_list)
     fig = plt.figure(figsize=(8 * (num_matrices+1), 36))  # 4行×N列
     n_row = 4
     records = []
 
     for col, matrix in tqdm(enumerate(matrix_list)):
+        # Crop every matrix to the largest power-of-two square so all methods
+        # (including QUIP-Sharp, which needs in%8==0 and out even) run on the
+        # identical matrix -> a fair weight-MSE vs memory comparison.
+        matrix = crop_to_max_power_of_two([matrix])[0]
         matrix = normalize_zero_mean_unit_var(matrix)
         ax1 = fig.add_subplot(n_row, num_matrices, col + 1)
         
@@ -115,6 +155,7 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
         lq_e_list, lq_m_list = [], []
         lplr_e_list, lplr_m_list = [], []
         jpeg_e_list, jpeg_m_list = [], []
+        quip_e_list, quip_m_list = [], []
         stack = torch.zeros_like(matrix)
 
         # SVD
@@ -158,6 +199,28 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
             elif bit==2: ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit', marker='p', color='violet', linewidth=8, markersize=20)
             elif bit==1: ax1.plot(svd_m_list, svd_e_list, label=f'LPLR {bit}-bit', marker='p', color='mediumvioletred', linewidth=8, markersize=20)
 
+
+        # QUIP-Sharp (weight-error only, H = I). Fixed bit-rate codebooks -> a
+        # 2/3/4-bit curve. Skips codebooks whose bit-rate isn't in bitwidth_list
+        # or matrices that aren't QUIP-compatible (in%codesz!=0 / out odd).
+        if run_quip:
+            for cb_name in quip_codebooks:
+                bits = QUIP_CODEBOOK_BITS.get(cb_name)
+                if bits is None or bits not in bitwidth_list:
+                    continue
+                print(f'running quip-sharp {cb_name} ({bits}-bit, H=I)...')
+                try:
+                    Wq = quantize_quip_sharp_weight_only(
+                        matrix, codebook=cb_name, quip_sharp_root=quip_sharp_root,
+                        device_id=device_id)
+                    quip_e_list.append(MSE(matrix, Wq))
+                    # index bits + SU/SV sign vectors (out+in, 1 bit each) + one
+                    # global fp32 scale (Wscale, fused into SV). No per-row/col
+                    # scales (rescale_WH=False), so scale overhead is a single scalar.
+                    quip_m_list.append((bits * matrix.numel()
+                                        + (matrix.shape[0] + matrix.shape[1]) + 32) / 8000)
+                except Exception as exc:
+                    print(f'  quip-sharp {cb_name} skipped: {exc}')
 
         for bw in (bitwidth_list):
             # UQ
@@ -236,11 +299,16 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
         ax1.plot(lq_m_list, lq_e_list, label='LVQ', marker='D', color='green', linewidth=8, markersize=20)
         ax1.plot(jpeg_m_list, jpeg_e_list, label='8-bit UQ + JPEG', marker='+', color='darkturquoise', linewidth=8, markersize=20)
         ax1.plot(qq_m_list, qq_e_list, label='BQQ', marker='o', color='r', linewidth=8, markersize=20)
+        if quip_m_list:
+            _qorder = sorted(range(len(quip_m_list)), key=lambda i: quip_m_list[i])
+            ax1.plot([quip_m_list[i] for i in _qorder], [quip_e_list[i] for i in _qorder],
+                     label='QuIP#', marker='*', color='teal', linewidth=8, markersize=25)
         ax1.set_xlabel('Memory Size [KB]', fontsize=45, labelpad=20)
         ax1.set_ylabel('MSE', fontsize=45, labelpad=20)
 
 
-        ax1.set_title(dic[col], fontsize=75, pad=40)
+        col_label = titles[col] if titles is not None else dic[col]
+        ax1.set_title(col_label, fontsize=75, pad=40)
         if len(matrix_list) == col+1:
             ax1.legend(fontsize=40, loc='center left', bbox_to_anchor=(1.0, 0.5))
         ax1.grid(True)
@@ -300,6 +368,7 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
             ('LVQ', lq_m_list, lq_e_list),
             ('8-bit UQ + JPEG', jpeg_m_list, jpeg_e_list),
             ('BQQ', qq_m_list, qq_e_list),
+            ('QuIP#', quip_m_list, quip_e_list),
         ]
 
         # レコード化
@@ -309,7 +378,7 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
                     'Method': method,
                     'Memory': m,
                     'MSE': e.item(),
-                    'Category': dic[col]
+                    'Category': col_label
                 })
 
         # DataFrame化してCSV出力
@@ -324,7 +393,9 @@ def plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_i
 
 
 if __name__ == '__main__':
-    matrix_list = load_matrix_data()
-    fig, df = plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_id=0)
+    matrix_list, names = load_matrix_data()
+    fig, df = plot_tradeoff(matrix_list, bitwidth_list=[1, 2, 3, 4], Nstep=50000, device_id=0,
+                            titles=names)
     df.to_csv(os.path.dirname(__file__)+'/results/tradeoff.csv', index=False)
     fig.savefig(os.path.dirname(__file__)+'/results/tradeoff.pdf')
+    fig.savefig(os.path.dirname(__file__)+'/results/tradeoff.png', dpi=80)
