@@ -43,9 +43,9 @@ NO_IO_CACHE="${NO_IO_CACHE:-1}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
-BQQ_OPT_MODE="${BQQ_OPT_MODE:-plain}"          # Options: "plain", "activation-aware" (full-matrix Hessian / fullchol)
-DIAG_POWER="${DIAG_POWER:-1.0}"                # Metric tempering alpha: quantize with H^alpha (alpha<1 flattens the spectrum)
-TRANSFORM="${TRANSFORM:-none}"                 # Options: "none", "rht", "ht", "dct" (input/output transform before quantization)
+BQQ_OPT_MODE="${BQQ_OPT_MODE:-activation-aware}"          # Options: "plain", "activation-aware" (full-matrix Hessian / fullchol)
+DIAG_POWER="${DIAG_POWER:-0.75}"                # Metric tempering alpha: quantize with H^alpha (alpha<1 flattens the spectrum)
+TRANSFORM="${TRANSFORM:-rht}"                 # Options: "none", "rht", "ht", "dct" (input/output transform before quantization)
 LDLQ_ACT_ORDER="${LDLQ_ACT_ORDER:-0}"
 LDLQ_ACT_ORDER_SCORE="${LDLQ_ACT_ORDER_SCORE:-maxdiag}"
 RANK_ALLOC_MODE="${RANK_ALLOC_MODE:-none}"
@@ -97,6 +97,9 @@ run_one_block() {
       --seed "${SEED}"
       --save_dir "${LAYERWISE_DIR}"
       --compensation_mode "${COMPENSATION_MODE}"
+      --bqq_opt_mode "${BQQ_OPT_MODE}"
+      --diag_power "${DIAG_POWER}"
+      --transform "${TRANSFORM}"
       "${assemble_args[@]}"
     )
     if [[ "${USE_MULTIBQQ}" == "1" ]]; then
