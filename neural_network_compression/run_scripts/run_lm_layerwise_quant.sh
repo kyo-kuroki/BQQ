@@ -30,6 +30,9 @@ SEED="${SEED:-0}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-0}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-0}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
+BQQ_OPT_MODE="${BQQ_OPT_MODE:-plain}"          # "plain" | "activation-aware" (full-matrix Hessian / fullchol)
+DIAG_POWER="${DIAG_POWER:-1.0}"                # Metric tempering alpha: quantize with H^alpha (alpha<1 flattens the spectrum)
+TRANSFORM="${TRANSFORM:-none}"                 # "none" | "rht" | "ht" | "dct" (input/output transform before quantization)
 
 MODEL_BASENAME="${MODEL_NAME##*/}"
 LAYERWISE_DIR="${LAYERWISE_DIR:-${LM_DIR}/src/bqq_compressed_data/${MODEL_BASENAME}-${BIT_WIDTH}bit-${GROUP_SIZE}gs-${LAYERWISE_ANNEAL_STEPS}step}"
@@ -66,6 +69,9 @@ run_one_block() {
     --main_gpu_id 0
     --save_dir "${LAYERWISE_DIR}"
     --compensation_mode "${COMPENSATION_MODE}"
+    --bqq_opt_mode "${BQQ_OPT_MODE}"
+    --diag_power "${DIAG_POWER}"
+    --transform "${TRANSFORM}"
     "${assemble_args[@]}"
   )
 

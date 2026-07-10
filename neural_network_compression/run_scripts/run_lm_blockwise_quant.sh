@@ -7,7 +7,7 @@ LM_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)/lm"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3.5-4B}" # Example Options: "Qwen/Qwen3.5-4B", "meta-llama/Llama-3.1-8B"
 BLOCK_IDX="${BLOCK_IDX:-all}" # Options: "all" (process all blocks), or a specific block index (e.g., 0, 1, 2, ...)
 BLOCKS_PER_GPU="${BLOCKS_PER_GPU:-1}"
-BIT_WIDTH="${BIT_WIDTH:-1}"
+BIT_WIDTH="${BIT_WIDTH:-2}"
 GROUP_SIZE="${GROUP_SIZE:-64}"
 
 LAYERWISE_ANNEAL_STEPS="${LAYERWISE_ANNEAL_STEPS:-20000}"
@@ -43,6 +43,9 @@ NO_IO_CACHE="${NO_IO_CACHE:-1}"
 NO_SCALE_REFINE="${NO_SCALE_REFINE:-1}"
 USE_MULTIBQQ="${USE_MULTIBQQ:-1}"
 COMPENSATION_MODE="${COMPENSATION_MODE:-ldlq}"
+BQQ_OPT_MODE="${BQQ_OPT_MODE:-plain}"          # Options: "plain", "activation-aware" (full-matrix Hessian / fullchol)
+DIAG_POWER="${DIAG_POWER:-1.0}"                # Metric tempering alpha: quantize with H^alpha (alpha<1 flattens the spectrum)
+TRANSFORM="${TRANSFORM:-none}"                 # Options: "none", "rht", "ht", "dct" (input/output transform before quantization)
 LDLQ_ACT_ORDER="${LDLQ_ACT_ORDER:-0}"
 LDLQ_ACT_ORDER_SCORE="${LDLQ_ACT_ORDER_SCORE:-maxdiag}"
 RANK_ALLOC_MODE="${RANK_ALLOC_MODE:-none}"
@@ -147,6 +150,9 @@ run_one_block() {
     blockwise_cmd+=(--no_use_multibqq)
   fi
   blockwise_cmd+=(--compensation_mode "${COMPENSATION_MODE}")
+  blockwise_cmd+=(--bqq_opt_mode "${BQQ_OPT_MODE}")
+  blockwise_cmd+=(--diag_power "${DIAG_POWER}")
+  blockwise_cmd+=(--transform "${TRANSFORM}")
   if [[ "${LDLQ_ACT_ORDER}" == "1" ]]; then
     blockwise_cmd+=(--ldlq_act_order)
   fi
