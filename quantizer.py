@@ -1006,6 +1006,468 @@ class BinaryQuadraticQuantization():
         return y, z, maximum * a
 
 
+    def run_weighted_multibqq_compile_batched(self, x, s=None, num_stack=1, rank_scale=1,
+                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       Nstep=50000, device_id=0, seed=1,
+                                       compile_mode="reduce-overhead"):
+        """Importance-weighted batched joint multi-stack BQQ.
+
+        Same as run_multibqq_compile_batched, but the objective is the
+        element-wise weighted reconstruction error
+
+            sum_ij ( s_ij * (x_ij - Wq_ij) )^2      (weight w_ij = s_ij^2)
+
+        instead of the plain ||x - Wq||^2. Both the closed-form coefficient
+        solve (compute_A) and the mean-field energy gradients carry the weight
+        w_ij, so high-importance entries (large s) get smaller quantization
+        error. Setting s=None (w=1) reduces exactly to the unweighted version.
+
+        Input:
+            x: (B, n, m)  -- batch of matrices to factorize
+            s: importance weights, broadcastable to (B, n, m) (per-column
+               s_j = sqrt(H_jj) gives a diagonal Hessian / GPTQ-style weighting).
+               None -> uniform (w=1).
+
+        Returns:
+            y: (B, num_stack, n, rank)  binary
+            z: (B, num_stack, rank, m)  binary
+            a: (B, num_stack, 4)        with per-matrix `maximum` pre-applied
+        """
+        torch.set_float32_matmul_precision('medium')
+        torch.manual_seed(seed)
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+        if x.ndim != 3:
+            raise ValueError('Input must be 3-D (B, n, m)')
+        B, n, m = x.shape
+        N = num_stack
+        rank = round(rank_scale * (n * m) / (n + m))
+
+        x = x.to(device).float()
+        maximum = (x.amax(dim=(1, 2)) - x.amin(dim=(1, 2))).view(B, 1, 1)  # (B,1,1)
+        x = x / maximum
+
+        # Element-wise squared-error weight w_ij = s_ij^2, expanded to (B, n, m).
+        # (s is dimensionless importance, applied in the maximum-scaled space; the
+        # per-matrix `maximum` is only an overall factor and does not affect argmin.)
+        if s is None:
+            w = torch.ones((B, n, m), device=device, dtype=x.dtype)
+        else:
+            s_t = s.to(device).float()
+            while s_t.ndim < 3:
+                s_t = s_t.unsqueeze(0)
+            s_t = s_t.expand(B, n, m).contiguous()
+            # Normalize the importance so mean(w)=mean(s^2)=1 per matrix. The energy
+            # gradient scales with w but the entropy/annealing gradient does not, so
+            # an un-normalized w (e.g. s in [100,1000]) makes the energy term
+            # dominate, the update step blow up, and the solution collapse toward 0.
+            # Normalizing keeps the energy/entropy balance identical to the
+            # unweighted optimizer while preserving the *relative* per-column
+            # importance (argmin-invariant). Normalize s (not s^2) to avoid a large
+            # intermediate ~s^2 (e.g. 1e6) that would inject avoidable rounding.
+            rms = s_t.pow(2).mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(1e-12)
+            s_t = s_t / rms
+            w = (s_t * s_t)
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+
+        yb = torch.rand((B, N, n, rank), device=device)
+        zb = torch.rand((B, N, rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+
+        # Gradient-shaped weighted marginals (broadcast over stacks/rank).
+        w_row_g = w.sum(dim=2).view(B, 1, n, 1)   # sum_j w_ij   (B,1,n,1)
+        w_col_g = w.sum(dim=1).view(B, 1, 1, m)   # sum_i w_ij   (B,1,1,m)
+        # compute_A-shaped weighted marginals and weighted activation moments.
+        w_row = w.sum(dim=2)                      # (B,n)  sum_j w_ij
+        w_col = w.sum(dim=1)                      # (B,m)  sum_i w_ij
+        w_tot = w.sum(dim=(1, 2))                 # (B,)   sum_ij w_ij
+        wx = w * x                                # (B,n,m)
+        wx_row = wx.sum(dim=2)                    # (B,n)
+        wx_col = wx.sum(dim=1)                    # (B,m)
+        wx_tot = wx.sum(dim=(1, 2))               # (B,)
+
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)              # (1, N, N)
+        damping_eye = (1e-6 * torch.eye(4 * N, device=device, dtype=x.dtype)).unsqueeze(0)  # (1, 4N, 4N)
+
+        def compute_A(y, z):
+            """Solve B parallel 4N x 4N systems for the *weighted* expected energy.
+
+            Identical to the unweighted compute_A but every sum over (i,j) carries
+            w_ij. Same-stack diagonal blocks keep the mean-field variance
+            corrections (E[(YZ)^2] != (E[YZ])^2 for binary Y,Z); cross-stack
+            blocks are plain products (independent stacks). Reduces exactly to the
+            unweighted normal equations when w=1."""
+            yz = torch.einsum('bnik,bnkj->bnij', y, z)        # (B, N, n, m)
+            sigma_y = y.sum(dim=3)                            # (B, N, n)
+            sigma_z = z.sum(dim=2)                            # (B, N, m)
+
+            y2 = y * y
+            z2 = z * z
+            y2z = torch.einsum('bnik,bnkj->bnij', y2, z)
+            yz2_mat = torch.einsum('bnik,bnkj->bnij', y, z2)
+            y2z2 = torch.einsum('bnik,bnkj->bnij', y2, z2)
+
+            wexp = w.unsqueeze(1)                             # (B, 1, n, m)
+            wyz = wexp * yz                                   # (B, N, n, m)
+
+            # same-stack (diagonal) blocks with variance corrections, weighted
+            diag_00 = (wexp * (yz*yz + yz - y2z2)).sum(dim=(2, 3))                          # (B, N)
+            diag_01 = (wexp * ((sigma_y.unsqueeze(3) + 1) * yz - y2z)).sum(dim=(2, 3))
+            diag_02 = (wexp * ((1 + sigma_z.unsqueeze(2)) * yz - yz2_mat)).sum(dim=(2, 3))
+            diag_11 = ((sigma_y*sigma_y + sigma_y - y2.sum(dim=3)) * w_row.unsqueeze(1)).sum(dim=2)
+            diag_22 = ((sigma_z*sigma_z + sigma_z - z2.sum(dim=2)) * w_col.unsqueeze(1)).sum(dim=2)
+
+            # cross-stack blocks (independent -> plain products), weighted
+            F00_c = torch.einsum('bnij,boij->bno', wyz, yz)
+            F01_c = torch.einsum('bni,boi->bno', wyz.sum(dim=3), sigma_y)
+            F02_c = torch.einsum('bnj,boj->bno', wyz.sum(dim=2), sigma_z)
+            F03_f = wyz.sum(dim=(2, 3)).unsqueeze(2).expand(B, N, N)
+            F11_c = torch.einsum('bni,boi,bi->bno', sigma_y, sigma_y, w_row)
+            F12_f = torch.einsum('bni,bij,boj->bno', sigma_y, w, sigma_z)
+            F13_f = (sigma_y * w_row.unsqueeze(1)).sum(dim=2).unsqueeze(2).expand(B, N, N)
+            F22_c = torch.einsum('bnj,boj,bj->bno', sigma_z, sigma_z, w_col)
+            F23_f = (sigma_z * w_col.unsqueeze(1)).sum(dim=2).unsqueeze(2).expand(B, N, N)
+            F33_f = w_tot.view(B, 1, 1).expand(B, N, N)
+
+            F00 = torch.where(diag_mask, diag_00.unsqueeze(2).expand(B, N, N), F00_c)
+            F01 = torch.where(diag_mask, diag_01.unsqueeze(2).expand(B, N, N), F01_c)
+            F02 = torch.where(diag_mask, diag_02.unsqueeze(2).expand(B, N, N), F02_c)
+            F11 = torch.where(diag_mask, diag_11.unsqueeze(2).expand(B, N, N), F11_c)
+            F22 = torch.where(diag_mask, diag_22.unsqueeze(2).expand(B, N, N), F22_c)
+
+            row0 = torch.stack([F00, F01, F02, F03_f], dim=-1)
+            row1 = torch.stack([F01.transpose(-1, -2), F11, F12_f, F13_f], dim=-1)
+            row2 = torch.stack([F02.transpose(-1, -2), F12_f.transpose(-1, -2), F22, F23_f], dim=-1)
+            row3 = torch.stack([F03_f.transpose(-1, -2), F13_f.transpose(-1, -2), F23_f.transpose(-1, -2), F33_f], dim=-1)
+            H4 = torch.stack([row0, row1, row2, row3], dim=-2)         # (B, N, N, 4, 4)
+            H_full = 2 * H4.permute(0, 1, 3, 2, 4).reshape(B, 4 * N, 4 * N)
+
+            v0 = -2 * (wx.unsqueeze(1) * yz).sum(dim=(2, 3))          # (B, N)
+            v1 = -2 * (wx_row.unsqueeze(1) * sigma_y).sum(dim=2)
+            v2 = -2 * (wx_col.unsqueeze(1) * sigma_z).sum(dim=2)
+            v3 = (-2 * wx_tot).unsqueeze(1).expand(B, N)
+            v_full = torch.stack([v0, v1, v2, v3], dim=2).reshape(B, 4 * N)
+
+            scale = H_full.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1).view(B, 1, 1)
+            H_reg = H_full + scale * damping_eye
+            A_flat = -torch.linalg.solve(H_reg, v_full.unsqueeze(-1)).squeeze(-1)
+            return A_flat.view(B, N, 4)
+
+        a = compute_A(y, z)
+
+        def _loop_fn(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+                a0 = a[:, :, 0].view(B, N, 1, 1)
+                a1 = a[:, :, 1].view(B, N, 1, 1)
+                a2 = a[:, :, 2].view(B, N, 1, 1)
+                a3 = a[:, :, 3].view(B, N, 1, 1)
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+
+                yz = torch.einsum('bnik,bnkj->bnij', yf, zf)
+                sigma_yf = yf.sum(dim=3, keepdim=True)   # (B, N, n, 1)
+                sigma_zf = zf.sum(dim=2, keepdim=True)   # (B, N, 1, m)
+
+                M_per = a0 * yz + a1 * sigma_yf + a2 * sigma_zf + a3   # (B, N, n, m)
+                total_M = M_per.sum(dim=1)                              # (B, n, m)
+                # Weighted residual w_ij * (x - Wq): appears wherever `part` did.
+                wpart = (w * (x - total_M)).unsqueeze(1).expand(B, N, n, m)   # (B,N,n,m)
+
+                # Y energy gradient (weighted). Weighted column-sums of zf now
+                # depend on the row i, so zf_sum1/zf2_sum1 become WZ1/WZ2 (B,N,n,rank).
+                kernel_y = (a0 * zf + a1).transpose(-1, -2)             # (B, N, m, rank)
+                linear_y = -2 * torch.einsum('bnij,bnjk->bnik', wpart, kernel_y)
+
+                WZ1 = torch.einsum('bij,bnkj->bnik', w, zf)            # sum_j w_ij zf_kj
+                WZ2 = torch.einsum('bij,bnkj->bnik', w, zf * zf)       # sum_j w_ij zf_kj^2
+
+                y_energy_grad = (
+                    linear_y
+                    + (a0*a0 + 2*a0*a1*(1 - 2*yf) + 2*a0*a2) * WZ1
+                    - 2 * (a0*a2 + a0*a0 * yf) * WZ2
+                    + (a1*a1) * (1 - 2 * yf) * w_row_g
+                )
+
+                # Z energy gradient (weighted), symmetric to Y.
+                kernel_z = (a0 * yf + a2).transpose(-1, -2)             # (B, N, rank, n)
+                linear_z = -2 * torch.einsum('bnij,bnjk->bnik', kernel_z, wpart)
+
+                WY0 = torch.einsum('bij,bnik->bnkj', w, yf)           # sum_i w_ij yf_ik
+                WY2 = torch.einsum('bij,bnik->bnkj', w, yf * yf)      # sum_i w_ij yf_ik^2
+
+                z_energy_grad = (
+                    linear_z
+                    + (a0*a0 + 2*a0*a1 + 2*a0*a2*(1 - 2*zf)) * WY0
+                    - 2 * (a0*a0 * zf + a0*a1) * WY2
+                    + (a2*a2) * (1 - 2 * zf) * w_col_g
+                )
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(
+                    torch.where((y < 0.0) | (y > 1.0),
+                                2*y - yb - eta * y_entropy_grad,
+                                2*y - yb - eta * (y_energy_grad + y_entropy_grad)),
+                    0, 1)
+                za = torch.clamp(
+                    torch.where((z < 0.0) | (z > 1.0),
+                                2*z - zb - eta * z_entropy_grad,
+                                2*z - zb - eta * (z_energy_grad + z_entropy_grad)),
+                    0, 1)
+
+                a_new = compute_A(ya, za)
+            return ya, za, y, z, a_new
+
+        loop_body = torch.compile(_loop_fn, mode=compile_mode)
+
+        temp = torch.tensor(Tinit, device=device)
+        delta_temp_t = torch.tensor(delta_temp, device=device)
+
+        for _ in range(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp = temp - delta_temp_t
+
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_A(y, z)
+
+        # maximum: (B, 1, 1); a: (B, N, 4). Broadcast to apply per-matrix scaling.
+        return y, z, maximum * a
+
+
+    def run_matrixweighted_multibqq_compile_batched(self, x, M, num_stack=1, rank_scale=1,
+                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       Nstep=50000, device_id=0, seed=1,
+                                       compile_mode="reduce-overhead"):
+        """Full-matrix (Hessian) weighted batched multi-stack BQQ.
+
+        Minimizes the Hessian-weighted output error over each column block
+
+            tr( (x - Wq) M (x - Wq)^T ) = || (x - Wq) C ||_F^2 ,   M = C C^T
+
+        where M (m x m, shared across the batch's row-groups) is the within-block
+        Hessian metric. This couples columns (unlike the element-wise weighted
+        version). The closed-form coefficient solve and the mean-field gradient
+        use the full M for the mean-reconstruction term; the second-order mean-
+        field variance corrections use diag(M) (they vanish once Y,Z are binary,
+        so this only affects the annealing path). When M is diagonal this reduces
+        *exactly* to run_weighted_multibqq_compile_batched with w = diag(M).
+
+        Input:
+            x: (B, n, m)   -- batch of matrices (row-groups) to factorize
+            M: (m, m) or (B, m, m) -- column Hessian metric (symmetric PSD).
+        Returns: y, z, a  (same layout as run_multibqq_compile_batched).
+        """
+        torch.set_float32_matmul_precision('medium')
+        torch.manual_seed(seed)
+        device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+
+        if x.ndim != 3:
+            raise ValueError('Input must be 3-D (B, n, m)')
+        B, n, m = x.shape
+        N = num_stack
+        rank = round(rank_scale * (n * m) / (n + m))
+
+        x = x.to(device).float()
+        maximum = (x.amax(dim=(1, 2)) - x.amin(dim=(1, 2))).view(B, 1, 1)
+        x = x / maximum
+
+        # Column metric M, symmetrized and normalized so mean(diag(M))=1 per matrix
+        # (keeps the energy/entropy annealing balance identical to the unweighted
+        # optimizer; only the *relative* metric matters). Normalize by the diagonal
+        # mean to match the element-wise mean(w)=1 convention.
+        M = M.to(device).float()
+        if M.ndim == 2:
+            M = M.unsqueeze(0)
+        M = M.expand(B, m, m).contiguous()
+        M = 0.5 * (M + M.transpose(1, 2))
+        M_diag = torch.diagonal(M, dim1=1, dim2=2)                      # (B, m)
+        M = M / M_diag.mean(dim=1, keepdim=True).clamp_min(1e-12).unsqueeze(2)
+        M_diag = torch.diagonal(M, dim1=1, dim2=2).contiguous()        # (B, m), mean 1
+        Ms = M.sum(dim=2)                                              # (B, m) row/col sums (M sym)
+        M_sum = M.sum(dim=(1, 2))                                      # (B,)  1^T M 1
+        Mtr = M_diag.sum(dim=1)                                        # (B,)  trace
+
+        delta_temp = (Tinit - Tfin) / (Nstep - 1)
+
+        yb = torch.rand((B, N, n, rank), device=device)
+        zb = torch.rand((B, N, rank, m), device=device)
+        y = yb - eta * (yb - 0.5)
+        z = zb - eta * (zb - 0.5)
+
+        # target moments contracted through M (for the linear term of compute_A)
+        x_Ms = torch.einsum('bid,bd->bi', x, Ms)      # (B, n)  Sum_d x_id Ms_d
+        xcol = x.sum(dim=1)                            # (B, m)  Sum_i x_id
+        Ms_xcol = (Ms * xcol).sum(dim=1)               # (B,)   Sum_d Ms_d xcol_d
+
+        diag_mask = torch.eye(N, dtype=torch.bool, device=device).unsqueeze(0)
+        damping_eye = (1e-6 * torch.eye(4 * N, device=device, dtype=x.dtype)).unsqueeze(0)
+
+        def compute_A(y, z):
+            """Weighted normal equations for tr((x-Wq)M(x-Wq)^T). Mean-reconstruction
+            blocks use full M; same-stack diagonal blocks add the diag(M) variance
+            corrections. Exact matrix-weighted LS once Y,Z are binary."""
+            yz = torch.einsum('bnik,bnkj->bnij', y, z)   # (B,N,n,m)
+            sigma_y = y.sum(dim=3)                        # (B,N,n)
+            sigma_z = z.sum(dim=2)                        # (B,N,m)
+            y2 = y * y
+            z2 = z * z
+            y2z = torch.einsum('bnik,bnkj->bnij', y2, z)
+            yz2_mat = torch.einsum('bnik,bnkj->bnij', y, z2)
+            y2z2 = torch.einsum('bnik,bnkj->bnij', y2, z2)
+
+            YZM = torch.einsum('bnij,bjd->bnid', yz, M)      # yz @ M     (B,N,n,m)
+            yzM_rowsum = YZM.sum(dim=3)                       # (B,N,n)
+            szM = torch.einsum('bnj,bjd->bnd', sigma_z, M)   # sigma_z @ M (B,N,m)
+            szMs = torch.einsum('bnd,bd->bn', sigma_z, Ms)   # (B,N)
+            sigma_y_total = sigma_y.sum(dim=2)               # (B,N)
+
+            # --- mean-reconstruction inner products tr(B_p M B_q^T) (all n,o) ---
+            G00 = torch.einsum('bnid,boid->bno', YZM, yz)
+            G01 = torch.einsum('bni,boi->bno', yzM_rowsum, sigma_y)
+            G02 = torch.einsum('bnid,bod->bno', YZM, sigma_z)
+            G03 = yzM_rowsum.sum(dim=2)                                        # (B,N)
+            G11 = M_sum.view(B, 1, 1) * torch.einsum('bni,boi->bno', sigma_y, sigma_y)
+            G12 = torch.einsum('bn,bo->bno', sigma_y_total, szMs)
+            G13 = M_sum.unsqueeze(1) * sigma_y_total                          # (B,N)
+            G22 = n * torch.einsum('bnd,bod->bno', szM, sigma_z)
+            G23 = n * szMs                                                    # (B,N)
+            G33 = (n * M_sum)                                                 # (B,)
+
+            # --- same-stack (diagonal) variance corrections, weight = diag(M) ---
+            wd_e = M_diag.view(B, 1, 1, m)
+            var00 = (wd_e * (yz - y2z2)).sum(dim=(2, 3))                      # (B,N)
+            var01 = (wd_e * (yz - y2z)).sum(dim=(2, 3))
+            var02 = (wd_e * (yz - yz2_mat)).sum(dim=(2, 3))
+            var11 = Mtr.unsqueeze(1) * (sigma_y - y2.sum(dim=3)).sum(dim=2)
+            var22 = n * torch.einsum('bnj,bj->bn', (sigma_z - z2.sum(dim=2)), M_diag)
+
+            F00 = G00 + torch.diag_embed(var00)
+            F01 = G01 + torch.diag_embed(var01)
+            F02 = G02 + torch.diag_embed(var02)
+            F03 = G03.unsqueeze(2).expand(B, N, N)
+            F11 = G11 + torch.diag_embed(var11)
+            F12 = G12
+            F13 = G13.unsqueeze(2).expand(B, N, N)
+            F22 = G22 + torch.diag_embed(var22)
+            F23 = G23.unsqueeze(2).expand(B, N, N)
+            F33 = G33.view(B, 1, 1).expand(B, N, N)
+
+            row0 = torch.stack([F00, F01, F02, F03], dim=-1)
+            row1 = torch.stack([F01.transpose(-1, -2), F11, F12, F13], dim=-1)
+            row2 = torch.stack([F02.transpose(-1, -2), F12.transpose(-1, -2), F22, F23], dim=-1)
+            row3 = torch.stack([F03.transpose(-1, -2), F13.transpose(-1, -2), F23.transpose(-1, -2), F33], dim=-1)
+            H4 = torch.stack([row0, row1, row2, row3], dim=-2)
+            H_full = 2 * H4.permute(0, 1, 3, 2, 4).reshape(B, 4 * N, 4 * N)
+
+            v0 = -2 * torch.einsum('bnid,bid->bn', YZM, x)
+            v1 = -2 * torch.einsum('bni,bi->bn', sigma_y, x_Ms)
+            v2 = -2 * torch.einsum('bnd,bd->bn', szM, xcol)
+            v3 = (-2 * Ms_xcol).unsqueeze(1).expand(B, N)
+            v_full = torch.stack([v0, v1, v2, v3], dim=2).reshape(B, 4 * N)
+
+            scale = H_full.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1).view(B, 1, 1)
+            H_reg = H_full + scale * damping_eye
+            A_flat = -torch.linalg.solve(H_reg, v_full.unsqueeze(-1)).squeeze(-1)
+            return A_flat.view(B, N, 4)
+
+        a = compute_A(y, z)
+
+        def _loop_fn(y, z, yb, zb, a, temp):
+            with torch.no_grad():
+                a0 = a[:, :, 0].view(B, N, 1, 1)
+                a1 = a[:, :, 1].view(B, N, 1, 1)
+                a2 = a[:, :, 2].view(B, N, 1, 1)
+                a3 = a[:, :, 3].view(B, N, 1, 1)
+
+                yf = y + zeta * (y - yb)
+                zf = z + zeta * (z - zb)
+
+                yz = torch.einsum('bnik,bnkj->bnij', yf, zf)
+                sigma_yf = yf.sum(dim=3, keepdim=True)
+                sigma_zf = zf.sum(dim=2, keepdim=True)
+
+                M_per = a0 * yz + a1 * sigma_yf + a2 * sigma_zf + a3
+                total_M = M_per.sum(dim=1)                              # (B, n, m)
+                # matrix-weighted residual: part @ M (replaces element-wise w*part)
+                partM = torch.einsum('bij,bjd->bid', (x - total_M), M)  # (B, n, m)
+                wpartM = partM.unsqueeze(1).expand(B, N, n, m)
+
+                # Y energy gradient
+                kernel_y = (a0 * zf + a1).transpose(-1, -2)             # (B, N, m, rank)
+                linear_y = -2 * torch.einsum('bnij,bnjk->bnik', wpartM, kernel_y)
+                # variance corrections use diag(M) -> row-independent weighted sums
+                WZ1 = torch.einsum('bj,bnkj->bnk', M_diag, zf).unsqueeze(2)       # (B,N,1,rank)
+                WZ2 = torch.einsum('bj,bnkj->bnk', M_diag, zf * zf).unsqueeze(2)
+                y_energy_grad = (
+                    linear_y
+                    + (a0*a0 + 2*a0*a1*(1 - 2*yf) + 2*a0*a2) * WZ1
+                    - 2 * (a0*a2 + a0*a0 * yf) * WZ2
+                    + (a1*a1) * (1 - 2 * yf) * Mtr.view(B, 1, 1, 1)
+                )
+
+                # Z energy gradient
+                kernel_z = (a0 * yf + a2).transpose(-1, -2)             # (B, N, rank, n)
+                linear_z = -2 * torch.einsum('bnij,bnjk->bnik', kernel_z, wpartM)
+                yf_sum0 = yf.sum(dim=2)                                 # (B, N, rank)
+                yf2_sum0 = (yf * yf).sum(dim=2)
+                md_col = M_diag.view(B, 1, 1, m)
+                WY0 = yf_sum0.unsqueeze(3) * md_col                     # (B, N, rank, m)
+                WY2 = yf2_sum0.unsqueeze(3) * md_col
+                z_energy_grad = (
+                    linear_z
+                    + (a0*a0 + 2*a0*a1 + 2*a0*a2*(1 - 2*zf)) * WY0
+                    - 2 * (a0*a0 * zf + a0*a1) * WY2
+                    + (a2*a2) * (1 - 2 * zf) * (n * md_col)
+                )
+
+                y_entropy_grad = temp * (y - 0.5)
+                z_entropy_grad = temp * (z - 0.5)
+
+                ya = torch.clamp(
+                    torch.where((y < 0.0) | (y > 1.0),
+                                2*y - yb - eta * y_entropy_grad,
+                                2*y - yb - eta * (y_energy_grad + y_entropy_grad)),
+                    0, 1)
+                za = torch.clamp(
+                    torch.where((z < 0.0) | (z > 1.0),
+                                2*z - zb - eta * z_entropy_grad,
+                                2*z - zb - eta * (z_energy_grad + z_entropy_grad)),
+                    0, 1)
+
+                a_new = compute_A(ya, za)
+            return ya, za, y, z, a_new
+
+        loop_body = torch.compile(_loop_fn, mode=compile_mode)
+
+        temp = torch.tensor(Tinit, device=device)
+        delta_temp_t = torch.tensor(delta_temp, device=device)
+
+        for _ in range(Nstep):
+            y = y.detach().clone()
+            yb = yb.detach().clone()
+            z = z.detach().clone()
+            zb = zb.detach().clone()
+            a = a.detach().clone()
+            y, z, yb, zb, a = loop_body(y, z, yb, zb, a, temp)
+            temp = temp - delta_temp_t
+
+        y = torch.where(y > 0.5, 1.0, 0.0)
+        z = torch.where(z > 0.5, 1.0, 0.0)
+        a = compute_A(y, z)
+
+        return y, z, maximum * a
+
+
     def patchify(self, tensor, max_patch_size):
         """
         テンソルをパッチに分割する関数
@@ -1775,6 +2237,7 @@ class BinaryQuadraticQuantization():
         consolidated_path, zeta, eta, Tinit, Tfin, Nstep, seed, main_gpu_id,
         damping=1e-6, scale_refine=True, use_multibqq=True, compensation_mode='ldlq',
         ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none',
+        importance_weight=False, importance_score='diag',
     ):
         """
         Column-wise Hessian-aware BQQ: process column groups sequentially,
@@ -1942,6 +2405,7 @@ class BinaryQuadraticQuantization():
 
         H_inv = None
         ldlq_L = None
+        ldlq_block_gram = {}
         if compensation_mode == 'gptq':
             # GPTQ/OPTQ form: use the inverse Hessian feedback.
             _L = self._cholesky_safe(H, COMP_DAMPING)
@@ -1960,6 +2424,11 @@ class BinaryQuadraticQuantization():
                 ldlq_L = torch.linalg.cholesky(H_damped)
                 for b0, b1 in w_ranges:
                     block = ldlq_L[b0:b1, b0:b1]
+                    # Save the within-block Hessian metric M = C_block C_block^T
+                    # (raw Cholesky diagonal block) for full-matrix importance
+                    # weighting: it is the residual column metric after LDLQ
+                    # compensation removes the cross-block (future) coupling.
+                    ldlq_block_gram[(b0, b1)] = (block @ block.transpose(-1, -2)).detach()
                     ldlq_L[:, b0:b1] = ldlq_L[:, b0:b1] @ torch.linalg.inv(block)
                 if not torch.isfinite(ldlq_L).all():
                     raise RuntimeError('non-finite block LDL factor')
@@ -1993,14 +2462,48 @@ class BinaryQuadraticQuantization():
                     col_patches.append(group_input[r0:r1, :].clone())
 
                 x_batch = torch.stack(col_patches)
-                print(f'Col {j}/{num_col_groups}: jointly decomposing {len(col_patches)} '
-                      f'patches of ({col_patches[0].shape[0]}x{pw}) with {bit_width} stacks')
 
-                y_mb, z_mb, a_mb = self.run_multibqq_compile_batched(
-                    x_batch, num_stack=bit_width, rank_scale=rs_j,
-                    zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
-                    Nstep=Nstep, device_id=main_gpu_id, seed=seed
-                )
+                if importance_weight and str(importance_score).lower() == 'fullchol' \
+                        and (c0, c1) in ldlq_block_gram:
+                    # Full-matrix (Hessian) weighting: minimize ||(W-Wq) C_block||^2
+                    # over the block, using the within-block metric M = C_block C_block^T.
+                    M_block = ldlq_block_gram[(c0, c1)].to(x_batch.device).float()
+                    print(f'Col {j}/{num_col_groups}: fullchol-weighted-decomposing '
+                          f'{len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw}) '
+                          f'with {bit_width} stacks')
+                    y_mb, z_mb, a_mb = self.run_matrixweighted_multibqq_compile_batched(
+                        x_batch, M=M_block, num_stack=bit_width, rank_scale=rs_j,
+                        zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                        Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                    )
+                elif importance_weight:
+                    # Element-wise importance weight w_ij (error-energy weight);
+                    # s = sqrt(w). The weighted optimizer normalizes s internally
+                    # (mean(w)=1 per matrix), preserving the energy/entropy balance.
+                    #   'diag':     w_ij = H_jj            (curvature, per column)
+                    #   'saliency': w_ij = |W_ij| * H_jj   (magnitude x curvature)
+                    d_col = torch.diagonal(H)[c0:c1].to(x_batch.device).float().clamp_min(1e-12)  # (pw,)
+                    if str(importance_score).lower() == 'saliency':
+                        w_elem = x_batch.abs() * d_col.view(1, 1, pw)          # (B, rh, pw)
+                    else:
+                        w_elem = d_col.view(1, 1, pw).expand_as(x_batch)      # (B, rh, pw)
+                    s = w_elem.clamp_min(1e-30).sqrt()
+                    print(f'Col {j}/{num_col_groups}: weighted({importance_score})-decomposing '
+                          f'{len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw}) '
+                          f'with {bit_width} stacks')
+                    y_mb, z_mb, a_mb = self.run_weighted_multibqq_compile_batched(
+                        x_batch, s=s, num_stack=bit_width, rank_scale=rs_j,
+                        zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                        Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                    )
+                else:
+                    print(f'Col {j}/{num_col_groups}: jointly decomposing {len(col_patches)} '
+                          f'patches of ({col_patches[0].shape[0]}x{pw}) with {bit_width} stacks')
+                    y_mb, z_mb, a_mb = self.run_multibqq_compile_batched(
+                        x_batch, num_stack=bit_width, rank_scale=rs_j,
+                        zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                        Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                    )
 
                 for b_idx, (r0, r1) in enumerate(h_ranges):
                     for bit_idx in range(bit_width):
@@ -2023,6 +2526,11 @@ class BinaryQuadraticQuantization():
             else:
                 # Residual decomposition: bit by bit on this group's compensated input.
                 col_residual = group_input.clone()
+                # Full-matrix Hessian weighting also available here: quantize each
+                # bit's residual with the single-stack matrix-weighted optimizer.
+                use_fullchol = (importance_weight and str(importance_score).lower() == 'fullchol'
+                                and (c0, c1) in ldlq_block_gram)
+                M_block = ldlq_block_gram[(c0, c1)].to(compute_device).float() if use_fullchol else None
 
                 for bit_idx in range(bit_width):
                     col_patches = []
@@ -2030,14 +2538,23 @@ class BinaryQuadraticQuantization():
                         col_patches.append(col_residual[r0:r1, :].clone())
 
                     x_batch = torch.stack(col_patches)
-                    print(f'Col {j}/{num_col_groups}, bit {bit_idx}: '
-                          f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
-
-                    y_b, z_b, a_b = self.run_bqq_compile_batched(
-                        x_batch, rank_scale=rs_j,
-                        zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
-                        Nstep=Nstep, device_id=main_gpu_id, seed=seed
-                    )
+                    if use_fullchol:
+                        print(f'Col {j}/{num_col_groups}, bit {bit_idx}: fullchol-decomposing '
+                              f'{len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
+                        y_s, z_s, a_s = self.run_matrixweighted_multibqq_compile_batched(
+                            x_batch, M=M_block, num_stack=1, rank_scale=rs_j,
+                            zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                            Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                        )
+                        y_b, z_b, a_b = y_s[:, 0], z_s[:, 0], a_s[:, 0]   # squeeze stack dim
+                    else:
+                        print(f'Col {j}/{num_col_groups}, bit {bit_idx}: '
+                              f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
+                        y_b, z_b, a_b = self.run_bqq_compile_batched(
+                            x_batch, rank_scale=rs_j,
+                            zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
+                            Nstep=Nstep, device_id=main_gpu_id, seed=seed
+                        )
 
                     for b_idx, (r0, r1) in enumerate(h_ranges):
                         yb = y_b[b_idx].to(compute_device)

@@ -229,7 +229,8 @@ def build_problem(
 
 def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mode=None,
                                   ldlq_act_order=False, ldlq_act_order_score='maxdiag',
-                                  rank_alloc_mode='none'):
+                                  rank_alloc_mode='none', importance_weight=False,
+                                  importance_score='diag'):
     quantizer = BQQ(x=W, rank_scale=args.rank_scale)
     method = getattr(quantizer, INTRA_LAYER_METHOD)
     return method(
@@ -251,6 +252,8 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mo
         ldlq_act_order=ldlq_act_order,
         ldlq_act_order_score=ldlq_act_order_score,
         rank_alloc_mode=rank_alloc_mode,
+        importance_weight=importance_weight,
+        importance_score=importance_score,
     ).float().cpu()
 
 
@@ -432,7 +435,8 @@ def compare_quip_ldlq(args):
 
 def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode='ldlq',
                             ldlq_act_order=False, ldlq_act_order_score='maxdiag',
-                            rank_alloc_mode='none'):
+                            rank_alloc_mode='none', importance_weight=False,
+                            importance_score='diag', randomize=True):
     """QUIP-style incoherence (randomized Hadamard) around BQQ.
 
     Reuses QUIP-Sharp's RHT: pick random sign vectors SU (in-side, shared with H)
@@ -452,9 +456,15 @@ def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode=
     Hd = H.to(dev).float()
     m, n = Wd.shape  # out, in
 
-    g = torch.Generator().manual_seed(args.seed + 12345)
-    SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # in-side
-    SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # out-side
+    if randomize:
+        g = torch.Generator().manual_seed(args.seed + 12345)
+        SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # in-side
+        SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().to(torch.float32).to(dev)  # out-side
+    else:
+        # Plain Hadamard transform (no random sign flips): deterministic rotation
+        # that mixes channels but preserves more structure than the full RHT.
+        SU = torch.ones(n, dtype=torch.float32, device=dev)
+        SV = torch.ones(m, dtype=torch.float32, device=dev)
 
     Hr = RHT_H(Hd, SU)
     Wr = RHT_W(Wd, SU, SV)
@@ -464,6 +474,7 @@ def quantize_bqq_incoherent(W, H, args, consolidated_path, *, compensation_mode=
         compensation_mode=compensation_mode,
         ldlq_act_order=ldlq_act_order, ldlq_act_order_score=ldlq_act_order_score,
         rank_alloc_mode=rank_alloc_mode,
+        importance_weight=importance_weight, importance_score=importance_score,
     ).to(dev)
 
     Wq = incoherence_process(hatWr, SU.cpu(), SV.cpu())
@@ -519,6 +530,20 @@ def compare_all_three(args):
             cp = str(Path(tmpdir) / f'bqq_{mode}.pt')
             Wq = quantize_intra_layer_and_save(W, H, args, cp, compensation_mode=mode)
             rows.append(mk_row(f'BQQ:{mode}', mode, None, Wq))
+
+        # Importance-weighted BQQ (weighted objective sum((sqrt(H_jj)*(W-Wq))^2))
+        # vs its unweighted counterpart above, optional.
+        if getattr(args, 'importance_weight', False):
+            cp_w = str(Path(tmpdir) / 'bqq_ldlq_wimp.pt')
+            Wq_w = quantize_intra_layer_and_save(W, H, args, cp_w, compensation_mode='ldlq',
+                                                 importance_weight=True)
+            rows.append(mk_row('BQQ:ldlq+wimp', 'ldlq', None, Wq_w))
+
+            cp_w2 = str(Path(tmpdir) / 'bqq_ldlq_ao_maxdiag_wimp.pt')
+            Wq_w2 = quantize_intra_layer_and_save(W, H, args, cp_w2, compensation_mode='ldlq',
+                                                  ldlq_act_order=True, ldlq_act_order_score='maxdiag',
+                                                  importance_weight=True)
+            rows.append(mk_row('BQQ:ldlq-ao-maxdiag+wimp', 'ldlq', None, Wq_w2))
 
         # LDLQ with activation-order: one row per requested group-score metric
         # (static / maxdiag / trace / logdet).
@@ -787,6 +812,9 @@ def main():
                         help='Apply refine_decomposition_with_ste to the BQQ row in --experiment quip-ldlq')
     parser.add_argument('--incoherence', action='store_true',
                         help='Add QUIP-style incoherence (randomized Hadamard) BQQ rows to --experiment all3')
+    parser.add_argument('--importance-weight', action='store_true',
+                        help='Add importance-weighted BQQ rows (weighted objective sum((sqrt(H_jj)(W-Wq))^2)) '
+                             'to --experiment all3, to compare against the unweighted BQQ rows')
     parser.add_argument('--quip-sharp-root', type=str, default='/work2/k-kuroki/quip-sharp')
     parser.add_argument('--quip-codebook', type=str, default='E8P12',
                         choices=['E8P12', 'E8P12RVQ3B', 'E8P12RVQ4B'])
