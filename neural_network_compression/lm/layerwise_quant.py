@@ -50,6 +50,57 @@ except ImportError:
     from neural_network_compression.lm.src.build_bqq_model import save_bqq_model
 
 
+def apply_transform(weight, H, transform, seed, device_id):
+    """Apply an input/output transform to (W, H) before quantization.
+
+    Returns (quant_W, quant_H, transform_desc). transform_desc is None (no
+    transform) or a dict describing the deployment transform, saved as a sidecar
+    and read by build_bqq_model to wrap the layer:
+      {'kind':'rht'/'ht', 'SU':tensor, 'SV':tensor}   -> IncoherentBinaryQuadratic
+      {'kind':'dct', 'n_in':n, 'n_out':m}             -> DCTBinaryQuadratic
+    """
+    tkind = str(transform).lower()
+    if tkind in ('none', '') or H is None:
+        return weight, H, None
+    dev = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
+    Wd = weight.to(dev).float()
+    Hd = H.to(dev).float()
+    m, n = Wd.shape
+    if tkind in ('rht', 'ht'):
+        _mc = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'matrix_compression')
+        if _mc not in sys.path:
+            sys.path.insert(0, _mc)
+        from incoherence import RHT_H, RHT_W
+        if tkind == 'rht':
+            g = torch.Generator().manual_seed(seed + 99999)
+            SU = (torch.randn(n, generator=g).sign() + 1e-5).sign().float().to(dev)
+            SV = (torch.randn(m, generator=g).sign() + 1e-5).sign().float().to(dev)
+        else:
+            SU = torch.ones(n, dtype=torch.float32, device=dev)
+            SV = torch.ones(m, dtype=torch.float32, device=dev)
+        quant_H = RHT_H(Hd, SU).detach().cpu()
+        quant_W = RHT_W(Wd, SU, SV).detach().cpu()
+        return quant_W, quant_H, {'kind': tkind, 'SU': SU.cpu(), 'SV': SV.cpu()}
+    elif tkind == 'dct':
+        from scipy.fft import dct as _dct
+        import numpy as _np
+        Din = torch.tensor(_dct(_np.eye(n), type=2, norm='ortho', axis=0), dtype=torch.float32, device=dev)
+        Dout = torch.tensor(_dct(_np.eye(m), type=2, norm='ortho', axis=0), dtype=torch.float32, device=dev)
+        quant_W = (Dout @ Wd @ Din.T).detach().cpu()
+        quant_H = (Din @ Hd @ Din.T).detach().cpu()
+        return quant_W, quant_H, {'kind': 'dct', 'n_in': n, 'n_out': m}
+    raise ValueError(f'Unknown transform {transform!r}')
+
+
+def _save_transform_sidecar(consolidated_path, transform_desc):
+    """Save the per-layer transform descriptor next to its consolidated patches."""
+    if transform_desc is None:
+        return
+    p = Path(consolidated_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(transform_desc, p.with_suffix('.transform.pth'))
+
+
 # ---------------------------------------------------------------------------
 # Target selection (same as weight_aware_quant_cached)
 # ---------------------------------------------------------------------------
@@ -292,7 +343,8 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
 
         print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
 
-        quantizer = BinaryQuadraticQuantization(weight, rank_scale=common['rank_scale'])
+        _qW, _qH, _tdesc = apply_transform(weight, H, common.get('transform', 'none'), common['seed'], gpu_id)
+        quantizer = BinaryQuadraticQuantization(_qW, rank_scale=common['rank_scale'])
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
             max_patch_size=common['group_size'],
             bit_width=common['bit_width'],
@@ -300,7 +352,7 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             Nstep=common['num_steps'],
             seed=common['seed'],
             main_gpu_id=gpu_id,
-            H=H,
+            H=_qH,
             damping=common['damping'],
             hessian_mode='intra-layer-ste',
             scale_refine=common['scale_refine'],
@@ -324,6 +376,7 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             ldlq_act_order_score=common.get('ldlq_act_order_score', 'maxdiag'),
             rank_alloc_mode=common.get('rank_alloc_mode', 'none'),
         )
+        _save_transform_sidecar(consolidated_path, _tdesc)
         if save_reconstructed:
             torch.save(reconstructed.cpu(), tensor_path)
             print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] Saved: {tensor_path}")
@@ -374,6 +427,7 @@ def layerwise_quantize(
     compensation_mode: str,
     bqq_opt_mode: str = 'plain',
     diag_power: float = 1.0,
+    transform: str = 'none',
     calibration_loader,
     save_reconstructed: bool = False,
     layer_threshold: int = 0,
@@ -450,7 +504,8 @@ def layerwise_quantize(
         H = H_dict[module_name].cpu()
         print(f"\n[{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
 
-        quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
+        _qW, _qH, _tdesc = apply_transform(weight, H, transform, seed, main_gpu_id)
+        quantizer = BinaryQuadraticQuantization(_qW, rank_scale=rank_scale)
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
             max_patch_size=group_size,
             bit_width=bit_width,
@@ -458,7 +513,7 @@ def layerwise_quantize(
             Nstep=num_steps,
             seed=seed,
             main_gpu_id=main_gpu_id,
-            H=H,
+            H=_qH,
             damping=damping,
             hessian_mode='intra-layer-ste',
             scale_refine=scale_refine,
@@ -479,6 +534,7 @@ def layerwise_quantize(
             ste_refine_row_group_batch_size=row_group_batch_size,
             ste_refine_log_interval=ste_refine_log_interval,
         )
+        _save_transform_sidecar(consolidated_path, _tdesc)
 
         if save_reconstructed:
             torch.save(reconstructed.cpu(), tensor_path)
@@ -521,6 +577,7 @@ def layerwise_quantize_block(
     compensation_mode: str,
     bqq_opt_mode: str = 'plain',
     diag_power: float = 1.0,
+    transform: str = 'none',
     workers_per_gpu: int,
     calibration_loader,
     save_reconstructed: bool = False,
@@ -652,6 +709,7 @@ def layerwise_quantize_block(
         compensation_mode=compensation_mode,
         bqq_opt_mode=bqq_opt_mode,
         diag_power=diag_power,
+        transform=transform,
         save_reconstructed=save_reconstructed,
         n_gpus=n_gpus,
         ldlq_act_order=ldlq_act_order,
@@ -784,6 +842,7 @@ def quantize_cached_target(
     compensation_mode: str,
     bqq_opt_mode: str = 'plain',
     diag_power: float = 1.0,
+    transform: str = 'none',
     save_reconstructed: bool = False,
     main_gpu_id: int = 0,
 ):
@@ -812,7 +871,8 @@ def quantize_cached_target(
     weight, H = entry['weight'], entry['H']
     print(f"[{target_idx}/{len(targets)}] {param_name} {tuple(weight.shape)} (cached Hessian)")
 
-    quantizer = BinaryQuadraticQuantization(weight, rank_scale=rank_scale)
+    _qW, _qH, _tdesc = apply_transform(weight, H, transform, seed, main_gpu_id)
+    quantizer = BinaryQuadraticQuantization(_qW, rank_scale=rank_scale)
     reconstructed = quantizer.bqq_large_matrix_multi_worker(
         max_patch_size=group_size,
         bit_width=bit_width,
@@ -820,7 +880,7 @@ def quantize_cached_target(
         Nstep=num_steps,
         seed=seed,
         main_gpu_id=main_gpu_id,
-        H=H,
+        H=_qH,
         damping=damping,
         hessian_mode='intra-layer-ste',
         scale_refine=scale_refine,
@@ -841,6 +901,7 @@ def quantize_cached_target(
         ste_refine_row_group_batch_size=row_group_batch_size,
         ste_refine_log_interval=ste_refine_log_interval,
     )
+    _save_transform_sidecar(consolidated_path, _tdesc)
     if save_reconstructed:
         torch.save(reconstructed.cpu(), tensor_path)
         print(f"  Saved: {tensor_path}")
@@ -879,6 +940,9 @@ def main():
     parser.add_argument('--diag_power', type=float, default=1.0,
                         help='Metric tempering exponent alpha: quantize with H^alpha (alpha<1 flattens the '
                              'Hessian eigenvalue spectrum; 1.0 = exact output-error metric)')
+    parser.add_argument('--transform', type=str, default='none', choices=['none', 'rht', 'ht', 'dct'],
+                        help='Input/output transform before quantization (rht/ht = (randomized) Hadamard, '
+                             'dct = 2D DCT). Deployed via IncoherentBinaryQuadratic (rht/ht) or DCTBinaryQuadratic (dct)')
     parser.add_argument('--ldlq_act_order', action='store_true', default=False,
                         help='Enable LDLQ activation-order (reorder column groups by score before quantizing)')
     parser.add_argument('--ldlq_act_order_score', type=str, default='maxdiag', choices=['maxdiag', 'trace', 'static'],
@@ -1009,6 +1073,7 @@ def main():
             compensation_mode=args.compensation_mode,
             bqq_opt_mode=args.bqq_opt_mode,
             diag_power=args.diag_power,
+            transform=args.transform,
             save_reconstructed=args.save_reconstructed,
             main_gpu_id=args.main_gpu_id,
         )
@@ -1068,6 +1133,7 @@ def main():
             compensation_mode=args.compensation_mode,
             bqq_opt_mode=args.bqq_opt_mode,
             diag_power=args.diag_power,
+            transform=args.transform,
             workers_per_gpu=args.workers_per_gpu,
             calibration_loader=train_loader,
             save_reconstructed=args.save_reconstructed,
@@ -1113,6 +1179,7 @@ def main():
         compensation_mode=args.compensation_mode,
         bqq_opt_mode=args.bqq_opt_mode,
         diag_power=args.diag_power,
+        transform=args.transform,
         calibration_loader=train_loader,
         save_reconstructed=args.save_reconstructed,
         layer_threshold=args.layer_threshold,

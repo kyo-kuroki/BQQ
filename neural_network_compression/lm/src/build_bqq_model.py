@@ -94,6 +94,20 @@ def _load_layer_matrices(layer_name, patch_index, bit_width, map_location):
     return get_matrices(patch_list, bit_width=bit_width)
 
 
+def _load_transform_sidecar(weight_key, weights_dir):
+    """Load the per-layer transform descriptor written by layerwise_quant (if any).
+
+    Layerwise saves it next to the consolidated patches as
+    {weights_dir}/_consolidated/{weight_key}.transform.pth. Returns None if absent.
+    """
+    if weights_dir is None:
+        return None
+    p = Path(weights_dir) / '_consolidated' / f'{weight_key}.transform.pth'
+    if p.exists():
+        return torch.load(p, map_location='cpu', weights_only=False)
+    return None
+
+
 def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='',
                               device=None, show_tqdm=True, patch_index=None):
     """Recursively replace nn.Linear layers with BinaryQuadratic modules."""
@@ -119,7 +133,13 @@ def replace_linear_with_bqq(model, weights_dir, bit_width, prefix='',
                 continue
 
             A, Y, Z = matrices
-            bqq = BinaryQuadratic(Y, Z, A, bias=module.bias)
+            tdesc = _load_transform_sidecar(weight_key, weights_dir)
+            if tdesc is not None and tdesc.get('kind') in ('rht', 'ht'):
+                bqq = IncoherentBinaryQuadratic(Y, Z, A, SU=tdesc['SU'], SV=tdesc['SV'], bias=module.bias)
+            elif tdesc is not None and tdesc.get('kind') == 'dct':
+                bqq = DCTBinaryQuadratic(Y, Z, A, n_in=tdesc['n_in'], n_out=tdesc['n_out'], bias=module.bias)
+            else:
+                bqq = BinaryQuadratic(Y, Z, A, bias=module.bias)
             setattr(model, name, bqq)
         else:
             replace_linear_with_bqq(
