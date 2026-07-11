@@ -459,7 +459,7 @@ class BinaryQuadraticQuantization():
             return y.detach().cpu().numpy(), z.detach().cpu().numpy(), (maximum * a).detach().cpu().numpy()
 
 
-    def run_bqq_compile_batched(self, x, rank_scale=1, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000, device_id=0, seed=1, compile_mode="reduce-overhead", binarize_scaling=False):
+    def run_bqq_compile_batched(self, x, rank_scale=1, zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005, Nstep=50000, device_id=0, seed=1, compile_mode="reduce-overhead", binarize_scaling=False):
         """
         バッチ版 run_bqq_compile。(B, n, m) のテンソルをバッチ次元で並列に分解する。
         self.x は参照せず、引数 x をそのまま使用する。
@@ -615,7 +615,7 @@ class BinaryQuadraticQuantization():
         return y, z, maximum.squeeze(-1) * a  # y: (B,n,rank), z: (B,rank,m), a: (B,4)
 
 
-    def run_multibqq_compile(self, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=50000,
+    def run_multibqq_compile(self, zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005, Nstep=50000,
                               device_id=0, seed=1, output_type='torch',
                               compile_mode="reduce-overhead"):
         """
@@ -820,7 +820,7 @@ class BinaryQuadraticQuantization():
 
 
     def run_multibqq_compile_batched(self, x, num_stack=1, rank_scale=1,
-                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005,
                                        Nstep=50000, device_id=0, seed=1,
                                        compile_mode="reduce-overhead"):
         """
@@ -1007,7 +1007,7 @@ class BinaryQuadraticQuantization():
 
 
     def run_weighted_multibqq_compile_batched(self, x, s=None, num_stack=1, rank_scale=1,
-                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005,
                                        Nstep=50000, device_id=0, seed=1,
                                        compile_mode="reduce-overhead"):
         """Importance-weighted batched joint multi-stack BQQ.
@@ -1245,7 +1245,7 @@ class BinaryQuadraticQuantization():
 
 
     def run_matrixweighted_multibqq_compile_batched(self, x, M, num_stack=1, rank_scale=1,
-                                       zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005,
+                                       zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005,
                                        Nstep=50000, device_id=0, seed=1,
                                        compile_mode="reduce-overhead"):
         """Full-matrix (Hessian) weighted batched multi-stack BQQ.
@@ -1681,7 +1681,7 @@ class BinaryQuadraticQuantization():
             queue.task_done()
 
 
-    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=4, eta=0.06, Tinit=0.2, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none', importance_weight=False, importance_score='diag', diag_power=1.0):
+    def bqq_large_matrix_multi_worker(self, max_patch_size, bit_width, consolidated_path=None, zeta=2, eta=0.1, Tinit=0.1, Tfin=0.005, Nstep=10000, seed=1, workers_per_gpu=8, main_gpu_id=0, use_batch=True, H=None, damping=1e-6, hessian_mode='inter', scale_refine=False, use_multibqq=True, compensation_mode='ldlq', ste_refine_steps=0, ste_refine_lr=1e-3, ste_refine_binary_lr=None, ste_refine_continuous_lr=None, ste_refine_weight_decay=0.0, ste_refine_optimize_factors=True, ste_refine_optimize_coeffs=True, ste_refine_optimize_theta=True, ste_refine_optimize_beta=True, ste_refine_row_group_batch_size=None, ste_refine_log_interval=20, ldlq_act_order=False, ldlq_act_order_score='maxdiag', rank_alloc_mode='none', importance_weight=False, importance_score='diag', diag_power=1.0):
         """
         大きな行列をパッチに分割し、行列分解を実行して復元。
 
@@ -2292,6 +2292,46 @@ class BinaryQuadraticQuantization():
         w_ranges = compute_patch_ranges(original_w, max_patch_size)
 
         compute_device = torch.device(f'cuda:{main_gpu_id}' if torch.cuda.is_available() else 'cpu')
+        profile_layer = os.environ.get('BQQ_PROFILE_LAYER', '').lower() in {'1', 'true', 'yes', 'on'}
+        profile_times = defaultdict(float)
+        profile_counts = defaultdict(int)
+        profile_samples = defaultdict(list)
+        profile_last = [time.perf_counter()]
+
+        def _profile_sync():
+            if profile_layer and torch.cuda.is_available():
+                torch.cuda.synchronize(compute_device)
+
+        def _profile_tick(name):
+            if not profile_layer:
+                return
+            _profile_sync()
+            now = time.perf_counter()
+            elapsed = now - profile_last[0]
+            profile_times[name] += elapsed
+            profile_counts[name] += 1
+            profile_samples[name].append(elapsed)
+            profile_last[0] = now
+
+        def _profile_report():
+            if not profile_layer:
+                return
+            _profile_sync()
+            total = sum(profile_times.values())
+            print('BQQ layer profile:')
+            for name, seconds in sorted(profile_times.items(), key=lambda kv: kv[1], reverse=True):
+                pct = (100.0 * seconds / total) if total > 0 else 0.0
+                count = profile_counts[name]
+                avg = seconds / count if count else 0.0
+                print(f'  {name:28s} {seconds:9.3f}s {pct:6.1f}% '
+                      f'count={count} avg={avg:.4f}s')
+                if name.startswith('bqq_') and count > 1:
+                    samples = profile_samples[name]
+                    rest_avg = sum(samples[1:]) / (len(samples) - 1)
+                    print(f'    first={samples[0]:.4f}s rest_avg={rest_avg:.4f}s '
+                          f'last={samples[-1]:.4f}s')
+            print(f'  {"profiled_total":28s} {total:9.3f}s')
+
         x_tensor = torch.tensor(x_copy, device=compute_device).float()
         H = H.to(dtype=torch.float32, device=x_tensor.device)
         H = 0.5 * (H + H.T)
@@ -2307,6 +2347,7 @@ class BinaryQuadraticQuantization():
             H = 0.5 * (H + H.T)
             print(f'Metric tempering: H -> H^{float(diag_power)} '
                   f'(eig range [{_lam.min().item():.3e}, {_lam.max().item():.3e}])')
+        _profile_tick('setup_and_h_transfer')
         num_col_groups = len(w_ranges)
         compensation_mode = str(compensation_mode).lower()
         valid_modes = {'gptq', 'ldlq', 'none'}
@@ -2391,10 +2432,12 @@ class BinaryQuadraticQuantization():
             w_ranges = new_ranges
             print(f'LDLQ act-order: reordered {num_col_groups} groups by '
                   f'{_score_mode} score (high first)')
+        _profile_tick('ldlq_act_order')
 
         COMP_DAMPING = 0.01  # 1% relative damping, same default used by GPTQ-style compensation.
         mean_diag = torch.mean(torch.diag(H)).clamp_min(1e-12)
         H_damped = H + (COMP_DAMPING * mean_diag) * torch.eye(H.shape[0], dtype=H.dtype, device=H.device)
+        _profile_tick('hessian_damping')
 
         # Optional per-column-group rank allocation. The factorization rank l of
         # each group is scaled by rank_scale_i, allocating more rank to important
@@ -2418,6 +2461,7 @@ class BinaryQuadraticQuantization():
                       f'{_rs.max().item():.3f}] over {len(w_ranges)} groups')
             except Exception as _e:
                 print(f'rank-alloc pivot-log failed ({_e}); using uniform rank_scale')
+        _profile_tick('rank_alloc')
 
         H_inv = None
         ldlq_L = None
@@ -2454,10 +2498,12 @@ class BinaryQuadraticQuantization():
                 print(f'WARNING: LDLQ block decomposition failed, compensation disabled: {e}')
         else:
             print('Column compensation disabled')
+        _profile_tick(f'{compensation_mode}_precompute')
 
         all_decomposed = []
         Wq = torch.zeros(original_h, original_w, dtype=dtype, device=compute_device)
         W_work = x_tensor.clone()
+        _profile_tick('state_init')
 
         col_group_iter = list(enumerate(w_ranges))
         if compensation_mode == 'ldlq':
@@ -2470,6 +2516,7 @@ class BinaryQuadraticQuantization():
                 group_input = x_tensor[:, c0:c1] + (x_tensor[:, c1:] - Wq[:, c1:]) @ ldlq_L[c1:, c0:c1]
             else:
                 group_input = W_work[:, c0:c1]
+            _profile_tick('group_input_compensation')
 
             # N-bit BQQ on this column group (all bits, batched across row groups)
             if use_multibqq:
@@ -2478,6 +2525,7 @@ class BinaryQuadraticQuantization():
                     col_patches.append(group_input[r0:r1, :].clone())
 
                 x_batch = torch.stack(col_patches)
+                _profile_tick('patch_stack')
 
                 if importance_weight and str(importance_score).lower() == 'fullchol' \
                         and (c0, c1) in ldlq_block_gram:
@@ -2492,6 +2540,7 @@ class BinaryQuadraticQuantization():
                         zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                         Nstep=Nstep, device_id=main_gpu_id, seed=seed
                     )
+                    _profile_tick('bqq_fullchol_optimize')
                 elif importance_weight:
                     # Element-wise importance weight w_ij (error-energy weight);
                     # s = sqrt(w). The weighted optimizer normalizes s internally
@@ -2512,6 +2561,7 @@ class BinaryQuadraticQuantization():
                         zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                         Nstep=Nstep, device_id=main_gpu_id, seed=seed
                     )
+                    _profile_tick('bqq_weighted_optimize')
                 else:
                     print(f'Col {j}/{num_col_groups}: jointly decomposing {len(col_patches)} '
                           f'patches of ({col_patches[0].shape[0]}x{pw}) with {bit_width} stacks')
@@ -2520,6 +2570,7 @@ class BinaryQuadraticQuantization():
                         zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                         Nstep=Nstep, device_id=main_gpu_id, seed=seed
                     )
+                    _profile_tick('bqq_multistack_optimize')
 
                 for b_idx, (r0, r1) in enumerate(h_ranges):
                     for bit_idx in range(bit_width):
@@ -2539,6 +2590,7 @@ class BinaryQuadraticQuantization():
                             'coeff': coeff.cpu(), 'mat1': yb.cpu(), 'mat2': zb.cpu(),
                             'bit_idx': bit_idx,
                         })
+                _profile_tick('reconstruct_store_cpu')
             else:
                 # Residual decomposition: bit by bit on this group's compensated input.
                 col_residual = group_input.clone()
@@ -2554,6 +2606,7 @@ class BinaryQuadraticQuantization():
                         col_patches.append(col_residual[r0:r1, :].clone())
 
                     x_batch = torch.stack(col_patches)
+                    _profile_tick('patch_stack')
                     if use_fullchol:
                         print(f'Col {j}/{num_col_groups}, bit {bit_idx}: fullchol-decomposing '
                               f'{len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
@@ -2563,6 +2616,7 @@ class BinaryQuadraticQuantization():
                             Nstep=Nstep, device_id=main_gpu_id, seed=seed
                         )
                         y_b, z_b, a_b = y_s[:, 0], z_s[:, 0], a_s[:, 0]   # squeeze stack dim
+                        _profile_tick('bqq_fullchol_optimize')
                     else:
                         print(f'Col {j}/{num_col_groups}, bit {bit_idx}: '
                               f'decomposing {len(col_patches)} patches of ({col_patches[0].shape[0]}x{pw})')
@@ -2571,6 +2625,7 @@ class BinaryQuadraticQuantization():
                             zeta=zeta, eta=eta, Tinit=Tinit, Tfin=Tfin,
                             Nstep=Nstep, device_id=main_gpu_id, seed=seed
                         )
+                        _profile_tick('bqq_singlebit_optimize')
 
                     for b_idx, (r0, r1) in enumerate(h_ranges):
                         yb = y_b[b_idx].to(compute_device)
@@ -2590,6 +2645,7 @@ class BinaryQuadraticQuantization():
                             'coeff': coeff.cpu(), 'mat1': yb.cpu(), 'mat2': zb.cpu(),
                             'bit_idx': bit_idx,
                         })
+                    _profile_tick('reconstruct_store_cpu')
 
             if compensation_mode == 'ldlq' and c1 < original_w:
                 print(f'  LDLQ-folded quantized future error from {original_w - c1} columns')
@@ -2612,11 +2668,13 @@ class BinaryQuadraticQuantization():
 
                 except RuntimeError as e:
                     print(f'  WARNING: gptq compensation solve failed: {e}')
+                _profile_tick('gptq_update')
 
         E_final = Wq - x_tensor
         hessian_loss = torch.sum((E_final @ H) * E_final).item()
         mse_loss = torch.mean(E_final.pow(2)).item()
         print(f'Final compensation={compensation_mode}: hessian_loss={hessian_loss:.6e}, mse={mse_loss:.6e}')
+        _profile_tick('final_loss')
 
         # --- Optional: inter-bit Hessian-aware scale refinement ---
         if scale_refine:
@@ -2707,6 +2765,7 @@ class BinaryQuadraticQuantization():
                     print(f'  Scale refine done')
                 else:
                     print('  WARNING: scale refine solve failed')
+            _profile_tick('scale_refine')
 
         # Act-order: remap each patch's column position from the permuted layout
         # back to its ORIGINAL column group, so the saved patches reconstruct the
@@ -2723,6 +2782,7 @@ class BinaryQuadraticQuantization():
             os.makedirs(os.path.dirname(consolidated_path), exist_ok=True)
             torch.save(all_decomposed, consolidated_path)
             print(f'Saved consolidated: {consolidated_path} ({len(all_decomposed)} entries)')
+        _profile_tick('save_decomposition')
 
         # Act-order: undo the column permutation so the returned dense weight is
         # in original column order.
@@ -2732,6 +2792,8 @@ class BinaryQuadraticQuantization():
             Wq = Wq_full
 
         self.x = copy.copy(x_copy)
+        _profile_tick('final_cpu_return')
+        _profile_report()
         # Return a CPU tensor with a deterministic device. With scale_refine
         # (the default) Wq is already rebuilt on CPU above, so .cpu() is a no-op
         # there; without it Wq lives on the GPU. Normalizing to CPU keeps the

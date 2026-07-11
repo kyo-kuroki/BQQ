@@ -252,8 +252,10 @@ def quantize_intra_layer_and_save(W, H, args, consolidated_path, compensation_mo
         ldlq_act_order=ldlq_act_order,
         ldlq_act_order_score=ldlq_act_order_score,
         rank_alloc_mode=rank_alloc_mode,
-        importance_weight=importance_weight,
-        importance_score=importance_score,
+        importance_weight=importance_weight or getattr(args, 'importance_weight', False),
+        importance_score=importance_score if importance_score != 'diag'
+        else getattr(args, 'importance_score', importance_score),
+        diag_power=getattr(args, 'diag_power', 1.0),
     ).float().cpu()
 
 
@@ -751,9 +753,9 @@ def main():
     parser.add_argument('--rank-scale', type=float, default=1.0)
     parser.add_argument('--max-patch-size', type=int, default=128)
     parser.add_argument('--nstep', type=int, default=10000)
-    parser.add_argument('--zeta', type=float, default=4.0)
-    parser.add_argument('--eta', type=float, default=0.06)
-    parser.add_argument('--Tinit', type=float, default=0.2)
+    parser.add_argument('--zeta', type=float, default=2.0)
+    parser.add_argument('--eta', type=float, default=0.1)
+    parser.add_argument('--Tinit', type=float, default=0.1)
     parser.add_argument('--Tfin', type=float, default=0.005)
     parser.add_argument('--damping', type=float, default=1e-6)
     parser.add_argument('--seed', type=int, default=0)
@@ -815,6 +817,11 @@ def main():
     parser.add_argument('--importance-weight', action='store_true',
                         help='Add importance-weighted BQQ rows (weighted objective sum((sqrt(H_jj)(W-Wq))^2)) '
                              'to --experiment all3, to compare against the unweighted BQQ rows')
+    parser.add_argument('--importance-score', type=str, default='diag',
+                        choices=['diag', 'saliency', 'fullchol'],
+                        help='Importance metric for weighted BQQ; fullchol uses the within-block Hessian metric.')
+    parser.add_argument('--diag-power', type=float, default=1.0,
+                        help='Tempering exponent for the Hessian metric used by BQQ.')
     parser.add_argument('--quip-sharp-root', type=str, default='/work2/k-kuroki/quip-sharp')
     parser.add_argument('--quip-codebook', type=str, default='E8P12',
                         choices=['E8P12', 'E8P12RVQ3B', 'E8P12RVQ4B'])
