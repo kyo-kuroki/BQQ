@@ -36,7 +36,7 @@ WORKERS_PER_GPU="${WORKERS_PER_GPU:-2}"
 
 # KL fine-tuning between units (pure KL against the original model by default)
 NO_FINETUNE="${NO_FINETUNE:-0}"
-FT_EPOCHS="${FT_EPOCHS:-1}"
+FT_EPOCHS="${FT_EPOCHS:-5}"
 FT_STEPS="${FT_STEPS:-0}"          # Cap on optimizer steps per unit (0 = no cap)
 FT_LR="${FT_LR:-1e-5}"
 FT_WEIGHT_DECAY="${FT_WEIGHT_DECAY:-0.0}"

@@ -763,7 +763,7 @@ def main():
     # KL fine-tuning
     parser.add_argument('--no_finetune', action='store_true',
                         help='Skip fine-tuning between units (quantize-only ablation)')
-    parser.add_argument('--ft_epochs', type=int, default=1,
+    parser.add_argument('--ft_epochs', type=int, default=5,
                         help='Fine-tuning epochs over the calibration set per unit')
     parser.add_argument('--ft_steps', type=int, default=0,
                         help='Cap on optimizer steps per unit fine-tune (0 = no cap)')
