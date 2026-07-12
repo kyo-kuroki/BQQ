@@ -12,6 +12,7 @@ import glob
 import argparse
 import os
 import sys
+import dill
 
 try:
     from .compressed_data import BQQ_ROOT, default_results_dir
@@ -64,6 +65,41 @@ def _load_gptq_model(model_path: str, repo_dir: str | None = None):
         from gptqmodel import GPTQModel
 
     return GPTQModel.load(model_path)
+
+
+def _load_bqq_for_eval(args):
+    """Load a BQQ checkpoint for evaluation.
+
+    fp     : dequantize BQQ layers to dense FP weights, then load into a fresh HF model.
+    packed : keep BQQ modules as saved; PackedBinaryQuadratic.forward uses the CUDA kernel
+             after compute_ppl_from_testloader moves the model to GPU.
+    auto   : use packed path for packed checkpoints, otherwise dense FP dequantization.
+    """
+    mode = args.bqq_eval_mode
+    model_path = args.model_path
+    if model_path is None:
+        return AutoModelForCausalLM.from_pretrained(
+            args.model_name, attn_implementation="flash_attention_2"
+        )
+
+    if mode == "auto":
+        stem = os.path.basename(model_path).lower()
+        mode = "packed" if "packed" in stem else "fp"
+
+    if mode == "packed":
+        print(f"Loading BQQ checkpoint in packed mode: {model_path}")
+        model = torch.load(
+            model_path,
+            weights_only=False,
+            map_location="cpu",
+            pickle_module=dill,
+        )
+        return model
+
+    if mode == "fp":
+        return load_bqq_as_fp(model_path, args.model_name, device_map=None)
+
+    raise ValueError(f"Unsupported bqq_eval_mode={args.bqq_eval_mode!r}")
 
 
 @torch.no_grad()
@@ -218,6 +254,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="random seed for sampling")
     parser.add_argument("--batch_size", type=int, default=1, help="batch size for lm_eval")
     parser.add_argument("--gptqmodel_dir", type=str, default=None, help="Optional path to the GPTQModel repository")
+    parser.add_argument("--bqq_eval_mode", type=str, default="auto", choices=["auto", "fp", "packed"],
+                        help="How to evaluate BQQ .pth checkpoints: auto=packed for '*packed*.pth' else fp; "
+                             "fp=dequantize to dense FP; packed=run saved BQQ modules directly on GPU")
     parser.add_argument("--eval_downstream", action="store_true", help="Also evaluate downstream tasks (requires lm_eval)")
     parser.add_argument("--downstream_tasks", type=str, default=None,
                         help="Comma-separated subset of task names to run (default: all DEFAULT_DOWNSTREAM_TASK_CONFIGS)")
@@ -252,13 +291,13 @@ def main():
 
         print("Loading model:", args.model_name)
         if args.model_path is None:
-            model = AutoModelForCausalLM.from_pretrained(
-                args.model_name, attn_implementation="flash_attention_2"
-            )
+            model = _load_bqq_for_eval(args)
         else:
             try:
-                model = load_bqq_as_fp(args.model_path, args.model_name, device_map=None)
+                model = _load_bqq_for_eval(args)
             except Exception:
+                if args.bqq_eval_mode != "auto":
+                    raise
                 model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
         model.eval()
 
@@ -277,13 +316,13 @@ def main():
     print("Loading model:", args.model_name)
 
     if args.model_path is None:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name, attn_implementation="flash_attention_2"
-        )
+        model = _load_bqq_for_eval(args)
     else:
         try:
-            model = load_bqq_as_fp(args.model_path, args.model_name, device_map=None)
+            model = _load_bqq_for_eval(args)
         except Exception:
+            if args.bqq_eval_mode != "auto":
+                raise
             model = _load_gptq_model(args.model_path, repo_dir=args.gptqmodel_dir)
 
     model.eval()
