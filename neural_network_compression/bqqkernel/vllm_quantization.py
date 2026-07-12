@@ -6,20 +6,48 @@ registered as a custom quantization method named ``bqq``.  It consumes the
 
 Current scope:
   - one GPU / no tensor-parallel sharding
-  - Linear prefixes that match the original HF module names
+  - vLLM fused Linear prefixes backed by multiple HF BQQ tensors
   - PackedBinaryQuadratic CUDA forward for decode/prefill
-
-The next integration step is mapping vLLM fused modules (qkv_proj,
-gate_up_proj) to the separate HF q/k/v and gate/up BQQ tensors.
 """
 
 from __future__ import annotations
 
 import json
+import importlib.machinery
+import sys
+import types
 from pathlib import Path
 from typing import Any
 
 import torch
+
+
+def _install_text_only_torchcodec_stub() -> None:
+    """Avoid torchcodec import failures in text-only vLLM processes.
+
+    vLLM 0.25 imports multimodal video helpers while resolving quantization
+    configs.  On this cluster torchcodec is installed but its binary
+    dependencies are incompatible with the active PyTorch/CUDA stack.  BQQ text
+    models do not need video decoding, so a minimal stub is safer than failing
+    before quantization registration.
+    """
+    if "torchcodec" in sys.modules:
+        return
+    tc = types.ModuleType("torchcodec")
+    tc.__spec__ = importlib.machinery.ModuleSpec("torchcodec", loader=None)
+    dec = types.ModuleType("torchcodec.decoders")
+    dec.__spec__ = importlib.machinery.ModuleSpec("torchcodec.decoders", loader=None)
+
+    class VideoDecoder:  # pragma: no cover - only used as an import placeholder
+        pass
+
+    dec.VideoDecoder = VideoDecoder
+    tc.decoders = dec
+    sys.modules["torchcodec"] = tc
+    sys.modules["torchcodec.decoders"] = dec
+
+
+_install_text_only_torchcodec_stub()
 
 
 def _require_vllm():
@@ -102,9 +130,6 @@ class BQQConfig(_require_vllm()[2]):  # type: ignore[misc]
             return UnquantizedLinearMethod()
         meta = self.layers.get(prefix)
         if meta is None:
-            # Important: current initial bridge does not handle vLLM fused
-            # names like qkv_proj/gate_up_proj. Returning None lets vLLM fail
-            # loudly instead of silently using the wrong weights.
             return None
         return BQQLinearMethod(meta)
 
@@ -115,6 +140,62 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
     def __init__(self, meta: dict[str, Any]) -> None:
         self.meta = meta
         self.tensor_names = meta.get("tensor_names", {})
+
+    @staticmethod
+    def _register_bqq_params(
+        layer: torch.nn.Module,
+        meta: dict[str, Any],
+        params_dtype: torch.dtype,
+        set_weight_attrs,
+        weight_loader,
+        *,
+        prefix: str = "",
+    ) -> None:
+        bit_width = int(meta["bit_width"])
+        row_width = int(meta["row_width"])
+        col_width = int(meta["col_width"])
+        y_row = int(meta["y_row"])
+        z_col = int(meta["z_col"])
+        k8 = int(meta["k8"])
+
+        def register_param(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
+            param = torch.nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+            layer.register_parameter(prefix + name, param)
+            set_weight_attrs(param, {"weight_loader": weight_loader})
+
+        register_param("Y_packed", (bit_width, row_width, col_width, y_row, k8), torch.uint8)
+        register_param("Z_packed", (bit_width, row_width, col_width, z_col, k8), torch.uint8)
+        register_param("Y_sum_i16", (bit_width, row_width, col_width, y_row, 1), torch.int16)
+        register_param("Z_sum_i16", (bit_width, row_width, col_width, 1, z_col), torch.int16)
+        register_param("a", (bit_width, row_width, col_width, 1, 1), params_dtype)
+        register_param("b", (bit_width, row_width, col_width, 1, 1), params_dtype)
+        register_param("c", (bit_width, row_width, col_width, 1, 1), params_dtype)
+        register_param("d", (row_width, col_width, 1, 1), params_dtype)
+
+    @staticmethod
+    def _build_runtime(layer: torch.nn.Module, meta: dict[str, Any], *, prefix: str = ""):
+        from neural_network_compression.bqqkernel.bqq_modules import PackedBinaryQuadratic
+
+        def param(name: str) -> torch.Tensor:
+            return getattr(layer, prefix + name).data
+
+        runtime = PackedBinaryQuadratic(
+            Y_packed=param("Y_packed"),
+            Z_packed=param("Z_packed"),
+            a=param("a"),
+            b=param("b"),
+            c=param("c"),
+            d=param("d"),
+            Y_sum_i16=param("Y_sum_i16"),
+            Z_sum_i16=param("Z_sum_i16"),
+            inter_dimension=int(meta["inter_dimension"]),
+            y_row=int(meta["y_row"]),
+            z_col=int(meta["z_col"]),
+            bias=None,
+        )
+        runtime.eval()
+        runtime.to(device=param("Y_packed").device)
+        return runtime
 
     def create_weights(
         self,
@@ -134,53 +215,47 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
                 f"{getattr(layer, 'prefix', '<unknown>')}: "
                 f"vLLM saw in={input_size_per_partition}, out={sum(output_partition_sizes)}; "
                 f"BQQ export has in={expected_in}, out={expected_out}. "
-                "Tensor parallel or fused vLLM modules are not supported by this initial bridge."
+                "Tensor parallel sharding is not supported by this BQQ bridge."
             )
-
-        bit_width = int(self.meta["bit_width"])
-        row_width = int(self.meta["row_width"])
-        col_width = int(self.meta["col_width"])
-        y_row = int(self.meta["y_row"])
-        z_col = int(self.meta["z_col"])
-        k8 = int(self.meta["k8"])
 
         _LinearBase, _LinearMethodBase, _QuantizationConfig, _UnquantizedLinearMethod, set_weight_attrs = _require_vllm()
         weight_loader = extra_weight_attrs.get("weight_loader")
 
-        def register_param(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> None:
-            param = torch.nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
-            layer.register_parameter(name, param)
-            set_weight_attrs(param, {"weight_loader": weight_loader})
-
-        register_param("Y_packed", (bit_width, row_width, col_width, y_row, k8), torch.uint8)
-        register_param("Z_packed", (bit_width, row_width, col_width, z_col, k8), torch.uint8)
-        register_param("Y_sum_i16", (bit_width, row_width, col_width, y_row, 1), torch.int16)
-        register_param("Z_sum_i16", (bit_width, row_width, col_width, 1, z_col), torch.int16)
-        register_param("a", (bit_width, row_width, col_width, 1, 1), params_dtype)
-        register_param("b", (bit_width, row_width, col_width, 1, 1), params_dtype)
-        register_param("c", (bit_width, row_width, col_width, 1, 1), params_dtype)
-        register_param("d", (row_width, col_width, 1, 1), params_dtype)
+        if self.meta.get("fused"):
+            part_metas = self.meta.get("part_metadata", [])
+            part_sizes = [int(part_meta["output_size"]) for part_meta in part_metas]
+            if output_partition_sizes != part_sizes and sum(output_partition_sizes) != sum(part_sizes):
+                raise ValueError(
+                    "BQQ fused layer output partition mismatch for prefix "
+                    f"{getattr(layer, 'prefix', '<unknown>')}: "
+                    f"vLLM partitions={output_partition_sizes}; BQQ parts={part_sizes}."
+                )
+            for part_idx, part_meta in enumerate(part_metas):
+                self._register_bqq_params(
+                    layer,
+                    part_meta,
+                    params_dtype,
+                    set_weight_attrs,
+                    weight_loader,
+                    prefix=f"p{part_idx}_",
+                )
+        else:
+            self._register_bqq_params(
+                layer,
+                self.meta,
+                params_dtype,
+                set_weight_attrs,
+                weight_loader,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from neural_network_compression.bqqkernel.bqq_modules import PackedBinaryQuadratic
-
-        runtime = PackedBinaryQuadratic(
-            Y_packed=layer.Y_packed.data,
-            Z_packed=layer.Z_packed.data,
-            a=layer.a.data,
-            b=layer.b.data,
-            c=layer.c.data,
-            d=layer.d.data,
-            Y_sum_i16=layer.Y_sum_i16.data,
-            Z_sum_i16=layer.Z_sum_i16.data,
-            inter_dimension=int(self.meta["inter_dimension"]),
-            y_row=int(self.meta["y_row"]),
-            z_col=int(self.meta["z_col"]),
-            bias=None,
-        )
-        runtime.eval()
-        runtime.to(device=layer.Y_packed.device)
-        layer.bqq_runtime = runtime
+        if self.meta.get("fused"):
+            layer.bqq_runtimes = [
+                self._build_runtime(layer, part_meta, prefix=f"p{part_idx}_")
+                for part_idx, part_meta in enumerate(self.meta.get("part_metadata", []))
+            ]
+        else:
+            layer.bqq_runtime = self._build_runtime(layer, self.meta)
 
     def apply(
         self,
@@ -189,10 +264,17 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         runtime = getattr(layer, "bqq_runtime", None)
-        if runtime is None:
-            self.process_weights_after_loading(layer)
-            runtime = layer.bqq_runtime
-        out = runtime(x)
+        runtimes = getattr(layer, "bqq_runtimes", None)
+        if self.meta.get("fused"):
+            if runtimes is None:
+                self.process_weights_after_loading(layer)
+                runtimes = layer.bqq_runtimes
+            out = torch.cat([runtime(x) for runtime in runtimes], dim=-1)
+        else:
+            if runtime is None:
+                self.process_weights_after_loading(layer)
+                runtime = layer.bqq_runtime
+            out = runtime(x)
         if bias is not None:
             out = out + bias
         return out
