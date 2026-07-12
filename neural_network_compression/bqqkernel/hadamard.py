@@ -90,6 +90,62 @@ def matmul_hadUt(X):
     return matmul_hadU(X, transpose=True)
 
 
+# ---------------------------------------------------------------------------
+# Fast CUDA Hadamard path (fast_hadamard_transform), matching QUIP-Sharp's
+# lib/utils/matmul_had.py::matmul_hadU_cuda. Numerically equivalent to the
+# pure-torch matmul_hadU above (same normalization and K-block factor), but
+# runs a fused Walsh-Hadamard kernel instead of a Python halving loop. Falls
+# back to the pure-torch path when fast_hadamard_transform is unavailable.
+# ---------------------------------------------------------------------------
+
+_FHT = None
+_FHT_RESOLVED = False
+
+
+def _fht():
+    global _FHT, _FHT_RESOLVED
+    if not _FHT_RESOLVED:
+        try:
+            import fast_hadamard_transform
+            _FHT = fast_hadamard_transform.hadamard_transform
+        except Exception:
+            _FHT = None
+        _FHT_RESOLVED = True
+    return _FHT
+
+
+def has_fast_hadamard():
+    return _fht() is not None
+
+
+def matmul_hadU_cuda(X, hadK=None, K=None, transpose=False):
+    """Fast Hadamard transform of X along its last axis.
+
+    hadK, K may be precomputed via get_hadK(n[, transpose]); if omitted they
+    are derived from n = X.shape[-1] with the given transpose flag. When
+    fast_hadamard_transform is missing, defers to the pure-torch matmul_hadU.
+    """
+    n = X.shape[-1]
+    fht = _fht()
+    if fht is None:
+        return matmul_hadU(X, transpose=transpose)
+    if hadK is None:
+        hadK, K = get_hadK(n, transpose)
+        transpose = False  # get_hadK already applied the transpose to hadK
+    if K == 1:
+        return fht(X.contiguous(), 1.0 / (n ** 0.5))
+    if transpose:
+        hadK = hadK.T.contiguous()
+    inp = X.float().view(-1, K, n // K)
+    inp = fht(inp.contiguous(), 1.0 / (n ** 0.5))
+    inp = hadK.to(inp.device).to(inp.dtype) @ inp
+    return inp.to(X.dtype).reshape(X.shape)
+
+
+def matmul_hadUt_cuda(X, hadK=None, K=None):
+    return matmul_hadU_cuda(X, hadK, K, transpose=True)
+
+
 def is_pow2(n):
     return (n & (n - 1) == 0) and (n > 0)
 

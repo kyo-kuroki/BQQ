@@ -71,6 +71,22 @@ def _hadamard_transforms():
     return _HADAMARD_FNS
 
 
+_HADAMARD_CUDA_FNS = None
+
+
+def _hadamard_cuda():
+    """Lazily import the fast-Hadamard path (get_hadK + CUDA transforms) used
+    by the packed incoherent layer."""
+    global _HADAMARD_CUDA_FNS
+    if _HADAMARD_CUDA_FNS is None:
+        try:
+            from .hadamard import get_hadK, matmul_hadU_cuda, matmul_hadUt_cuda
+        except ImportError:
+            from hadamard import get_hadK, matmul_hadU_cuda, matmul_hadUt_cuda
+        _HADAMARD_CUDA_FNS = (get_hadK, matmul_hadU_cuda, matmul_hadUt_cuda)
+    return _HADAMARD_CUDA_FNS
+
+
 class IncoherentBinaryQuadratic(BinaryQuadratic):
     """BQQ layer whose stored weight lives in the incoherent (RHT) space.
 
@@ -597,6 +613,111 @@ class PackedBinaryQuadratic(nn.Module):
         )
 
 
+class PackedIncoherentBinaryQuadratic(PackedBinaryQuadratic):
+    """Packed BQQ layer that keeps the RHT (incoherence) transform.
+
+    This is the packed-kernel counterpart of IncoherentBinaryQuadratic: the
+    stored bits live in the incoherent (RHT) space, so forward applies the
+    Hadamard transform around the packed BQQ core, matching
+    IncoherentBinaryQuadratic.forward exactly::
+
+        v   = hadUt(x . SU)          # fast Hadamard on the input
+        w   = PackedBQQ_core(v)      # CUDA popcount kernel (no bias)
+        y   = hadU(w) . SV + bias    # fast Hadamard on the output
+
+    The bias is applied after the output transform (as in the unpacked layer),
+    so the packed core is built bias-free and the real bias is stored here.
+    hadK/K for the in- and out-dimensions are precomputed once.
+    """
+
+    def __init__(self, Y_packed, Z_packed, a, b, c, d,
+                 Y_sum_i16, Z_sum_i16, inter_dimension, y_row, z_col,
+                 SU, SV, bias=None):
+        # Packed core is bias-free; bias is applied after the output Hadamard.
+        super().__init__(Y_packed, Z_packed, a, b, c, d,
+                         Y_sum_i16, Z_sum_i16, inter_dimension, y_row, z_col,
+                         bias=None)
+        self.register_buffer("SU", SU.detach().float().reshape(-1))  # [in_features]
+        self.register_buffer("SV", SV.detach().float().reshape(-1))  # [out_features]
+        self.inc_bias = nn.Parameter(bias.detach().clone().float()) if bias is not None else None
+
+        in_features = self.col_width * self.z_col
+        out_features = self.row_width * self.y_row
+        get_hadK, _, _ = _hadamard_cuda()
+        hadK_in, K_in = get_hadK(in_features)
+        hadK_out, K_out = get_hadK(out_features)
+        # Register the K-block Hadamard factors as buffers so .to(device) moves
+        # them; None (K==1, pure power-of-two) stays None.
+        self.register_buffer("hadK_in", hadK_in if hadK_in is not None else None)
+        self.register_buffer("hadK_out", hadK_out if hadK_out is not None else None)
+        self.K_in = int(K_in)
+        self.K_out = int(K_out)
+
+    def forward(self, X):
+        _, matmul_hadU_cuda, matmul_hadUt_cuda = _hadamard_cuda()
+        dtype = X.dtype
+        device = self.Y_packed.device
+        SU = self.SU.to(device=device, dtype=dtype)
+        SV = self.SV.to(device=device, dtype=dtype)
+        Xt = matmul_hadUt_cuda(X.to(device) * SU, self.hadK_in, self.K_in)
+        out = super().forward(Xt)                                    # packed BQQ core, bias-free
+        out = matmul_hadU_cuda(out, self.hadK_out, self.K_out) * SV
+        if self.inc_bias is not None:
+            out = out + self.inc_bias.type(dtype).to(device)
+        return out
+
+    def to_unpacked(self) -> 'IncoherentBinaryQuadratic':
+        """Inverse of from_incoherent: restore an IncoherentBinaryQuadratic
+        (numerically exact bits, SU/SV and bias preserved)."""
+        Y = self._unpack_to_bool(self.Y_packed, self.inter_dimension)
+        Z = self._unpack_to_bool(self.Z_packed, self.inter_dimension) \
+            .transpose(-2, -1).contiguous()
+        A = torch.empty(
+            self.bit_width, self.row_width, self.col_width, 4,
+            dtype=self.a.dtype, device=self.a.device)
+        A[..., 0] = self.a.detach()[..., 0, 0]
+        A[..., 1] = self.b.detach()[..., 0, 0]
+        A[..., 2] = self.c.detach()[..., 0, 0]
+        A[..., 3] = (self.d.detach()[..., 0, 0] / self.bit_width).expand(
+            self.bit_width, -1, -1)
+        return IncoherentBinaryQuadratic(
+            Y, Z, A,
+            SU=self.SU.data.clone(), SV=self.SV.data.clone(),
+            bias=self.inc_bias.data.clone() if self.inc_bias is not None else None,
+        )
+
+    @classmethod
+    def from_incoherent(cls, inc: 'IncoherentBinaryQuadratic') -> 'PackedIncoherentBinaryQuadratic':
+        """Pack an IncoherentBinaryQuadratic layer (Y/Z bits packed; SU/SV kept)."""
+        Y = inc.Y.cpu()
+        Z = inc.Z.cpu()
+        bit_width, row_width, col_width, y_row, inter_dim = Y.shape
+        z_col = Z.shape[-1]
+
+        Y_packed = cls._np_packbits(Y, inter_dim)
+        Z_t = Z.permute(0, 1, 2, 4, 3).contiguous()
+        Z_packed = cls._np_packbits(Z_t, inter_dim)
+        Y_sum = Y.sum(dim=-1, keepdim=True).to(torch.int16)
+        Z_sum = Z.sum(dim=-2, keepdim=True).to(torch.int16)
+
+        return cls(
+            Y_packed=Y_packed,
+            Z_packed=Z_packed,
+            a=inc.a.data.clone(),
+            b=inc.b.data.clone(),
+            c=inc.c.data.clone(),
+            d=inc.d.data.clone(),
+            Y_sum_i16=Y_sum,
+            Z_sum_i16=Z_sum,
+            inter_dimension=inter_dim,
+            y_row=y_row,
+            z_col=z_col,
+            SU=inc.SU.data.clone(),
+            SV=inc.SV.data.clone(),
+            bias=inc.bias.data.clone() if inc.bias is not None else None,
+        )
+
+
 class PartialBQQLinear(nn.Module):
     """Mixed-precision linear layer for progressive patch-wise quantization.
 
@@ -926,9 +1047,16 @@ def convert_ste_model_to_binaryquadratic(model: nn.Module) -> nn.Module:
 
 
 def pack_binaryquadratic_model(model: nn.Module) -> nn.Module:
-    """Recursively replace all BinaryQuadratic layers with PackedBinaryQuadratic."""
+    """Recursively replace BinaryQuadratic layers with their packed form.
+
+    IncoherentBinaryQuadratic (RHT) -> PackedIncoherentBinaryQuadratic (keeps
+    SU/SV + Hadamard); plain BinaryQuadratic -> PackedBinaryQuadratic. The
+    incoherent check must come first because it subclasses BinaryQuadratic.
+    """
     for name, module in list(model.named_children()):
-        if isinstance(module, BinaryQuadratic):
+        if isinstance(module, IncoherentBinaryQuadratic):
+            setattr(model, name, PackedIncoherentBinaryQuadratic.from_incoherent(module))
+        elif isinstance(module, BinaryQuadratic):
             setattr(model, name, PackedBinaryQuadratic.from_unpacked(module))
         else:
             pack_binaryquadratic_model(module)
