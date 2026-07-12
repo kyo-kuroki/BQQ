@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 import dill
 import torch.nn.functional as F
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLanguageModeling
 from transformers.data.data_collator import _torch_collate_batch, pad_without_fast_tokenizer_warning
 from trl import SFTConfig, SFTTrainer
@@ -337,9 +337,11 @@ def main():
         return len(text) > 10
 
     if args.dataset == "slimpajama":
-        train_dataset = load_dataset("DKYoon/SlimPajama-6B", split="train")
         if args.nsamples is not None:
-            train_dataset = train_dataset.select(range(args.nsamples))
+            train_stream = load_dataset("DKYoon/SlimPajama-6B", split="train", streaming=True)
+            train_dataset = Dataset.from_list(list(train_stream.take(args.nsamples)))
+        else:
+            train_dataset = load_dataset("DKYoon/SlimPajama-6B", split="train")
     else:
         train_dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train').filter(is_not_empty)
         if args.nsamples is not None:
@@ -364,7 +366,7 @@ def main():
         ce_alpha=args.ce_alpha,
         kl_alpha=args.kl_alpha,
         kl_temperature=args.kl_temperature,
-        optimize_bqq_factors=not args.refine_coeffs_only,
+        optimize_bqq_factors=(not args.refine_coeffs_only and args.binary_lr != 0.0),
         optimize_bqq_coeffs=True,
         optimize_bqq_theta=not args.fix_theta,
         optimize_bqq_beta=not args.fix_beta,
