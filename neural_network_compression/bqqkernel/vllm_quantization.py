@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import importlib.machinery
+import os
 import sys
 import types
 from pathlib import Path
@@ -111,7 +112,7 @@ class BQQConfig(_require_vllm()[2]):  # type: ignore[misc]
 
     @staticmethod
     def get_config_filenames() -> list[str]:
-        return ["quantization_config.json", "bqq_config.json"]
+        return ["bqq_config.json"]
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "BQQConfig":
@@ -249,13 +250,32 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from neural_network_compression.bqqkernel.bqq_cuda_ext import _get_ext, _get_forward_flat_op
+        from neural_network_compression.bqqkernel.bqq_modules import PackedBinaryQuadratic
+
+        ext = _get_ext()
+        # vLLM may TorchDynamo-trace module forwards during CUDA graph setup.
+        # Register and cache the custom op before tracing so forward does not
+        # run torch.library schema inference inside the captured graph.
+        if os.environ.get("BQQ_VLLM_RAW_CUDA_OP") == "1":
+            PackedBinaryQuadratic._forward_flat = ext.bqq_forward_flat
+        else:
+            PackedBinaryQuadratic._forward_flat = _get_forward_flat_op()
         if self.meta.get("fused"):
-            layer.bqq_runtimes = [
+            runtimes = [
                 self._build_runtime(layer, part_meta, prefix=f"p{part_idx}_")
                 for part_idx, part_meta in enumerate(self.meta.get("part_metadata", []))
             ]
+            layer.bqq_runtimes = runtimes
         else:
-            layer.bqq_runtime = self._build_runtime(layer, self.meta)
+            runtimes = [self._build_runtime(layer, self.meta)]
+            layer.bqq_runtime = runtimes[0]
+
+        if runtimes:
+            PackedBinaryQuadratic._empty_bias = torch.empty(0, device=runtimes[0].Y_packed.device)
+            for runtime in runtimes:
+                runtime._get_flat_cache()
+                runtime.__dict__["_flat_cache_static"] = True
 
     def apply(
         self,

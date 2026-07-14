@@ -8,6 +8,7 @@ the occupancy vs atomicAdd tradeoff in bqq_cuda.cu.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import statistics
 import sys
@@ -15,13 +16,41 @@ from pathlib import Path
 
 import torch
 import dill
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 from transformers import AutoModelForCausalLM
 
 
 def _add_repo_to_path() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    package_root = Path(__file__).resolve().parents[1]
+    project_root = package_root.parent
+    for path in (str(project_root), str(package_root)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def _prime_local_import_shims() -> None:
+    """Force local compatibility shims to win over broken site-packages ones."""
+    package_root = Path(__file__).resolve().parents[1]
+
+    def _load_package(name: str) -> None:
+        pkg_init = package_root / name / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            name,
+            pkg_init,
+            submodule_search_locations=[str(pkg_init.parent)],
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load local shim package: {name}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+
+    _load_package("causal_conv1d")
+    _load_package("fla")
 
 
 def _make_layer(
@@ -154,25 +183,72 @@ def _parse_ints(value: str) -> list[int]:
 
 
 def _load_bqq_model(model_path: str, dtype: torch.dtype | None) -> torch.nn.Module:
+    _add_repo_to_path()
+    _prime_local_import_shims()
     model = torch.load(model_path, map_location="cpu", weights_only=False, pickle_module=dill)
     if not hasattr(model, "eval"):
         raise TypeError(f"{model_path} did not deserialize to a torch.nn.Module")
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    if hasattr(model, "config"):
+        setattr(model.config, "use_cache", True)
     if dtype is not None:
         model = model.to(dtype=dtype)
+    _ensure_qwen35_block_type(model)
     return model
 
 
 def _load_fp16_model(model_name: str) -> torch.nn.Module:
+    _add_repo_to_path()
+    _prime_local_import_shims()
     try:
-        return AutoModelForCausalLM.from_pretrained(
+        model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.float16,
             attn_implementation="flash_attention_2",
         )
     except Exception:
-        return AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    if hasattr(model, "config"):
+        setattr(model.config, "use_cache", True)
+    _ensure_qwen35_block_type(model)
+    return model
 
 
+def _ensure_qwen35_block_type(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        if hasattr(module, "layer_type") and not hasattr(module, "block_type"):
+            module.block_type = module.layer_type
+
+
+def _apply_bqq_kernel_env(kernel: str | None, col_splits: str | None) -> tuple[str | None, str | None]:
+    old_kernel = os.environ.get("BQQ_CUDA_DECODE_KERNEL")
+    old_splits = os.environ.get("BQQ_CUDA_COL_SPLITS")
+    if kernel is None:
+        os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
+    else:
+        os.environ["BQQ_CUDA_DECODE_KERNEL"] = kernel
+    if col_splits is None:
+        os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
+    else:
+        os.environ["BQQ_CUDA_COL_SPLITS"] = col_splits
+    return old_kernel, old_splits
+
+
+def _restore_bqq_kernel_env(old_kernel: str | None, old_splits: str | None) -> None:
+    if old_kernel is None:
+        os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
+    else:
+        os.environ["BQQ_CUDA_DECODE_KERNEL"] = old_kernel
+    if old_splits is None:
+        os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
+    else:
+        os.environ["BQQ_CUDA_COL_SPLITS"] = old_splits
+
+
+@torch.inference_mode()
 def _run_decode_benchmark(
     *,
     model: torch.nn.Module,
@@ -185,47 +261,46 @@ def _run_decode_benchmark(
     model.eval()
     model.to(input_ids.device)
 
-    with torch.inference_mode():
-        pref = model(input_ids=input_ids, use_cache=True)
-        past_key_values = pref.past_key_values
-        step_ids = input_ids[:, -1:]
+    pref = model(input_ids=input_ids, use_cache=True)
+    past_key_values = pref.past_key_values
+    step_ids = input_ids[:, -1:]
 
-        def step():
-            model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+    def step():
+        model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
 
-        for _ in range(warmup):
-            step()
-        torch.cuda.synchronize()
+    for _ in range(warmup):
+        step()
+    torch.cuda.synchronize()
 
-        if use_cuda_graph:
-            # Capture one decode step and replay it.  The DynamicCache is
-            # frozen at capture time, so this measures fixed-context decode
-            # with zero kernel-launch overhead — what a serving stack with
-            # CUDA graphs / static cache would see.
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(3):
-                    step()
-            torch.cuda.current_stream().wait_stream(side)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+    if use_cuda_graph:
+        # Capture one decode step and replay it.  The DynamicCache is
+        # frozen at capture time, so this measures fixed-context decode
+        # with zero kernel-launch overhead — what a serving stack with
+        # CUDA graphs / static cache would see.
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
                 step()
-            run_step = graph.replay
-            torch.cuda.synchronize()
-        else:
-            run_step = step
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            step()
+        run_step = graph.replay
+        torch.cuda.synchronize()
+    else:
+        run_step = step
 
-        samples = []
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        for _ in range(iters):
-            start.record()
-            for _ in range(inner_iters):
-                run_step()
-            end.record()
-            torch.cuda.synchronize()
-            samples.append(start.elapsed_time(end) / inner_iters)
+    samples = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        start.record()
+        for _ in range(inner_iters):
+            run_step()
+        end.record()
+        torch.cuda.synchronize()
+        samples.append(start.elapsed_time(end) / inner_iters)
 
     mean_ms = statistics.fmean(samples)
     p50_ms = statistics.median(samples)
@@ -243,6 +318,8 @@ def _run_model_benchmark(args) -> None:
     bqq_dtype = None if args.bqq_dtype == "keep" else getattr(torch, args.bqq_dtype)
     bqq_model = _load_bqq_model(args.model_path, bqq_dtype)
     fp16_model = _load_fp16_model(args.model_name)
+    _ensure_qwen35_block_type(bqq_model)
+    _ensure_qwen35_block_type(fp16_model)
 
     vocab_size = getattr(getattr(fp16_model, "config", None), "vocab_size", None)
     if vocab_size is None:
@@ -255,26 +332,86 @@ def _run_model_benchmark(args) -> None:
     input_ids = torch.randint(0, int(vocab_size), (1, args.seq_len), dtype=torch.long, generator=generator)
     input_ids = input_ids.to(device=device)
 
-    for name, model in (("bqq", bqq_model), ("fp16", fp16_model)):
-        mean_ms, p50_ms, p90_ms = _run_decode_benchmark(
-            model=model,
-            input_ids=input_ids,
-            warmup=args.warmup,
-            iters=args.iters,
-            inner_iters=args.inner_iters,
-            use_cuda_graph=args.use_cuda_graph,
-        )
-        toks = 1000.0 / mean_ms
-        print(f"{name},{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+    old_kernel = old_splits = None
+    try:
+        old_kernel, old_splits = _apply_bqq_kernel_env(args.bqq_decode_kernel, args.bqq_col_splits)
+        for name, model in (("bqq", bqq_model), ("fp16", fp16_model)):
+            mean_ms, p50_ms, p90_ms = _run_decode_benchmark(
+                model=model,
+                input_ids=input_ids,
+                warmup=args.warmup,
+                iters=args.iters,
+                inner_iters=args.inner_iters,
+                use_cuda_graph=args.use_cuda_graph,
+            )
+            toks = 1000.0 / mean_ms
+            print(f"{name},{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+    finally:
+        _restore_bqq_kernel_env(old_kernel, old_splits)
+
+
+def _run_packed_core_benchmark(args) -> None:
+    """Benchmark packed binary matmul directly.
+
+    This bypasses the full decode forward path and measures the core packed
+    BQQ binary matmul used by PackedBinaryQuadratic._compute_W_core.
+    """
+    from neural_network_compression.bqqkernel.bqq_modules import PackedBinaryQuadratic
+
+    device = torch.device("cuda")
+    dtype = getattr(torch, args.dtype)
+    default_group = args.group_size if args.group_size is not None else 2 * args.inter_dim
+    y_row = args.y_row if args.y_row is not None else default_group
+    z_col = args.z_col if args.z_col is not None else default_group
+    bit_widths = _parse_ints(args.bit_widths) if args.bit_widths else [args.bit_width]
+
+    print("method,bits,col_splits,mean_ms,p50_ms,p90_ms,tokens_per_s")
+
+    old_flag = PackedBinaryQuadratic.use_packed_kernel
+    try:
+        for bit_width in bit_widths:
+            layer, _x = _make_layer(
+                out_features=args.out_features,
+                in_features=args.in_features,
+                bit_width=bit_width,
+                y_row=y_row,
+                z_col=z_col,
+                inter_dim=args.inter_dim,
+                device=device,
+                dtype=dtype,
+                seed=args.seed + bit_width,
+            )
+
+            PackedBinaryQuadratic.use_packed_kernel = False
+            mean_ms, p50_ms, p90_ms = _time_forward(
+                lambda: layer._compute_W_core(dtype),
+                warmup=args.warmup,
+                iters=args.iters,
+                inner_iters=args.inner_iters,
+            )
+            toks = 1000.0 / mean_ms
+            print(f"packed-unpack,{bit_width},n/a,{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+
+            PackedBinaryQuadratic.use_packed_kernel = True
+            mean_ms, p50_ms, p90_ms = _time_forward(
+                lambda: layer._compute_W_core(dtype),
+                warmup=args.warmup,
+                iters=args.iters,
+                inner_iters=args.inner_iters,
+            )
+            toks = 1000.0 / mean_ms
+            print(f"packed-kernel,{bit_width},n/a,{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
+    finally:
+        PackedBinaryQuadratic.use_packed_kernel = old_flag
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--benchmark-mode",
-        choices=["microbench", "model"],
+        choices=["microbench", "packed-core", "model"],
         default="microbench",
-        help="microbench keeps the existing packed-layer benchmark; model compares BQQ .pth vs fp16 HF model.",
+        help="microbench keeps the existing decode benchmark; packed-core measures packed_binary_matmul directly; model compares BQQ .pth vs fp16 HF model.",
     )
     parser.add_argument("--model-name", type=str, default="Qwen/Qwen3.5-4B")
     parser.add_argument("--model-path", type=str, default=None)
@@ -321,6 +458,16 @@ def main() -> None:
         help="Comma-separated decode kernels: default,bitblas_byte4,bitblas_byte2,bitblas_byte.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--bqq-decode-kernel",
+        default=None,
+        help="Override BQQ_CUDA_DECODE_KERNEL during model benchmark. Useful to force a stable decode kernel such as two_stage_warp.",
+    )
+    parser.add_argument(
+        "--bqq-col-splits",
+        default=None,
+        help="Override BQQ_CUDA_COL_SPLITS during model benchmark.",
+    )
     args = parser.parse_args()
 
     _add_repo_to_path()
@@ -331,6 +478,9 @@ def main() -> None:
     if args.benchmark_mode == "model":
         print("method,mean_ms,p50_ms,p90_ms,tokens_per_s")
         _run_model_benchmark(args)
+        return
+    if args.benchmark_mode == "packed-core":
+        _run_packed_core_benchmark(args)
         return
 
     device = torch.device("cuda")

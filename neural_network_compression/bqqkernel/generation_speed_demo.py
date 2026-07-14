@@ -8,6 +8,7 @@ only PyTorch and Transformers are required.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import csv
 import gc
 import json
@@ -19,13 +20,20 @@ from pathlib import Path
 
 import dill
 import torch
+
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def _add_repo_to_path() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
+    package_root = Path(__file__).resolve().parents[1]
+    project_root = package_root.parent
+    for path in (str(project_root), str(package_root)):
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -38,19 +46,60 @@ def _dtype_from_name(name: str) -> torch.dtype:
 
 
 def _load_bqq_model(path: str, dtype: torch.dtype, device: torch.device) -> torch.nn.Module:
-    _add_repo_to_path()
-    import neural_network_compression.bqqkernel.bqq_modules as _bqq_modules  # noqa: F401
+    from bqqkernel.benchmark_decode import _load_bqq_model as _load_bqq_model_core
 
-    model = torch.load(path, map_location="cpu", weights_only=False, pickle_module=dill)
-    if not hasattr(model, "eval"):
-        raise TypeError(f"{path} did not deserialize to a torch.nn.Module")
-    model.eval()
-    model.to(dtype=dtype)
+    model = _load_bqq_model_core(path, dtype)
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    if hasattr(model, "config"):
+        setattr(model.config, "use_cache", True)
+    print("[demo] model.to(device) start", flush=True)
     model.to(device)
+    print("[demo] model move done", flush=True)
+    _ensure_qwen35_block_type(model)
     return model
 
 
+def _set_bqq_kernel_env(kernel: str | None, col_splits: str | None) -> tuple[str | None, str | None]:
+    old_kernel = os.environ.get("BQQ_CUDA_DECODE_KERNEL")
+    old_splits = os.environ.get("BQQ_CUDA_COL_SPLITS")
+    if kernel is None:
+        os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
+    else:
+        os.environ["BQQ_CUDA_DECODE_KERNEL"] = kernel
+    if col_splits is None:
+        os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
+    else:
+        os.environ["BQQ_CUDA_COL_SPLITS"] = col_splits
+    return old_kernel, old_splits
+
+
+def _restore_bqq_kernel_env(old_kernel: str | None, old_splits: str | None) -> None:
+    if old_kernel is None:
+        os.environ.pop("BQQ_CUDA_DECODE_KERNEL", None)
+    else:
+        os.environ["BQQ_CUDA_DECODE_KERNEL"] = old_kernel
+    if old_splits is None:
+        os.environ.pop("BQQ_CUDA_COL_SPLITS", None)
+    else:
+        os.environ["BQQ_CUDA_COL_SPLITS"] = old_splits
+
+
 def _load_fp16_model(model_name: str, device: torch.device) -> torch.nn.Module:
+    _add_repo_to_path()
+    package_root = Path(__file__).resolve().parents[1]
+    for name in ("causal_conv1d", "fla"):
+        pkg_init = package_root / name / "__init__.py"
+        spec = importlib.util.spec_from_file_location(
+            name,
+            pkg_init,
+            submodule_search_locations=[str(pkg_init.parent)],
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load local shim package: {name}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -60,9 +109,20 @@ def _load_fp16_model(model_name: str, device: torch.device) -> torch.nn.Module:
     except Exception as exc:
         print(f"[fp16] flash_attention_2 unavailable, using default attention: {exc}")
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    if hasattr(model, "config"):
+        setattr(model.config, "use_cache", True)
     model.eval()
     model.to(device)
+    _ensure_qwen35_block_type(model)
     return model
+
+
+def _ensure_qwen35_block_type(model: torch.nn.Module) -> None:
+    for module in model.modules():
+        if hasattr(module, "layer_type") and not hasattr(module, "block_type"):
+            module.block_type = module.layer_type
 
 
 def _load_tokenizer(model_name: str):
@@ -160,20 +220,28 @@ def _generate_token_ids_eager(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
-    _sync_if_cuda(device)
+    print("[demo] prefill start", flush=True)
     prefill_start = time.perf_counter()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
-    _sync_if_cuda(device)
+    with torch.inference_mode():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
     prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
+    print(f"[demo] prefill done: {prefill_ms:.2f} ms", flush=True)
 
     past_key_values = outputs.past_key_values
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    del outputs
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
     generated_ids = [int(next_token.item())]
     step_ids = next_token
 
     eos_id = tokenizer.eos_token_id
     for _ in range(2, max_new_tokens + 1):
-        outputs = model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
+        print("[demo] decode step start", flush=True)
+        with torch.inference_mode():
+            outputs = model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
         past_key_values = outputs.past_key_values
         step_ids = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
         token_id = int(step_ids.item())
@@ -203,6 +271,7 @@ def run_cuda_graph_replay_demo(
     # Tokens are generated eagerly for display.  The speed shown below is from
     # CUDA graph replay of one fixed-context decode step, matching
     # benchmark_decode.py --use-cuda-graph.
+    print("[demo] graph mode eager warmup", flush=True)
     generated_ids, prefill_ms = _generate_token_ids_eager(
         model=model,
         tokenizer=tokenizer,
@@ -217,12 +286,19 @@ def run_cuda_graph_replay_demo(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+    with torch.inference_mode():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
     past_key_values = outputs.past_key_values
     static_step_ids = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+    del outputs
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    print("[demo] graph capture prep done", flush=True)
 
     def graph_step():
-        model(input_ids=static_step_ids, past_key_values=past_key_values, use_cache=True)
+        with torch.inference_mode():
+            model(input_ids=static_step_ids, past_key_values=past_key_values, use_cache=True)
 
     for _ in range(max(1, graph_warmup)):
         graph_step()
@@ -314,11 +390,14 @@ def run_generation(
     if attention_mask is not None:
         attention_mask = attention_mask.to(device)
 
+    print(f"[demo] {name} prefill start", flush=True)
     _sync_if_cuda(device)
     prefill_start = time.perf_counter()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
+    with torch.inference_mode():
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=True)
     _sync_if_cuda(device)
     prefill_ms = (time.perf_counter() - prefill_start) * 1000.0
+    print(f"[demo] {name} prefill done: {prefill_ms:.2f} ms", flush=True)
 
     past_key_values = outputs.past_key_values
     next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
@@ -351,10 +430,10 @@ def run_generation(
     decode_ms: list[float] = []
     step_ids = next_token
     for index in range(2, max_new_tokens + 1):
-        _sync_if_cuda(device)
+        print(f"[demo] {name} decode step {index}", flush=True)
         start = time.perf_counter()
-        outputs = model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
-        _sync_if_cuda(device)
+        with torch.inference_mode():
+            outputs = model(input_ids=step_ids, past_key_values=past_key_values, use_cache=True)
         latency_ms = (time.perf_counter() - start) * 1000.0
 
         past_key_values = outputs.past_key_values
@@ -472,32 +551,49 @@ def main() -> None:
                         help="Scale used for the terminal speed bar.")
     parser.add_argument("--csv-out", default=None)
     parser.add_argument("--json-out", default=None)
+    parser.add_argument(
+        "--bqq-decode-kernel",
+        default=None,
+        help="Override BQQ_CUDA_DECODE_KERNEL for the packed BQQ run. Use this to force a stable decode kernel such as two_stage_warp.",
+    )
+    parser.add_argument(
+        "--bqq-col-splits",
+        default=None,
+        help="Override BQQ_CUDA_COL_SPLITS for the packed BQQ run.",
+    )
     args = parser.parse_args()
 
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is not available")
     device = torch.device(args.device)
 
+    print("[demo] tokenizer load start", flush=True)
     tokenizer = _load_tokenizer(args.model_name)
+    print("[demo] tokenizer load done", flush=True)
     results: list[RunResult] = []
 
     if args.mode in {"bqq", "both"}:
         print("Loading packed BQQ model...", flush=True)
-        bqq = _load_bqq_model(args.bqq_model_path, _dtype_from_name(args.bqq_dtype), device)
-        runner = run_cuda_graph_replay_demo if args.use_cuda_graph else run_generation
-        kwargs = {"graph_warmup": args.graph_warmup} if args.use_cuda_graph else {}
-        results.append(runner(
-            name="BQQ packed",
-            model=bqq,
-            tokenizer=tokenizer,
-            prompt=args.prompt,
-            max_new_tokens=args.max_new_tokens,
-            device=device,
-            refresh_screen=args.refresh_screen,
-            reference_tps=args.reference_tps,
-            **kwargs,
-        ))
-        _free_model(bqq)
+        old_kernel = old_splits = None
+        try:
+            old_kernel, old_splits = _set_bqq_kernel_env(args.bqq_decode_kernel, args.bqq_col_splits)
+            bqq = _load_bqq_model(args.bqq_model_path, _dtype_from_name(args.bqq_dtype), device)
+            runner = run_cuda_graph_replay_demo if args.use_cuda_graph else run_generation
+            kwargs = {"graph_warmup": args.graph_warmup} if args.use_cuda_graph else {}
+            results.append(runner(
+                name="BQQ packed",
+                model=bqq,
+                tokenizer=tokenizer,
+                prompt=args.prompt,
+                max_new_tokens=args.max_new_tokens,
+                device=device,
+                refresh_screen=args.refresh_screen,
+                reference_tps=args.reference_tps,
+                **kwargs,
+            ))
+            _free_model(bqq)
+        finally:
+            _restore_bqq_kernel_env(old_kernel, old_splits)
 
     if args.mode in {"fp16", "both"}:
         print("Loading fp16 baseline model...", flush=True)

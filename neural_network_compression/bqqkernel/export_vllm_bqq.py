@@ -256,6 +256,28 @@ def _copy_or_save_hf_files(model_name: str, output_dir: Path, hf_source_dir: Pat
     tokenizer.save_pretrained(output_dir)
 
 
+def _inject_bqq_quantization_config(
+    output_dir: Path,
+    layers: dict[str, dict[str, Any]],
+    modules_to_not_convert: list[str],
+) -> None:
+    config_path = output_dir / "config.json"
+    with open(config_path) as f:
+        config = json.load(f)
+    config["quantization_config"] = {
+        "quant_method": "bqq",
+        "format": "packed_binary_quadratic",
+        "version": 1,
+        "layers": layers,
+        "modules_to_not_convert": modules_to_not_convert,
+    }
+    rope_parameters = config.get("rope_parameters")
+    if isinstance(rope_parameters, dict):
+        rope_parameters.pop("mrope_section", None)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+
+
 def export_bqq_for_vllm(
     *,
     model_path: Path,
@@ -289,6 +311,8 @@ def export_bqq_for_vllm(
     if hf_source_dir is None and (model_path.parent / "config.json").exists():
         hf_source_dir = model_path.parent
     _copy_or_save_hf_files(model_name, output_dir, hf_source_dir)
+    modules_to_not_convert = _unquantized_linear_names(model)
+    _inject_bqq_quantization_config(output_dir, vllm_layers, modules_to_not_convert)
 
     bqq_config = {
         "format": "packed_binary_quadratic",
@@ -297,7 +321,7 @@ def export_bqq_for_vllm(
         "source_checkpoint": str(model_path),
         "hf_layers": layers,
         "layers": vllm_layers,
-        "modules_to_not_convert": _unquantized_linear_names(model),
+        "modules_to_not_convert": modules_to_not_convert,
     }
     with open(output_dir / "bqq_config.json", "w") as f:
         json.dump(bqq_config, f, indent=2)

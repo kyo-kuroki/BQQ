@@ -502,6 +502,8 @@ class PackedBinaryQuadratic(nn.Module):
         _invalidate_flat_cache() after mutating coefficients.
         """
         cache = self.__dict__.get("_flat_cache")
+        if cache is not None and self.__dict__.get("_flat_cache_static", False):
+            return cache
         key = (self.Y_packed.data_ptr(), self.a.data_ptr())
         if cache is not None and cache["key"] == key:
             return cache

@@ -1581,13 +1581,14 @@ torch::Tensor reconstruct_W(
 
     dim3 block(16, 16);
     dim3 grid((out_f + 15) / 16, (in_f + 15) / 16);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     auto a_h = a.to(torch::kFloat16).contiguous();
     auto b_h = b.to(torch::kFloat16).contiguous();
     auto c_h = c.to(torch::kFloat16).contiguous();
     auto d_h = d.to(torch::kFloat16).contiguous();
 
-    reconstruct_W_kernel<<<grid, block>>>(
+    reconstruct_W_kernel<<<grid, block, 0, stream>>>(
         Y_packed.data_ptr<uint8_t>(),
         Z_packed.data_ptr<uint8_t>(),
         reinterpret_cast<const __half*>(a_h.data_ptr<at::Half>()),
@@ -1687,6 +1688,7 @@ torch::Tensor bqq_forward_core(
     const int in_f      = col_width * z_col;
     const int B_total   = bit_width * row_width * col_width;
     const int ni        = (y_row + 31) / 32;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     /* ── flatten X to [batch, in_features] ─────────────────── */
     auto X_shape = X.sizes().vec();
@@ -1738,7 +1740,7 @@ torch::Tensor bqq_forward_core(
             #define LAUNCH_ROWTILE(K8M) \
                 do { \
                     if (x_large_bf16) \
-                        bqq_forward_byte4_rowtile_kernel<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem>>>( \
+                        bqq_forward_byte4_rowtile_kernel<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem, stream>>>( \
                             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                             bf16_ptr(X_view_half), \
                             half_ptr(a_flat), half_ptr(b_flat), \
@@ -1746,7 +1748,7 @@ torch::Tensor bqq_forward_core(
                             out.data_ptr<float>(), \
                             row_width, col_width, bit_width, y_row, z_col, k8, col_splits, row_tiles); \
                     else \
-                        bqq_forward_byte4_rowtile_kernel<__half, NW, NI, K8M><<<grid, block, smem>>>( \
+                        bqq_forward_byte4_rowtile_kernel<__half, NW, NI, K8M><<<grid, block, smem, stream>>>( \
                             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                             half_ptr(X_view_half), \
                             half_ptr(a_flat), half_ptr(b_flat), \
@@ -1775,7 +1777,7 @@ torch::Tensor bqq_forward_core(
             dim3 s1_block(NW * 32);
             dim3 s1_grid((B_total * n_inner + NW - 1) / NW);
             if (x_large_bf16)
-                bqq_stage1_ztx_kernel<__nv_bfloat16, NW><<<s1_grid, s1_block>>>(
+                bqq_stage1_ztx_kernel<__nv_bfloat16, NW><<<s1_grid, s1_block, 0, stream>>>(
                     Z_flat.data_ptr<uint8_t>(),
                     bf16_ptr(X_view_half),
                     T.data_ptr<float>(),
@@ -1783,7 +1785,7 @@ torch::Tensor bqq_forward_core(
                     Xsum.data_ptr<float>(),
                     B_total, col_width, z_col, k8);
             else
-                bqq_stage1_ztx_kernel<__half, NW><<<s1_grid, s1_block>>>(
+                bqq_stage1_ztx_kernel<__half, NW><<<s1_grid, s1_block, 0, stream>>>(
                     Z_flat.data_ptr<uint8_t>(),
                     half_ptr(X_view_half),
                     T.data_ptr<float>(),
@@ -1802,7 +1804,7 @@ torch::Tensor bqq_forward_core(
                     const int lut_total = B_total * k8 * 256;
                     dim3 lut_block(256);
                     dim3 lut_grid((lut_total + lut_block.x - 1) / lut_block.x);
-                    bqq_build_t_lut_kernel<<<lut_grid, lut_block>>>(
+                    bqq_build_t_lut_kernel<<<lut_grid, lut_block, 0, stream>>>(
                         T.data_ptr<float>(),
                         TLut.data_ptr<float>(),
                         B_total, k8);
@@ -1814,7 +1816,7 @@ torch::Tensor bqq_forward_core(
                         torch::dtype(torch::kFloat32).device(X.device()));
                     dim3 s2_grid(bit_width * row_width * rowwarp_row_tiles, batch);
                     dim3 s2_block(rowwarp_warps * 32);
-                    bqq_stage2_yt_rowwarp_lut_partial_kernel<rowwarp_warps><<<s2_grid, s2_block>>>(
+                    bqq_stage2_yt_rowwarp_lut_partial_kernel<rowwarp_warps><<<s2_grid, s2_block, 0, stream>>>(
                         Y_flat.data_ptr<uint8_t>(),
                         TLut.data_ptr<float>(),
                         Tsum.data_ptr<float>(),
@@ -1827,7 +1829,7 @@ torch::Tensor bqq_forward_core(
                     const int total_out = row_width * y_row;
                     dim3 s3_block(256);
                     dim3 s3_grid((total_out + s3_block.x - 1) / s3_block.x);
-                    bqq_stage3_reduce_kernel<<<s3_grid, s3_block>>>(
+                    bqq_stage3_reduce_kernel<<<s3_grid, s3_block, 0, stream>>>(
                         partial.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
                         half_ptr(d_flat),
@@ -1837,7 +1839,7 @@ torch::Tensor bqq_forward_core(
                     auto partial = torch::empty({bit_width, row_width, y_row},
                         torch::dtype(torch::kFloat32).device(X.device()));
                     dim3 s2_grid(bit_width * row_width * row_tiles, batch);
-                    bqq_stage2_yt_partial_kernel<NI><<<s2_grid, s2_block>>>(
+                    bqq_stage2_yt_partial_kernel<NI><<<s2_grid, s2_block, 0, stream>>>(
                         Y_flat.data_ptr<uint8_t>(),
                         T.data_ptr<float>(),
                         Tsum.data_ptr<float>(),
@@ -1850,7 +1852,7 @@ torch::Tensor bqq_forward_core(
                     const int total_out = row_width * y_row;
                     dim3 s3_block(256);
                     dim3 s3_grid((total_out + s3_block.x - 1) / s3_block.x);
-                    bqq_stage3_reduce_kernel<<<s3_grid, s3_block>>>(
+                    bqq_stage3_reduce_kernel<<<s3_grid, s3_block, 0, stream>>>(
                         partial.data_ptr<float>(),
                         Xsum.data_ptr<float>(),
                         half_ptr(d_flat),
@@ -1859,7 +1861,7 @@ torch::Tensor bqq_forward_core(
                 }
             } else {
                 dim3 s2_grid(row_width * row_tiles, batch);
-                bqq_stage2_yt_kernel<NI><<<s2_grid, s2_block>>>(
+                bqq_stage2_yt_kernel<NI><<<s2_grid, s2_block, 0, stream>>>(
                     Y_flat.data_ptr<uint8_t>(),
                     T.data_ptr<float>(),
                     Tsum.data_ptr<float>(),
@@ -1966,7 +1968,7 @@ torch::Tensor bqq_forward_core(
             dim3 block(GW * 32);
             int smem = (y_row + GW * y_row + GW) * static_cast<int>(sizeof(float));
             #define LAUNCH_GROUPED(K8M) \
-                bqq_decode_grouped_scatter_kernel<GW, K8M><<<grid, block, smem>>>( \
+                bqq_decode_grouped_scatter_kernel<GW, K8M><<<grid, block, smem, stream>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
                     half_ptr(a_flat), half_ptr(b_flat), \
@@ -1981,7 +1983,7 @@ torch::Tensor bqq_forward_core(
         } else if (use_two_stage_warp) {
             constexpr int TW = 8;
             dim3 block(TW * 32);
-            bqq_decode_two_stage_warp_kernel<TW><<<grid, block>>>( \
+            bqq_decode_two_stage_warp_kernel<TW><<<grid, block, 0, stream>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
                     half_ptr(a_flat), half_ptr(b_flat), \
@@ -1991,7 +1993,7 @@ torch::Tensor bqq_forward_core(
         } else if (use_two_stage) {
             dim3 block(256);
             #define LAUNCH_TWO_STAGE(K8M) \
-                bqq_decode_two_stage_kernel<K8M><<<grid, block>>>( \
+                bqq_decode_two_stage_kernel<K8M><<<grid, block, 0, stream>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
                     half_ptr(a_flat), half_ptr(b_flat), \
@@ -2008,7 +2010,7 @@ torch::Tensor bqq_forward_core(
             int smem = NW * 32 * sizeof(float);
 
             #define LAUNCH_FLOAT(NI, K8M) \
-                bqq_forward_kernel<float, NW, NI, K8M><<<grid, block, smem>>>( \
+                bqq_forward_kernel<float, NW, NI, K8M><<<grid, block, smem, stream>>>( \
                     Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                     X_view.data_ptr<float>(), \
                     half_ptr(a_flat), half_ptr(b_flat), \
@@ -2021,7 +2023,7 @@ torch::Tensor bqq_forward_core(
             #define LAUNCH_X16(KERNEL, NI, K8M) \
                 do { \
                     if (x_is_bf16) \
-                        KERNEL<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem>>>( \
+                        KERNEL<__nv_bfloat16, NW, NI, K8M><<<grid, block, smem, stream>>>( \
                             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                             bf16_ptr(X_view_half), \
                             half_ptr(a_flat), half_ptr(b_flat), \
@@ -2029,7 +2031,7 @@ torch::Tensor bqq_forward_core(
                             out.data_ptr<float>(), \
                             row_width, col_width, bit_width, y_row, z_col, k8, col_splits); \
                     else \
-                        KERNEL<__half, NW, NI, K8M><<<grid, block, smem>>>( \
+                        KERNEL<__half, NW, NI, K8M><<<grid, block, smem, stream>>>( \
                             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
                             half_ptr(X_view_half), \
                             half_ptr(a_flat), half_ptr(b_flat), \
@@ -2104,12 +2106,12 @@ torch::Tensor bqq_forward_core(
             const int threads = 256;
             const int blocks = (out_f + threads - 1) / threads;
             if (x_is_bf16)
-                bqq_ws_store_zero_kernel<__nv_bfloat16><<<blocks, threads>>>(
+                bqq_ws_store_zero_kernel<__nv_bfloat16><<<blocks, threads, 0, stream>>>(
                     ws.data_ptr<float>(),
                     reinterpret_cast<__nv_bfloat16*>(out_h.data_ptr<at::BFloat16>()),
                     out_f);
             else
-                bqq_ws_store_zero_kernel<__half><<<blocks, threads>>>(
+                bqq_ws_store_zero_kernel<__half><<<blocks, threads, 0, stream>>>(
                     ws.data_ptr<float>(),
                     reinterpret_cast<__half*>(out_h.data_ptr<at::Half>()),
                     out_f);
@@ -2126,7 +2128,7 @@ torch::Tensor bqq_forward_core(
         dim3 rblock(16, 16);
         dim3 rgrid((out_f + 15) / 16, (in_f + 15) / 16);
 
-        reconstruct_W_kernel<<<rgrid, rblock>>>(
+        reconstruct_W_kernel<<<rgrid, rblock, 0, stream>>>(
             Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(),
             half_ptr(a_flat), half_ptr(b_flat),
             half_ptr(c_flat), half_ptr(d_flat),
@@ -2202,11 +2204,12 @@ void prefetch_tensors_to_l2(
     torch::Tensor a, torch::Tensor b,
     torch::Tensor c, torch::Tensor d)
 {
-    auto launch = [](const void* ptr, size_t nbytes) {
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto launch = [stream](const void* ptr, size_t nbytes) {
         if (nbytes == 0) return;
         int threads = 256;
         int blocks = min((int)((nbytes + threads * 16 - 1) / (threads * 16)), 256);
-        prefetch_l2_kernel<<<blocks, threads>>>(
+        prefetch_l2_kernel<<<blocks, threads, 0, stream>>>(
             static_cast<const char*>(ptr), nbytes);
     };
     launch(Y_packed.data_ptr(), Y_packed.nbytes());
