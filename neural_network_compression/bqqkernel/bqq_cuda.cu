@@ -43,17 +43,6 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-__device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
-    const int tid = threadIdx.x;
-    smem[tid] = val;
-    __syncthreads();
-    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) smem[tid] += smem[tid + stride];
-        __syncthreads();
-    }
-    return smem[0];
-}
-
 template <typename T>
 __device__ __forceinline__ float load_activation(const T* ptr, size_t idx);
 
@@ -950,91 +939,6 @@ __global__ void bqq_stage3_reduce_kernel(
     out[idx] = acc;
 }
 
-template <int N_I_TILES, int K_CHUNK>
-__global__ void bqq_stage2_yt_ksplit_lut_kernel(
-    const uint8_t* __restrict__ Y,
-    const float*   __restrict__ TLut,
-    const float*   __restrict__ Xsum,
-    const __half*  __restrict__ a_ptr,
-    const __half*  __restrict__ b_ptr,
-    float*         __restrict__ partial,
-    int row_width, int col_width, int bit_width,
-    int y_row, int k8, int row_tiles, int k_splits)
-{
-    constexpr int ROW_TILE = N_I_TILES * 32;
-    const int combined = blockIdx.x;
-    const int rt = combined % row_tiles;
-    const int tmp0 = combined / row_tiles;
-    const int ks = tmp0 % k_splits;
-    const int tmp1 = tmp0 / k_splits;
-    const int r = tmp1 % row_width;
-    const int p = tmp1 / row_width;
-    const int lane = threadIdx.x & 31;
-    const int warp_id = threadIdx.x >> 5;
-    const int row_start = rt * ROW_TILE;
-    const int bk_start = ks * K_CHUNK;
-    const int bk_end = min(bk_start + K_CHUNK, k8);
-
-    #pragma unroll
-    for (int it = 0; it < N_I_TILES; it++) {
-        const int i = row_start + it * 32 + lane;
-        if (warp_id != it || i >= y_row) continue;
-
-        float acc = 0.0f;
-        for (int ci = 0; ci < col_width; ci++) {
-            const int rc = r * col_width + ci;
-            const int B_idx = p * row_width * col_width + rc;
-            const uint8_t* yp = Y + (size_t)B_idx * y_row * k8 + i * k8;
-            const float* lut = TLut + (size_t)B_idx * k8 * 256;
-            float part = 0.0f;
-            int y_count = 0;
-            for (int bk = bk_start; bk < bk_end; bk++) {
-                const uint8_t yb = yp[bk];
-                y_count += __popc((unsigned)yb);
-                part += lut[bk * 256 + (int)yb];
-            }
-            const float xsum = Xsum[B_idx];
-            acc += __half2float(a_ptr[B_idx]) * part
-                 + __half2float(b_ptr[B_idx]) * xsum * (float)y_count;
-        }
-
-        partial[(((size_t)p * k_splits + ks) * row_width + r) * y_row + i] = acc;
-    }
-}
-
-__global__ void bqq_stage3_reduce_ksplit_kernel(
-    const float* __restrict__ partial,
-    const float* __restrict__ Tsum,
-    const float* __restrict__ Xsum,
-    const __half* __restrict__ c_ptr,
-    const __half* __restrict__ d_ptr,
-    float*       __restrict__ out,
-    int row_width, int col_width, int bit_width, int y_row, int k_splits)
-{
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    const int total = row_width * y_row;
-    if (idx >= total) return;
-
-    const int r = idx / y_row;
-    const int i = idx - r * y_row;
-    float acc = 0.0f;
-
-    for (int p = 0; p < bit_width; p++) {
-        for (int ks = 0; ks < k_splits; ks++) {
-            acc += partial[(((size_t)p * k_splits + ks) * row_width + r) * y_row + i];
-        }
-        for (int ci = 0; ci < col_width; ci++) {
-            const int B_idx = p * row_width * col_width + r * col_width + ci;
-            acc += __half2float(c_ptr[B_idx]) * Tsum[B_idx];
-        }
-    }
-    for (int ci = 0; ci < col_width; ci++) {
-        const int rc = r * col_width + ci;
-        acc += __half2float(d_ptr[rc]) * Xsum[rc];
-    }
-    out[idx] = acc;
-}
-
 __global__ void bqq_build_t_lut_kernel(
     const float* __restrict__ T,
     float*       __restrict__ TLut,
@@ -1057,57 +961,6 @@ __global__ void bqq_build_t_lut_kernel(
         if ((mask >> shift) & 1) sum += tptr[bit];
     }
     TLut[idx] = sum;
-}
-
-template <int N_I_TILES>
-__global__ void bqq_stage2_yt_partial_lut_kernel(
-    const uint8_t* __restrict__ Y,
-    const float*   __restrict__ TLut,
-    const float*   __restrict__ Tsum,
-    const float*   __restrict__ Xsum,
-    const __half*  __restrict__ a_ptr,
-    const __half*  __restrict__ b_ptr,
-    const __half*  __restrict__ c_ptr,
-    float*         __restrict__ partial,
-    int row_width, int col_width, int bit_width,
-    int y_row, int k8, int row_tiles)
-{
-    constexpr int ROW_TILE = N_I_TILES * 32;
-    const int combined = blockIdx.x;
-    const int rt = combined % row_tiles;
-    const int tmp = combined / row_tiles;
-    const int r = tmp % row_width;
-    const int p = tmp / row_width;
-    const int lane = threadIdx.x & 31;
-    const int warp_id = threadIdx.x >> 5;
-    const int row_start = rt * ROW_TILE;
-
-    #pragma unroll
-    for (int it = 0; it < N_I_TILES; it++) {
-        const int i = row_start + it * 32 + lane;
-        if (warp_id != it || i >= y_row) continue;
-
-        float acc = 0.0f;
-        for (int ci = 0; ci < col_width; ci++) {
-            const int rc = r * col_width + ci;
-            const int B_idx = p * row_width * col_width + rc;
-            const uint8_t* yp = Y + (size_t)B_idx * y_row * k8 + i * k8;
-            const float* lut = TLut + (size_t)B_idx * k8 * 256;
-            float part = 0.0f;
-            int y_count = 0;
-            for (int bk = 0; bk < k8; bk++) {
-                const uint8_t yb = yp[bk];
-                y_count += __popc((unsigned)yb);
-                part += lut[bk * 256 + (int)yb];
-            }
-            const float xsum = Xsum[B_idx];
-            acc += __half2float(a_ptr[B_idx]) * part
-                 + __half2float(b_ptr[B_idx]) * xsum * (float)y_count
-                 + __half2float(c_ptr[B_idx]) * Tsum[B_idx];
-        }
-
-        partial[(size_t)p * row_width * y_row + r * y_row + i] = acc;
-    }
 }
 
 template <int N_WARPS>
@@ -1166,103 +1019,7 @@ __global__ void bqq_stage2_yt_rowwarp_lut_partial_kernel(
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════
- * Decode experiment: explicit Z@x then Y@t
- * ═══════════════════════════════════════════════════════════════════ */
-
-template <int K8_MAX>
-__global__ void bqq_decode_two_stage_kernel(
-    const uint8_t* __restrict__ Y,
-    const uint8_t* __restrict__ Z,
-    const float*   __restrict__ X,
-    const __half*  __restrict__ a_ptr,
-    const __half*  __restrict__ b_ptr,
-    const __half*  __restrict__ c_ptr,
-    const __half*  __restrict__ d_ptr,
-    float*         __restrict__ out,
-    int row_width, int col_width, int bit_width,
-    int y_row, int z_col, int k8,
-    int col_splits)
-{
-    constexpr int K_MAX = K8_MAX * 8;
-    __shared__ float t_vals[K_MAX];
-    __shared__ float reduce_buf[256];
-
-    const int combined = blockIdx.x;
-    const int r = combined / col_splits;
-    const int cs = combined % col_splits;
-    const int n = blockIdx.y;
-    const int tid = threadIdx.x;
-
-    const int c_per_split = (col_width + col_splits - 1) / col_splits;
-    const int c_block_start = cs * c_per_split;
-    const int c_block_end = min(c_block_start + c_per_split, col_width);
-    const int n_inner = k8 * 8;
-
-    float acc = 0.0f;
-    const bool has_i = tid < y_row;
-    const int i = tid;
-
-    for (int ci = c_block_start; ci < c_block_end; ci++) {
-        const int rc = r * col_width + ci;
-        const int x_base = n * col_width * z_col + ci * z_col;
-
-        float xsum_local = 0.0f;
-        for (int j = tid; j < z_col; j += blockDim.x) {
-            xsum_local += X[x_base + j];
-        }
-        const float xsum = block_reduce_sum(xsum_local, reduce_buf);
-
-        for (int p = 0; p < bit_width; p++) {
-            const int B_idx = p * row_width * col_width + rc;
-            const float a_val = __half2float(a_ptr[B_idx]);
-            const float b_val = __half2float(b_ptr[B_idx]);
-            const float c_val = __half2float(c_ptr[B_idx]);
-            float t_sum = 0.0f;
-
-            for (int l = 0; l < K_MAX; l++) {
-                if (l >= n_inner) break;
-                const int byte_k = l >> 3;
-                const int shift = 7 - (l & 7);
-                float t_local = 0.0f;
-                for (int j = tid; j < z_col; j += blockDim.x) {
-                    const uint8_t zb = Z[(size_t)B_idx * z_col * k8 + j * k8 + byte_k];
-                    if ((zb >> shift) & 1) t_local += X[x_base + j];
-                }
-                const float t_l = block_reduce_sum(t_local, reduce_buf);
-                if (tid == 0) t_vals[l] = t_l;
-                t_sum += t_l;
-            }
-            __syncthreads();
-
-            if (has_i) {
-                const uint8_t* yp = Y + (size_t)B_idx * y_row * k8 + i * k8;
-                float part = 0.0f;
-                for (int l = 0; l < K_MAX; l++) {
-                    if (l >= n_inner) break;
-                    const int byte_k = l >> 3;
-                    const int shift = 7 - (l & 7);
-                    if ((yp[byte_k] >> shift) & 1) {
-                        part += a_val * t_vals[l] + b_val * xsum;
-                    }
-                }
-                acc += part + c_val * t_sum;
-            }
-            __syncthreads();
-        }
-
-        if (has_i) acc += __half2float(d_ptr[rc]) * xsum;
-    }
-
-    if (has_i) {
-        size_t idx = (size_t)n * row_width * y_row + r * y_row + i;
-        if (col_splits > 1)
-            atomicAdd(&out[idx], acc);
-        else
-            out[idx] = acc;
-    }
-}
-
+/* Warp-parallel explicit Z@x then Y@t fallback for float32 activations. */
 template <int N_WARPS>
 __global__ void bqq_decode_two_stage_warp_kernel(
     const uint8_t* __restrict__ Y,
@@ -1375,132 +1132,6 @@ __global__ void bqq_decode_two_stage_warp_kernel(
     }
 }
 
-template <int N_WARPS, int K8_MAX>
-__global__ void bqq_decode_grouped_scatter_kernel(
-    const uint8_t* __restrict__ Y,
-    const uint8_t* __restrict__ Z,
-    const float*   __restrict__ X,
-    const __half*  __restrict__ a_ptr,
-    const __half*  __restrict__ b_ptr,
-    const __half*  __restrict__ c_ptr,
-    const __half*  __restrict__ d_ptr,
-    float*         __restrict__ out,
-    int row_width, int col_width, int bit_width,
-    int y_row, int z_col, int k8,
-    int col_splits)
-{
-    constexpr int K_MAX = K8_MAX * 8;
-    extern __shared__ float smem[];
-    float* row_acc = smem;                         // [y_row]
-    float* warp_partials = row_acc + y_row;        // [N_WARPS, y_row]
-    float* warp_t_sums = warp_partials + N_WARPS * y_row; // [N_WARPS]
-
-    const int combined = blockIdx.x;
-    const int r = combined / col_splits;
-    const int cs = combined % col_splits;
-    const int n = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int warp_id = tid >> 5;
-    const int lane = tid & 31;
-
-    const int c_per_split = (col_width + col_splits - 1) / col_splits;
-    const int c_block_start = cs * c_per_split;
-    const int c_block_end = min(c_block_start + c_per_split, col_width);
-    const int n_inner = k8 * 8;
-
-    for (int i = tid; i < y_row; i += blockDim.x) {
-        row_acc[i] = 0.0f;
-    }
-    __syncthreads();
-
-    for (int ci = c_block_start; ci < c_block_end; ci++) {
-        const int rc = r * col_width + ci;
-        const int x_base = n * col_width * z_col + ci * z_col;
-
-        float xsum_local = 0.0f;
-        for (int j = lane; j < z_col; j += 32) {
-            xsum_local += X[x_base + j];
-        }
-        float xsum = warp_reduce_sum(xsum_local);
-        xsum = __shfl_sync(0xffffffff, xsum, 0);
-
-        for (int p = 0; p < bit_width; p++) {
-            const int B_idx = p * row_width * col_width + rc;
-            const float a_val = __half2float(a_ptr[B_idx]);
-            const float b_val = __half2float(b_ptr[B_idx]);
-            const float c_val = __half2float(c_ptr[B_idx]);
-
-            for (int i = tid; i < N_WARPS * y_row; i += blockDim.x) {
-                warp_partials[i] = 0.0f;
-            }
-            if (tid < N_WARPS) warp_t_sums[tid] = 0.0f;
-            __syncthreads();
-
-            for (int l_base = 0; l_base < K_MAX; l_base += N_WARPS) {
-                const int l = l_base + warp_id;
-                float t_local = 0.0f;
-                if (l < n_inner) {
-                    const int byte_k = l >> 3;
-                    const int shift = 7 - (l & 7);
-                    for (int j = lane; j < z_col; j += 32) {
-                        const uint8_t zb =
-                            Z[(size_t)B_idx * z_col * k8 + j * k8 + byte_k];
-                        if ((zb >> shift) & 1) t_local += X[x_base + j];
-                    }
-                }
-                float t_l = warp_reduce_sum(t_local);
-
-                if (lane == 0 && l < n_inner) {
-                    const int byte_k = l >> 3;
-                    const int shift = 7 - (l & 7);
-                    const float contrib = a_val * t_l + b_val * xsum;
-                    float* my_partials = warp_partials + warp_id * y_row;
-                    warp_t_sums[warp_id] += t_l;
-                    for (int i = 0; i < y_row; i++) {
-                        const uint8_t yb =
-                            Y[(size_t)B_idx * y_row * k8 + i * k8 + byte_k];
-                        if ((yb >> shift) & 1) my_partials[i] += contrib;
-                    }
-                }
-            }
-            __syncthreads();
-
-            float t_sum = 0.0f;
-            if (tid == 0) {
-                for (int w = 0; w < N_WARPS; w++) t_sum += warp_t_sums[w];
-                warp_t_sums[0] = t_sum;
-            }
-            __syncthreads();
-            t_sum = warp_t_sums[0];
-
-            for (int i = tid; i < y_row; i += blockDim.x) {
-                float row_val = c_val * t_sum;
-                #pragma unroll
-                for (int w = 0; w < N_WARPS; w++) {
-                    row_val += warp_partials[w * y_row + i];
-                }
-                row_acc[i] += row_val;
-            }
-            __syncthreads();
-        }
-
-        const float d_term = __half2float(d_ptr[rc]) * xsum;
-        for (int i = tid; i < y_row; i += blockDim.x) {
-            row_acc[i] += d_term;
-        }
-        __syncthreads();
-    }
-
-    for (int i = tid; i < y_row; i += blockDim.x) {
-        const size_t idx = (size_t)n * row_width * y_row + r * y_row + i;
-        if (col_splits > 1)
-            atomicAdd(&out[idx], row_acc[i]);
-        else
-            out[idx] = row_acc[i];
-    }
-}
-
-
 /* ═══════════════════════════════════════════════════════════════════
  * Fused W-reconstruction kernel
  * ═══════════════════════════════════════════════════════════════════
@@ -1566,43 +1197,6 @@ __global__ void reconstruct_W_kernel(
     W_out[out_idx * in_features + in_idx] = __float2half(val);
 }
 
-torch::Tensor reconstruct_W(
-    torch::Tensor Y_packed, torch::Tensor Z_packed,
-    torch::Tensor a, torch::Tensor b,
-    torch::Tensor c, torch::Tensor d,
-    int row_width, int col_width, int bit_width,
-    int y_row, int z_col, int k8)
-{
-    int out_f = row_width * y_row;
-    int in_f  = col_width * z_col;
-
-    auto W = torch::empty({out_f, in_f},
-        torch::dtype(torch::kFloat16).device(Y_packed.device()));
-
-    dim3 block(16, 16);
-    dim3 grid((out_f + 15) / 16, (in_f + 15) / 16);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    auto a_h = a.to(torch::kFloat16).contiguous();
-    auto b_h = b.to(torch::kFloat16).contiguous();
-    auto c_h = c.to(torch::kFloat16).contiguous();
-    auto d_h = d.to(torch::kFloat16).contiguous();
-
-    reconstruct_W_kernel<<<grid, block, 0, stream>>>(
-        Y_packed.data_ptr<uint8_t>(),
-        Z_packed.data_ptr<uint8_t>(),
-        reinterpret_cast<const __half*>(a_h.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(b_h.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(c_h.data_ptr<at::Half>()),
-        reinterpret_cast<const __half*>(d_h.data_ptr<at::Half>()),
-        reinterpret_cast<__half*>(W.data_ptr<at::Half>()),
-        row_width, col_width, bit_width,
-        y_row, z_col, k8);
-
-    return W;
-}
-
-
 /* ═══════════════════════════════════════════════════════════════════
  * Unified forward: one call from Python, zero tensor manipulation
  * ═══════════════════════════════════════════════════════════════════
@@ -1612,7 +1206,7 @@ torch::Tensor reconstruct_W(
  * returns the result in the same leading shape as X.
  *
  * seq_len <= 32 → fused warp-shuffle kernel (no W materialisation)
- * seq_len >  32 → reconstruct_W (popcount) + cuBLAS FP16 matmul
+ * seq_len >  32 → reconstruct_W_kernel (popcount) + cuBLAS FP16 matmul
  */
 
 static inline const __half* half_ptr(const torch::Tensor& t) {
@@ -1883,9 +1477,6 @@ torch::Tensor bqq_forward_core(
         const bool x_is_bf16 = X.scalar_type() == torch::kBFloat16;
         const bool x_is_16bit =
             X.scalar_type() == torch::kFloat16 || x_is_bf16;
-        const bool use_bitblas_fp16 =
-            decode_kernel && std::strcmp(decode_kernel, "bitblas_fp16") == 0 &&
-            x_is_16bit;
         const bool use_bitblas_byte4 =
             ((decode_kernel && std::strcmp(decode_kernel, "bitblas_byte4") == 0) ||
              (decode_kernel == nullptr && bit_width <= 2)) &&
@@ -1899,11 +1490,11 @@ torch::Tensor bqq_forward_core(
              (decode_kernel == nullptr && !use_bitblas_byte4 && !use_bitblas_byte2)) &&
             x_is_16bit && z_col > 32;
 
-        auto X_view = (use_bitblas_fp16 || use_bitblas_byte || use_bitblas_byte2 || use_bitblas_byte4)
+        auto X_view = (use_bitblas_byte || use_bitblas_byte2 || use_bitblas_byte4)
             ? torch::Tensor()
             : X_2d.reshape({(int)batch, col_width, z_col})
                   .to(torch::kFloat32).contiguous();
-        auto X_view_half = (use_bitblas_fp16 || use_bitblas_byte || use_bitblas_byte2 || use_bitblas_byte4)
+        auto X_view_half = (use_bitblas_byte || use_bitblas_byte2 || use_bitblas_byte4)
             ? X_2d.reshape({(int)batch, col_width, z_col}).contiguous()
             : torch::Tensor();
 
@@ -1928,10 +1519,6 @@ torch::Tensor bqq_forward_core(
             while (col_splits > 1 && col_width % col_splits != 0) col_splits--;
         }
 
-        const bool use_grouped_scatter =
-            decode_kernel && std::strcmp(decode_kernel, "grouped") == 0 &&
-            y_row <= 256 && k8 <= 16;
-
         /* Fused-output path: accumulate into the caller-cached, pre-zeroed
          * fp32 workspace, then one epilogue kernel emits fp16 and re-zeroes.
          * Replaces per-call zeros+fill and the fp32→fp16 aten cast. */
@@ -1945,7 +1532,7 @@ torch::Tensor bqq_forward_core(
         if (fuse_out) {
             out = ws;
         } else {
-            out = (col_splits > 1 || use_grouped_scatter)
+            out = (col_splits > 1)
                 ? torch::zeros({(int)batch, row_width, y_row},
                       torch::dtype(torch::kFloat32).device(X.device()))
                 : torch::empty({(int)batch, row_width, y_row},
@@ -1954,33 +1541,13 @@ torch::Tensor bqq_forward_core(
 
         dim3 grid(row_width * col_splits, batch);
         const bool use_auto_decode_kernel = decode_kernel == nullptr;
-        const bool use_two_stage = decode_kernel &&
-            std::strcmp(decode_kernel, "two_stage") == 0 &&
-            y_row <= 256;
         const bool use_two_stage_warp =
             ((decode_kernel && std::strcmp(decode_kernel, "two_stage_warp") == 0) ||
              (use_auto_decode_kernel && !use_bitblas_byte && !use_bitblas_byte2 &&
               !use_bitblas_byte4 && z_col >= 128)) &&
             y_row <= 256 && k8 <= 16;
 
-        if (use_grouped_scatter) {
-            constexpr int GW = 8;
-            dim3 block(GW * 32);
-            int smem = (y_row + GW * y_row + GW) * static_cast<int>(sizeof(float));
-            #define LAUNCH_GROUPED(K8M) \
-                bqq_decode_grouped_scatter_kernel<GW, K8M><<<grid, block, smem, stream>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    X_view.data_ptr<float>(), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
-
-            if      (k8 <= 4)  LAUNCH_GROUPED(4);
-            else if (k8 <= 8)  LAUNCH_GROUPED(8);
-            else               LAUNCH_GROUPED(16);
-            #undef LAUNCH_GROUPED
-        } else if (use_two_stage_warp) {
+        if (use_two_stage_warp) {
             constexpr int TW = 8;
             dim3 block(TW * 32);
             bqq_decode_two_stage_warp_kernel<TW><<<grid, block, 0, stream>>>( \
@@ -1990,21 +1557,6 @@ torch::Tensor bqq_forward_core(
                     half_ptr(c_flat), half_ptr(d_flat), \
                     out.data_ptr<float>(), \
                     row_width, col_width, bit_width, y_row, z_col, k8, col_splits);
-        } else if (use_two_stage) {
-            dim3 block(256);
-            #define LAUNCH_TWO_STAGE(K8M) \
-                bqq_decode_two_stage_kernel<K8M><<<grid, block, 0, stream>>>( \
-                    Y_flat.data_ptr<uint8_t>(), Z_flat.data_ptr<uint8_t>(), \
-                    X_view.data_ptr<float>(), \
-                    half_ptr(a_flat), half_ptr(b_flat), \
-                    half_ptr(c_flat), half_ptr(d_flat), \
-                    out.data_ptr<float>(), \
-                    row_width, col_width, bit_width, y_row, z_col, k8, col_splits)
-
-            if      (k8 <= 4)  LAUNCH_TWO_STAGE(4);
-            else if (k8 <= 8)  LAUNCH_TWO_STAGE(8);
-            else               LAUNCH_TWO_STAGE(16);
-            #undef LAUNCH_TWO_STAGE
         } else {
             dim3 block(NW * 32);
             int smem = NW * 32 * sizeof(float);
@@ -2040,7 +1592,6 @@ torch::Tensor bqq_forward_core(
                             row_width, col_width, bit_width, y_row, z_col, k8, col_splits); \
                 } while (0)
 
-            #define LAUNCH_HALF(NI, K8M)  LAUNCH_X16(bqq_forward_kernel, NI, K8M)
             #define LAUNCH_BYTE_HALF(NI, K8M)  LAUNCH_X16(bqq_forward_byte_kernel, NI, K8M)
             #define LAUNCH_BYTE2_HALF(NI, K8M) LAUNCH_X16(bqq_forward_byte2_kernel, NI, K8M)
             #define LAUNCH_BYTE4_HALF(NI, K8M) LAUNCH_X16(bqq_forward_byte4_kernel, NI, K8M)
@@ -2072,15 +1623,6 @@ torch::Tensor bqq_forward_core(
                     if      (k8 <= 8)  LAUNCH_BYTE_HALF(2, 8);
                     else               LAUNCH_BYTE_HALF(2, 16);
                 } else { LAUNCH_BYTE_HALF(4, 16); }
-            } else if (use_bitblas_fp16) {
-                if (ni == 1) {
-                    if      (k8 <= 4)  LAUNCH_HALF(1, 4);
-                    else if (k8 <= 8)  LAUNCH_HALF(1, 8);
-                    else               LAUNCH_HALF(1, 16);
-                } else if (ni <= 2) {
-                    if      (k8 <= 8)  LAUNCH_HALF(2, 8);
-                    else               LAUNCH_HALF(2, 16);
-                } else { LAUNCH_HALF(4, 16); }
             } else {
                 if (ni == 1) {
                     if      (k8 <= 4)  LAUNCH_FLOAT(1, 4);
@@ -2094,7 +1636,6 @@ torch::Tensor bqq_forward_core(
             #undef LAUNCH_BYTE4_HALF
             #undef LAUNCH_BYTE2_HALF
             #undef LAUNCH_BYTE_HALF
-            #undef LAUNCH_HALF
             #undef LAUNCH_X16
             #undef LAUNCH_FLOAT
         }
@@ -2184,63 +1725,6 @@ torch::Tensor bqq_forward(
 }
 
 
-/* ═══════════════════════════════════════════════════════════════════
- * L2 cache utilities (experimental)
- * ═══════════════════════════════════════════════════════════════════ */
-
-__global__ void prefetch_l2_kernel(const char* __restrict__ ptr, size_t nbytes) {
-    const size_t tid = threadIdx.x + (size_t)blockIdx.x * blockDim.x;
-    const size_t stride = (size_t)blockDim.x * gridDim.x;
-    for (size_t i = tid * 16; i < nbytes; i += stride * 16) {
-        if (i + 16 <= nbytes) {
-            float4 v = *reinterpret_cast<const float4*>(ptr + i);
-            asm volatile("" :: "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
-        }
-    }
-}
-
-void prefetch_tensors_to_l2(
-    torch::Tensor Y_packed, torch::Tensor Z_packed,
-    torch::Tensor a, torch::Tensor b,
-    torch::Tensor c, torch::Tensor d)
-{
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    auto launch = [stream](const void* ptr, size_t nbytes) {
-        if (nbytes == 0) return;
-        int threads = 256;
-        int blocks = min((int)((nbytes + threads * 16 - 1) / (threads * 16)), 256);
-        prefetch_l2_kernel<<<blocks, threads, 0, stream>>>(
-            static_cast<const char*>(ptr), nbytes);
-    };
-    launch(Y_packed.data_ptr(), Y_packed.nbytes());
-    launch(Z_packed.data_ptr(), Z_packed.nbytes());
-    launch(a.data_ptr(), a.nbytes());
-    launch(b.data_ptr(), b.nbytes());
-    launch(c.data_ptr(), c.nbytes());
-    launch(d.data_ptr(), d.nbytes());
-}
-
-void set_l2_persistence(torch::Tensor tensor, float hit_ratio) {
-    cudaStreamAttrValue attr = {};
-    attr.accessPolicyWindow.base_ptr  = tensor.data_ptr();
-    attr.accessPolicyWindow.num_bytes = tensor.nbytes();
-    attr.accessPolicyWindow.hitRatio  = hit_ratio;
-    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
-    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
-    cudaStreamSetAttribute(
-        at::cuda::getCurrentCUDAStream(),
-        cudaStreamAttributeAccessPolicyWindow, &attr);
-}
-
-void reset_l2_persistence() {
-    cudaStreamAttrValue attr = {};
-    attr.accessPolicyWindow.num_bytes = 0;
-    cudaStreamSetAttribute(
-        at::cuda::getCurrentCUDAStream(),
-        cudaStreamAttributeAccessPolicyWindow, &attr);
-}
-
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bqq_forward", &bqq_forward,
           "BQQ forward: one call, no Python tensor manipulation",
@@ -2255,11 +1739,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("d_flat"), py::arg("bias"), py::arg("ws"),
           py::arg("bit_width"), py::arg("row_width"), py::arg("col_width"),
           py::arg("y_row"), py::arg("z_col"));
-    m.def("prefetch_tensors_to_l2", &prefetch_tensors_to_l2,
-          "Prefetch weight tensors into L2 cache");
-    m.def("set_l2_persistence", &set_l2_persistence,
-          "Pin tensor in L2 cache (Ampere+)",
-          py::arg("tensor"), py::arg("hit_ratio") = 1.0f);
-    m.def("reset_l2_persistence", &reset_l2_persistence,
-          "Remove L2 persistence policy");
 }
