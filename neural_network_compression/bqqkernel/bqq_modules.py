@@ -4,6 +4,8 @@ BQQ (Binary Quadratic Quantization) module definitions.
 Shared between LM and CV workflows.
 """
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -504,14 +506,71 @@ class PackedBinaryQuadratic(nn.Module):
         cache = self.__dict__.get("_flat_cache")
         if cache is not None and self.__dict__.get("_flat_cache_static", False):
             return cache
-        key = (self.Y_packed.data_ptr(), self.a.data_ptr())
+        decode_kernel = os.environ.get("BQQ_CUDA_DECODE_KERNEL")
+        supports_bitplane_kernel = (
+            self.Y_packed.is_cuda
+            and torch.cuda.get_device_capability(self.Y_packed.device)[0] < 12
+        )
+        bitplane_layout = (
+            decode_kernel == "bitplane_packed"
+            and 2 <= self.bit_width <= 3
+            and self.y_row <= 128
+            and supports_bitplane_kernel
+        )
+        # The nibble-LUT kernel sums Z along j, so it needs Z rank-major with the
+        # j bits packed together: [B, n_inner, z_col/8] instead of the usual
+        # [B, z_col, k8].  Rebuild it here (cached) the same way bitplane_layout
+        # swaps in its own layout.
+        # These conditions must match the C++ use_lut / use_lut8 gates exactly: if
+        # we hand the kernel a rank-major Z but the dispatch falls through to a
+        # kernel expecting the j-major layout, the result is silently wrong.
+        # "lut" is the default kernel, so decode_kernel=None selects it too.
+        lut_layout = (
+            self._k8 <= 4
+            and self.z_col <= 128
+            and (
+                (decode_kernel in (None, "lut") and self.z_col % 32 == 0)
+                or (decode_kernel == "lut8" and self.z_col % 8 == 0)
+            )
+        )
+        key = (self.Y_packed.data_ptr(), self.a.data_ptr(), bitplane_layout, lut_layout)
         if cache is not None and cache["key"] == key:
             return cache
         B = self.bit_width * self.row_width * self.col_width
+        z_rank_major = False
+        if bitplane_layout:
+            # Interleave quantization planes so one vector transaction can
+            # feed the fused 2/3-plane decode kernel.
+            Y_flat = self.Y_packed.permute(1, 2, 3, 4, 0).contiguous()
+            Z_flat = self.Z_packed.permute(1, 2, 3, 4, 0).contiguous()
+        elif lut_layout:
+            # The LUT kernels sum Z along j, so they need Z rank-major with the j
+            # bits packed together: [B, n_inner, z_col/8].  This REPLACES the
+            # j-major layout rather than sitting next to it -- keeping both would
+            # cost an extra copy of Z (~+50% of the quantized weights).  Prefill
+            # reads the same buffer: bqq_stage1_ztx_kernel takes z_rank_major and
+            # indexes accordingly, and the kernels that can only read j-major are
+            # gated off when the flag is set.
+            n_inner = self._k8 * 8
+            Y_flat = self.Y_packed.reshape(B, self.y_row, self._k8).contiguous()
+            Z_bool = self._unpack_to_bool(self.Z_packed.cpu(), self.inter_dimension)
+            Zt_bool = Z_bool.transpose(-2, -1).contiguous()  # [.., inter_dim, z_col]
+            if Zt_bool.shape[-2] < n_inner:
+                pad = torch.zeros(
+                    *Zt_bool.shape[:-2], n_inner - Zt_bool.shape[-2], self.z_col,
+                    dtype=torch.bool)
+                Zt_bool = torch.cat([Zt_bool, pad], dim=-2)
+            Z_flat = self._np_packbits(Zt_bool, self.z_col).reshape(
+                B, n_inner, self.z_col // 8).contiguous().to(self.Z_packed.device)
+            z_rank_major = True
+        else:
+            Y_flat = self.Y_packed.reshape(B, self.y_row, self._k8).contiguous()
+            Z_flat = self.Z_packed.reshape(B, self.z_col, self._k8).contiguous()
         cache = {
             "key": key,
-            "Y_flat": self.Y_packed.reshape(B, self.y_row, self._k8).contiguous(),
-            "Z_flat": self.Z_packed.reshape(B, self.z_col, self._k8).contiguous(),
+            "Y_flat": Y_flat,
+            "Z_flat": Z_flat,
+            "z_rank_major": z_rank_major,
             "a_flat": self.a.detach().reshape(B).half().contiguous(),
             "b_flat": self.b.detach().reshape(B).half().contiguous(),
             "c_flat": self.c.detach().reshape(B).half().contiguous(),
@@ -530,6 +589,7 @@ class PackedBinaryQuadratic(nn.Module):
         self.__dict__.pop("_flat_cache", None)
 
     _forward_flat = None  # cached ext.bqq_forward_flat (avoids per-call lookup)
+    _forward_flat_out = None
 
     def _needs_grad(self, X: torch.Tensor) -> bool:
         return torch.is_grad_enabled() and (
@@ -571,7 +631,31 @@ class PackedBinaryQuadratic(nn.Module):
             cache["a_flat"], cache["b_flat"], cache["c_flat"], cache["d_flat"],
             b, cache["ws"],
             self.bit_width, self.row_width, self.col_width,
-            self.y_row, self.z_col)
+            self.y_row, self.z_col, cache["z_rank_major"])
+
+    def forward_into(self, X, output: torch.Tensor, output_offset: int) -> None:
+        """Decode directly into a slice of a caller-owned fused output."""
+        if self._needs_grad(X):
+            raise RuntimeError("forward_into is inference-only")
+        fwd = PackedBinaryQuadratic._forward_flat_out
+        if fwd is None:
+            from .bqq_cuda_ext import _get_forward_flat_out_op
+            fwd = PackedBinaryQuadratic._forward_flat_out = _get_forward_flat_out_op()
+        if self.bias is not None:
+            b = self.bias
+        else:
+            if PackedBinaryQuadratic._empty_bias is None or \
+               PackedBinaryQuadratic._empty_bias.device != self.Y_packed.device:
+                PackedBinaryQuadratic._empty_bias = torch.empty(
+                    0, device=self.Y_packed.device)
+            b = PackedBinaryQuadratic._empty_bias
+        cache = self._get_flat_cache()
+        fwd(
+            cache["Y_flat"], cache["Z_flat"], X,
+            cache["a_flat"], cache["b_flat"], cache["c_flat"], cache["d_flat"],
+            b, cache["ws"], output, output_offset,
+            self.bit_width, self.row_width, self.col_width,
+            self.y_row, self.z_col, cache["z_rank_major"])
 
     def get_weight(self, dtype=torch.float32):
         W_core = self._compute_W_core(dtype)
