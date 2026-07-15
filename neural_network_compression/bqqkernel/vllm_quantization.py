@@ -131,7 +131,12 @@ class BQQConfig(_require_vllm()[2]):  # type: ignore[misc]
             return UnquantizedLinearMethod()
         meta = self.layers.get(prefix)
         if meta is None:
-            return None
+            # A Linear the export did not quantize -- e.g. the vision tower of a
+            # Qwen3.5-VL checkpoint, where only the text decoder carries BQQ
+            # weights.  Returning None here trips vLLM's
+            # `assert self.quant_method is not None`, so hand back the plain
+            # method and let the layer run unquantized.
+            return UnquantizedLinearMethod()
         return BQQLinearMethod(meta)
 
 
@@ -250,7 +255,11 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
             )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        from neural_network_compression.bqqkernel.bqq_cuda_ext import _get_ext, _get_forward_flat_op
+        from neural_network_compression.bqqkernel.bqq_cuda_ext import (
+            _get_ext,
+            _get_forward_flat_op,
+            _get_forward_flat_out_op,
+        )
         from neural_network_compression.bqqkernel.bqq_modules import PackedBinaryQuadratic
 
         ext = _get_ext()
@@ -259,8 +268,10 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
         # run torch.library schema inference inside the captured graph.
         if os.environ.get("BQQ_VLLM_RAW_CUDA_OP") == "1":
             PackedBinaryQuadratic._forward_flat = ext.bqq_forward_flat
+            PackedBinaryQuadratic._forward_flat_out = ext.bqq_forward_flat_out
         else:
             PackedBinaryQuadratic._forward_flat = _get_forward_flat_op()
+            PackedBinaryQuadratic._forward_flat_out = _get_forward_flat_out_op()
         if self.meta.get("fused"):
             runtimes = [
                 self._build_runtime(layer, part_meta, prefix=f"p{part_idx}_")
@@ -289,7 +300,18 @@ class BQQLinearMethod(_require_vllm()[1]):  # type: ignore[misc]
             if runtimes is None:
                 self.process_weights_after_loading(layer)
                 runtimes = layer.bqq_runtimes
-            out = torch.cat([runtime(x) for runtime in runtimes], dim=-1)
+            use_direct_output = (
+                os.environ.get("BQQ_VLLM_DIRECT_FUSED_OUTPUT", "1") != "0"
+                and x.numel() == x.size(-1)
+            )
+            if use_direct_output:
+                out = x.new_empty((*x.shape[:-1], int(self.meta["output_size"])))
+                output_offset = 0
+                for part_runtime in runtimes:
+                    part_runtime.forward_into(x, out, output_offset)
+                    output_offset += part_runtime.row_width * part_runtime.y_row
+            else:
+                out = torch.cat([part_runtime(x) for part_runtime in runtimes], dim=-1)
         else:
             if runtime is None:
                 self.process_weights_after_loading(layer)
