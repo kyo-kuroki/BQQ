@@ -256,6 +256,30 @@ def _copy_or_save_hf_files(model_name: str, output_dir: Path, hf_source_dir: Pat
     tokenizer.save_pretrained(output_dir)
 
 
+def _flatten_text_only_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Collapse a Qwen3.5-VL config to its text decoder.
+
+    The BQQ export only quantizes (and ships) the text decoder, but the stock
+    Qwen3.5 checkpoints are VL (`Qwen3_5ForConditionalGeneration`, with a nested
+    ``text_config`` and a ``vision_config``).  vLLM would otherwise try to build
+    the vision tower and expect ``model.language_model.*`` weight names.  Lift
+    ``text_config`` to the top level and declare the text-only class, matching
+    the hand-made 4B export.  No-op for an already text-only config.
+    """
+    text_config = config.get("text_config")
+    if not isinstance(text_config, dict):
+        return config
+    flat = dict(text_config)
+    flat["architectures"] = ["Qwen3_5ForCausalLM"]
+    flat["model_type"] = "qwen3_5_text"
+    # carry over the handful of top-level fields the text model still needs
+    for key in ("quantization_config", "tie_word_embeddings",
+                "transformers_version", "dtype", "torch_dtype"):
+        if key in config:
+            flat[key] = config[key]
+    return flat
+
+
 def _inject_bqq_quantization_config(
     output_dir: Path,
     layers: dict[str, dict[str, Any]],
@@ -264,6 +288,7 @@ def _inject_bqq_quantization_config(
     config_path = output_dir / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+    config = _flatten_text_only_config(config)
     config["quantization_config"] = {
         "quant_method": "bqq",
         "format": "packed_binary_quadratic",
