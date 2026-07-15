@@ -19,15 +19,37 @@ already-working packages.
 
 | Package | Used by | Notes |
 | --- | --- | --- |
-| **flash-linear-attention** (`fla`) | **Qwen3.5 / Qwen3-Next inference** — `transformers/models/qwen3_next` imports `fla.modules.FusedRMSNormGated` and `fla.ops.gated_delta_rule` for the `linear_attn` blocks | **Must come from GitHub.** The PyPI wheel (0.5.1) is broken: it ships only `fla/layers` and `fla/models`, with no `fla/__init__.py` and no `fla/modules`, so `import fla.modules` fails |
-| **causal-conv1d** | Same Qwen3-Next `linear_attn` path (`causal_conv1d_fn` / `causal_conv1d_update`), detected via `is_causal_conv1d_available()` | Without it the gated delta-net layers cannot run |
 | **fast-hadamard-transform** | The RHT (incoherence) transform in `bqqkernel/hadamard.py::matmul_hadU_cuda`, used by `IncoherentBinaryQuadratic` / `PackedIncoherentBinaryQuadratic` | If missing, the code silently falls back to a pure-torch Hadamard that is far slower **and not CUDA-graph capturable** for non-power-of-two dims |
 | **quiptools** (optional) | Only needed to benchmark **QuIP#'s E8P kernel** against BQQ | Built from the local `quip-sharp` checkout with `-std=c++20` rewritten to `-std=c++17` |
+
+## fla / causal_conv1d are repo shims — do NOT pip install them
+
+`transformers/models/qwen3_next` (and qwen3_5) import `fla.modules.FusedRMSNormGated`,
+`fla.ops.gated_delta_rule`, and `causal_conv1d_fn` for the `linear_attn` blocks.
+The repo ships pure-torch stand-ins at
+
+    neural_network_compression/fla/
+    neural_network_compression/causal_conv1d/
+    neural_network_compression/sitecustomize.py   # torchcodec stub for vLLM introspection
+
+which resolve whenever `neural_network_compression` is on `PYTHONPATH` (the run
+scripts already put it there).  **Keep them as the single copy** — a
+site-packages `flash-linear-attention` / `causal-conv1d` is redundant:
+
+- vLLM uses its **own vendored** `vllm.model_executor.layers.fla`, not this package;
+- the shim matches the real kernels to fp16 rounding (same next-token argmax) and
+  is only ~11% slower, on the transformers-direct decode path alone;
+- a pip copy just shadows the shim depending on path order and drifts out of sync
+  with transformers (the PyPI wheel is also broken — it omits `fla/modules`).
+
+If you truly need the Triton speed for direct inference, build them from source
+(`git clone … && pip install . --no-build-isolation`) and place site-packages
+ahead of `neural_network_compression` on `PYTHONPATH`.
 
 ## Usage
 
 ```bash
-bash tools/env/setup_env.sh            # fla + causal-conv1d + fast-hadamard-transform
+bash tools/env/setup_env.sh            # fast-hadamard-transform (fla/causal_conv1d are repo shims)
 bash tools/env/setup_env.sh --quip     # also build quiptools for the QuIP# comparison
 bash tools/env/setup_env.sh --check    # just verify what is importable
 ```
