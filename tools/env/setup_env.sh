@@ -27,10 +27,10 @@ done
 check() {
   BQQ_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" "${PY}" - <<'EOF'
 import importlib, os, sys
-# The fla/causal_conv1d shims only resolve with neural_network_compression on
+# The fla/causal_conv1d shims only resolve with tools/shims on
 # the path -- mirror how the run scripts invoke python.
 repo = os.environ["BQQ_REPO"]
-sys.path.insert(0, os.path.join(repo, "neural_network_compression"))
+sys.path.insert(0, os.path.join(repo, "tools", "shims"))
 sys.path.insert(0, repo)
 
 pip_built = [
@@ -45,7 +45,7 @@ shims = [
 for name, what in pip_built + shims:
     try:
         m = importlib.import_module(name)
-        where = "repo shim" if "neural_network_compression" in getattr(m, "__file__", "") else "installed"
+        where = "repo shim" if "tools/shims" in getattr(m, "__file__", "") else "installed"
         print(f"  OK   {name:26s} {what}  [{where}]")
     except Exception as e:
         print(f"  MISS {name:26s} {what}  [{type(e).__name__}]")

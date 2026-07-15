@@ -26,15 +26,19 @@ already-working packages.
 
 `transformers/models/qwen3_next` (and qwen3_5) import `fla.modules.FusedRMSNormGated`,
 `fla.ops.gated_delta_rule`, and `causal_conv1d_fn` for the `linear_attn` blocks.
-The repo ships pure-torch stand-ins at
+The repo ships pure-torch stand-ins, grouped in one directory:
 
-    neural_network_compression/fla/
-    neural_network_compression/causal_conv1d/
-    neural_network_compression/sitecustomize.py   # torchcodec stub for vLLM introspection
+    tools/shims/fla/
+    tools/shims/causal_conv1d/
+    tools/shims/sitecustomize.py   # torchcodec stub for vLLM introspection
 
-which resolve whenever `neural_network_compression` is on `PYTHONPATH` (the run
-scripts already put it there).  **Keep them as the single copy** — a
-site-packages `flash-linear-attention` / `causal-conv1d` is redundant:
+**Put `tools/shims` on `PYTHONPATH`** so `import fla` / `import causal_conv1d`
+resolve to them and `sitecustomize.py` auto-runs, e.g.
+
+    PYTHONPATH=/path/to/BQQ:/path/to/BQQ/tools/shims python ...
+
+**Keep them as the single copy** — a site-packages `flash-linear-attention` /
+`causal-conv1d` is redundant:
 
 - vLLM uses its **own vendored** `vllm.model_executor.layers.fla`, not this package;
 - the shim matches the real kernels to fp16 rounding (same next-token argmax) and
@@ -44,7 +48,7 @@ site-packages `flash-linear-attention` / `causal-conv1d` is redundant:
 
 If you truly need the Triton speed for direct inference, build them from source
 (`git clone … && pip install . --no-build-isolation`) and place site-packages
-ahead of `neural_network_compression` on `PYTHONPATH`.
+ahead of `tools/shims` on `PYTHONPATH`.
 
 ## Usage
 
