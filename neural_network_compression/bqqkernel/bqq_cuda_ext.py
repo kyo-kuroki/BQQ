@@ -17,6 +17,7 @@ from torch.utils.cpp_extension import load
 _dir = os.path.dirname(os.path.abspath(__file__))
 _ext = None
 _forward_flat_op = None
+_forward_flat_out_op = None
 
 
 def _use_blackwell_fallback():
@@ -119,3 +120,59 @@ def bqq_forward_flat(
     return _get_forward_flat_op()(
         Y_flat, Z_flat, X, a_flat, b_flat, c_flat, d_flat, bias, ws,
         bit_width, row_width, col_width, y_row, z_col)
+
+
+def _get_forward_flat_out_op():
+    """Return a traceable op that writes into a shared fused output tensor."""
+    global _forward_flat_out_op
+    if _forward_flat_out_op is not None:
+        return _forward_flat_out_op
+
+    @torch.library.custom_op(
+        "bqq::forward_flat_out", mutates_args=("ws", "output"))
+    def _op(
+        Y_flat: torch.Tensor,
+        Z_flat: torch.Tensor,
+        X: torch.Tensor,
+        a_flat: torch.Tensor,
+        b_flat: torch.Tensor,
+        c_flat: torch.Tensor,
+        d_flat: torch.Tensor,
+        bias: torch.Tensor,
+        ws: torch.Tensor,
+        output: torch.Tensor,
+        output_offset: int,
+        bit_width: int,
+        row_width: int,
+        col_width: int,
+        y_row: int,
+        z_col: int,
+    ) -> None:
+        _get_ext().bqq_forward_flat_out(
+            Y_flat, Z_flat, X, a_flat, b_flat, c_flat, d_flat, bias, ws,
+            output, output_offset,
+            bit_width, row_width, col_width, y_row, z_col)
+
+    @_op.register_fake
+    def _op_fake(
+        Y_flat: torch.Tensor,
+        Z_flat: torch.Tensor,
+        X: torch.Tensor,
+        a_flat: torch.Tensor,
+        b_flat: torch.Tensor,
+        c_flat: torch.Tensor,
+        d_flat: torch.Tensor,
+        bias: torch.Tensor,
+        ws: torch.Tensor,
+        output: torch.Tensor,
+        output_offset: int,
+        bit_width: int,
+        row_width: int,
+        col_width: int,
+        y_row: int,
+        z_col: int,
+    ) -> None:
+        return None
+
+    _forward_flat_out_op = _op
+    return _forward_flat_out_op

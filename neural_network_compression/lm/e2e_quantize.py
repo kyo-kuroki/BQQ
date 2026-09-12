@@ -75,10 +75,38 @@ except ImportError:
 
 try:
     from .src.model_loader import resolve_decoder_layers
+    from .src.progressive_bits import build_bit_plan, format_bit_plan_table
 except ImportError:
     from neural_network_compression.lm.src.model_loader import resolve_decoder_layers
+    from neural_network_compression.lm.src.progressive_bits import build_bit_plan, format_bit_plan_table
 
 LM_DIR = Path(__file__).resolve().parent
+
+
+# ---------------------------------------------------------------------------
+# Progressive per-block bit-width allocation
+# ---------------------------------------------------------------------------
+# In the e2e flow blocks are quantized front-to-back with KL fine-tuning of the
+# remaining full-precision blocks between units, so an early block's error is
+# absorbed downstream. We therefore give earlier blocks fewer bits and later
+# blocks more, holding the model's total memory (params x bits) fixed. The
+# continuous target is realised via rank_scale (= eff_bits / bit_width). Every
+# Linear in a block inherits that block's rank_scale regardless of --quant_unit.
+
+
+def compute_block_bit_plan(model, *, bit_width, base_rank_scale, strength,
+                           min_bits, max_bits):
+    """Per-block effective-bit / rank_scale schedule from a loaded model."""
+    n_blocks = get_decoder_num_layers(model)
+    counts = []
+    for b in range(n_blocks):
+        block = get_decoder_layer(model, b)
+        counts.append(sum(m.weight.numel() for _, m in block.named_modules()
+                          if isinstance(m, nn.Linear)))
+    return build_bit_plan(
+        list(range(n_blocks)), counts, bit_width=bit_width,
+        base_rank_scale=base_rank_scale, strength=strength,
+        min_bits=min_bits, max_bits=max_bits)
 
 
 # ---------------------------------------------------------------------------
@@ -285,14 +313,16 @@ def _e2e_quantize_worker(rank: int, gpu_tasks: list, common: dict):
 
         weight = task['weight']
         H = task.get('H')
-        print(f"[GPU{gpu_id}/W{rank}] [{task['display_idx']}/{task['n_total']}] {label} {tuple(weight.shape)}")
+        _rs = task.get('rank_scale', common['rank_scale'])
+        _rs_note = '' if _rs == common['rank_scale'] else f" rank_scale={_rs:.4f}"
+        print(f"[GPU{gpu_id}/W{rank}] [{task['display_idx']}/{task['n_total']}] {label} {tuple(weight.shape)}{_rs_note}")
 
         A, Y, Z, SU, SV, tdesc = quantize_weight_to_bqq(
             weight,
             bit_width=common['bit_width'],
             group_size=common['group_size'],
             num_steps=common['num_steps'],
-            rank_scale=common['rank_scale'],
+            rank_scale=task.get('rank_scale', common['rank_scale']),
             seed=common['seed'],
             device_id=gpu_id,
             H=H,
@@ -336,6 +366,13 @@ def quantize_unit(student, block_idx: int, linear_names: List[str],
     prefix = get_decoder_block_prefix(student, block_idx)
     unit_dir.mkdir(parents=True, exist_ok=True)
 
+    # Progressive per-block bit-width: every Linear in this block uses the
+    # block's allocated rank_scale (falls back to the scalar rank_scale).
+    block_rank_scales = common.get('block_rank_scales')
+    unit_rank_scale = common['rank_scale']
+    if block_rank_scales is not None:
+        unit_rank_scale = block_rank_scales.get(block_idx, common['rank_scale'])
+
     tasks = []
     for i, name in enumerate(linear_names):
         lin = _get_submodule(block, name)
@@ -353,6 +390,7 @@ def quantize_unit(student, block_idx: int, linear_names: List[str],
             'out_path': str(unit_dir / f"{prefix}.{name}.pth"),
             'weight': lin.weight.detach().cpu().float(),
             'H': H,
+            'rank_scale': unit_rank_scale,
         })
 
     todo = [t for t in tasks if not Path(t['out_path']).exists()]
@@ -516,6 +554,26 @@ def _atomic_torch_save(obj, path: Path, **kwargs):
 
 
 def e2e_quantize(args):
+    # --print_bit_plan reports the per-block schedule; build on meta (no weights).
+    if getattr(args, 'print_bit_plan', False):
+        if not getattr(args, 'progressive_bits', False):
+            raise SystemExit('--print_bit_plan requires --progressive_bits')
+        try:
+            from transformers import AutoConfig, AutoModelForCausalLM
+            cfg = AutoConfig.from_pretrained(args.model_name)
+            with torch.device('meta'):
+                meta_model = AutoModelForCausalLM.from_config(cfg)
+        except Exception:
+            meta_model = load_causal_lm(args.model_name)
+        plan = compute_block_bit_plan(
+            meta_model, bit_width=args.bit_width, base_rank_scale=args.rank_scale,
+            strength=args.progressive_strength, min_bits=args.progressive_min_bits,
+            max_bits=args.progressive_max_bits)
+        print(format_bit_plan_table(
+            plan, title='Progressive per-block bit plan', key_header='block', key_width=6))
+        del meta_model
+        return
+
     if torch.cuda.is_available():
         if args.gpu_ids:
             gpu_ids = [int(g) for g in str(args.gpu_ids).split(',') if g != '']
@@ -528,9 +586,13 @@ def e2e_quantize(args):
     student_device = torch.device(f'cuda:{gpu_ids[0]}') if gpu_ids else torch.device('cpu')
     teacher_device = torch.device(f'cuda:{gpu_ids[-1]}') if gpu_ids else torch.device('cpu')
 
+    prog_suffix = ''
+    if getattr(args, 'progressive_bits', False):
+        prog_suffix = (f"-prog_s{args.progressive_strength:g}"
+                       f"_{args.progressive_min_bits:g}-{args.progressive_max_bits:g}")
     work_dir = Path(args.work_dir) if args.work_dir else (
         LM_DIR / 'e2e_output' / model_basename(args.model_name)
-        / f"{args.bit_width}bit-{args.group_size}gs-{args.quant_unit}"
+        / f"{args.bit_width}bit-{args.group_size}gs-{args.quant_unit}{prog_suffix}"
     )
     work_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = work_dir / 'student_checkpoint.pth'
@@ -538,7 +600,11 @@ def e2e_quantize(args):
     log_path = work_dir / 'e2e_log.csv'
 
     config_key = dict(model_name=args.model_name, quant_unit=args.quant_unit,
-                      bit_width=args.bit_width, group_size=args.group_size)
+                      bit_width=args.bit_width, group_size=args.group_size,
+                      progressive_bits=bool(getattr(args, 'progressive_bits', False)),
+                      progressive_strength=float(getattr(args, 'progressive_strength', 0.0)),
+                      progressive_min_bits=float(getattr(args, 'progressive_min_bits', 0.0)),
+                      progressive_max_bits=float(getattr(args, 'progressive_max_bits', 0.0)))
 
     # Resume or fresh start
     start_unit = 0
@@ -559,6 +625,17 @@ def e2e_quantize(args):
     teacher.config.use_cache = False
     for p in teacher.parameters():
         p.requires_grad_(False)
+
+    # Progressive per-block bit-width: map block_idx -> rank_scale (None => uniform).
+    block_rank_scales = None
+    if getattr(args, 'progressive_bits', False):
+        bit_plan = compute_block_bit_plan(
+            teacher, bit_width=args.bit_width, base_rank_scale=args.rank_scale,
+            strength=args.progressive_strength, min_bits=args.progressive_min_bits,
+            max_bits=args.progressive_max_bits)
+        print(format_bit_plan_table(
+            bit_plan, title='Progressive per-block bit plan', key_header='block', key_width=6))
+        block_rank_scales = {b: bit_plan['items'][b]['rank_scale'] for b in bit_plan['order']}
 
     if student is None:
         print(f"Loading student model: {args.model_name}")
@@ -608,6 +685,7 @@ def e2e_quantize(args):
         group_size=args.group_size,
         num_steps=args.num_steps,
         rank_scale=args.rank_scale,
+        block_rank_scales=block_rank_scales,
         seed=args.seed,
         scale_refine=not args.no_scale_refine,
         damping=args.damping,
@@ -724,6 +802,22 @@ def main():
     parser.add_argument('--rank_scale', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--damping', type=float, default=1e-6)
+
+    # Progressive per-block bit-width allocation (earlier blocks fewer bits,
+    # later blocks more; total memory held equal to a uniform run).
+    parser.add_argument('--progressive_bits', action='store_true', default=False,
+                        help='Allocate per-block effective bit-width by depth. Total memory '
+                             '(params x bits) is held equal to a uniform run; the continuous '
+                             'target is realised by scaling rank_scale per block.')
+    parser.add_argument('--progressive_strength', type=float, default=2.0,
+                        help='[progressive] Spread in bits: eff_b = base + strength*(fbar - f_b), '
+                             'f_b = downstream-param fraction. 0 = uniform; larger = steeper.')
+    parser.add_argument('--progressive_min_bits', type=float, default=1.0,
+                        help='[progressive] Lower clamp on per-block effective bits/param.')
+    parser.add_argument('--progressive_max_bits', type=float, default=8.0,
+                        help='[progressive] Upper clamp on per-block effective bits/param.')
+    parser.add_argument('--print_bit_plan', action='store_true', default=False,
+                        help='[progressive] Print the per-block bit plan and exit.')
     parser.add_argument('--no_scale_refine', action='store_true',
                         help='Disable Hessian-aware scale refinement')
     parser.add_argument('--use_multibqq', dest='use_multibqq', action='store_true', default=True)

@@ -41,12 +41,14 @@ try:
     from .src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from .src.datautils import get_loaders
     from .src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
+    from .src.progressive_bits import build_bit_plan, format_bit_plan_table
     from .layerwise_quant import layerwise_quantize_block
 except ImportError:
     from neural_network_compression.lm.src.build_bqq_model import BinaryQuadratic, DCTBinaryQuadratic, IncoherentBinaryQuadratic, PartialBQQLinear, TrainableSTEBinaryQuadratic, assemble_from_blocks, convert_ste_model_to_binaryquadratic
     from neural_network_compression.lm.src.compressed_data import build_consolidated_index, default_block_io_cache_dir, default_compressed_data_dir, get_bqq_matrices, load_layer_patches
     from neural_network_compression.lm.src.datautils import get_loaders
     from neural_network_compression.lm.src.model_loader import load_causal_lm, get_decoder_layer, get_decoder_block_prefix, get_decoder_num_layers
+    from neural_network_compression.lm.src.progressive_bits import build_bit_plan, format_bit_plan_table
     from neural_network_compression.lm.layerwise_quant import layerwise_quantize_block
 
 
@@ -561,6 +563,7 @@ def ensure_layerwise_block_available(
     row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    layer_rank_scales=None,
 ):
     """Generate missing layerwise quantization results for a block on demand."""
     layerwise_dir = Path(layerwise_dir)
@@ -574,6 +577,13 @@ def ensure_layerwise_block_available(
     if not missing:
         return
 
+    # layerwise keys targets by full module name; translate the per-layer map.
+    module_rank_scales = None
+    if layer_rank_scales is not None:
+        module_rank_scales = {
+            f"{block_prefix}.{name}": rs for name, rs in layer_rank_scales.items()
+        }
+
     print(f'Missing {len(missing)} layerwise target(s) for block {block_idx}; running internal layerwise quantization ...')
     layerwise_quantize_block(
         model_name=model_name,
@@ -583,6 +593,7 @@ def ensure_layerwise_block_available(
         group_size=group_size,
         num_steps=num_steps,
         rank_scale=rank_scale,
+        layer_rank_scales=module_rank_scales,
         seed=seed,
         scale_refine=scale_refine,
         damping=damping,
@@ -1135,10 +1146,15 @@ def quantize_block(
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    layer_rank_scales=None,
 ):
     """
     Load a block from precomputed layerwise BQQ patches, then optimize the
     whole block output error with STE-trainable BQQ layers.
+
+    ``layer_rank_scales`` optionally maps each Linear name -> rank_scale for
+    progressive per-layer bit-width (see src/progressive_bits.py); None => the
+    scalar ``rank_scale`` is used for every layer.
     """
     dev = torch.device(device)
 
@@ -1198,6 +1214,9 @@ def quantize_block(
         refine_coeffs_only=refine_coeffs_only,
         fix_theta=fix_theta,
         fix_beta=fix_beta,
+        use_multibqq=use_multibqq,
+        compensation_mode=compensation_mode,
+        layer_rank_scales=layer_rank_scales,
     )
     torch.cuda.empty_cache()
 
@@ -1318,6 +1337,7 @@ def quantize_block_progressive(
     ste_refine_row_group_batch_size=None,
     use_multibqq=True,
     compensation_mode='ldlq',
+    layer_rank_scales=None,
 ):
     """
     Quantize all Linear weights in a block via progressive patch-wise BQQ.
@@ -1442,12 +1462,13 @@ def quantize_block_progressive(
             layer = _get_submodule(block, lname)
             print(f'  [{lname}] BQQ quantize full layer '
                   f'{tuple(layer.float_weight.shape)} → activating {len(ij_list)} patches')
+            layer_rs = _resolve_layer_rank_scale(layer_rank_scales, rank_scale, lname)
             A_all, Y_all, Z_all, _SU, _SV, _td = quantize_weight_to_bqq(
                 layer.float_weight.data.clone(),
                 bit_width=bit_width,
                 group_size=group_size,
                 num_steps=num_steps,
-                rank_scale=rank_scale,
+                rank_scale=layer_rs,
                 seed=seed,
                 device_id=device_id,
                 use_multibqq=use_multibqq,
@@ -1547,6 +1568,7 @@ def quantize_block_progressive_closed_form(
     ldlq_act_order=False,
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
+    layer_rank_scales=None,
 ):
     """Front-to-back layer quantization with closed-form continuous recentering.
 
@@ -1647,12 +1669,13 @@ def quantize_block_progressive_closed_form(
             quant_weight = current_linear.weight.data.detach().float().clone()
             bias = current_linear.bias.data.clone().float() if current_linear.bias is not None else None
 
+        layer_rs = _resolve_layer_rank_scale(layer_rank_scales, rank_scale, lname)
         A, Y, Z, SU, SV, transform_desc = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width,
             group_size=group_size,
             num_steps=num_steps,
-            rank_scale=rank_scale,
+            rank_scale=layer_rs,
             seed=seed,
             device_id=device_id,
             H=H_current,
@@ -1790,6 +1813,7 @@ def quantize_block_attn_mlp_split(
     ldlq_act_order_score='maxdiag',
     rank_alloc_mode='none',
     tune_after_quantize=True,
+    layer_rank_scales=None,
 ):
     """Attention-then-MLP blockwise quantization.
 
@@ -1845,10 +1869,11 @@ def quantize_block_attn_mlp_split(
         cur_linear = _get_submodule(current_block, lname)
         quant_weight = cur_linear.weight.data.detach().float().clone()
         bias = cur_linear.bias.data.clone().float() if cur_linear.bias is not None else None
+        layer_rs = _resolve_layer_rank_scale(layer_rank_scales, rank_scale, lname)
         A, Y, Z, SU, SV, transform_desc = quantize_weight_to_bqq(
             quant_weight.cpu(),
             bit_width=bit_width, group_size=group_size, num_steps=num_steps,
-            rank_scale=rank_scale, seed=seed, device_id=device_id, H=H_current,
+            rank_scale=layer_rs, seed=seed, device_id=device_id, H=H_current,
             scale_refine=scale_refine, damping=damping, use_multibqq=use_multibqq,
             compensation_mode=compensation_mode, use_incoherent=use_incoherent,
             bqq_opt_mode=bqq_opt_mode, diag_power=diag_power, transform=transform,
@@ -2032,6 +2057,91 @@ def finetune_block_continuous_params(
 
 
 # ---------------------------------------------------------------------------
+# Progressive per-LAYER bit-width allocation (within one block)
+# ---------------------------------------------------------------------------
+#
+# Blockwise quantization treats each transformer block independently, so the
+# progressive schedule is applied *inside* a block, over that block's Linear
+# layers. The error of an earlier-quantized layer is easy to absorb: the layers
+# quantized after it (still full precision, then re-tuned to match the block
+# output) can compensate. A later layer has fewer downstream layers left to soak
+# up its error, so it deserves more bits. We therefore make the per-layer
+# effective bit-width increase along the block's quantization order while holding
+# the block's total memory (params x bits) fixed -- so the block's average
+# bits/param is unchanged versus a uniform run. The continuous target is realised
+# by dialing rank_scale per layer (rank_scale = eff_bits / bit_width). See
+# ``src/progressive_bits.py`` for the budget-preserving allocation.
+
+
+def compute_block_layer_plan(linear_names, linear_shapes, *, bit_width,
+                             base_rank_scale, strength, min_bits, max_bits):
+    """Per-layer effective-bit / rank_scale plan for one block.
+
+    ``linear_names`` are in block quantization order (get_quantizable_linears);
+    ``linear_shapes`` are the matching (out_features, in_features) pairs.
+    """
+    counts = [float(o) * float(i) for (o, i) in linear_shapes]
+    return build_bit_plan(
+        linear_names, counts, bit_width=bit_width, base_rank_scale=base_rank_scale,
+        strength=strength, min_bits=min_bits, max_bits=max_bits)
+
+
+def meta_block_linear_shapes(model_name, block_idx):
+    """(names, [(out, in), ...]) for one decoder block's Linears, via meta device.
+
+    Builds the model on the meta device (correct shapes, no weights read, ~zero
+    memory) so ``main`` can plan a block's schedule without a full model load.
+    """
+    model = None
+    try:
+        from transformers import AutoConfig, AutoModelForCausalLM
+        cfg = AutoConfig.from_pretrained(model_name)
+        with torch.device('meta'):
+            model = AutoModelForCausalLM.from_config(cfg)
+    except Exception:
+        model = load_causal_lm(model_name)
+    try:
+        num_blocks = get_decoder_num_layers(model)
+        if block_idx >= num_blocks:
+            raise ValueError(f"block_idx={block_idx} >= n_blocks {num_blocks}")
+        block = get_decoder_layer(model, block_idx)
+        names = get_quantizable_linears(block)
+        shapes = [(int(_get_submodule(block, n).weight.shape[0]),
+                   int(_get_submodule(block, n).weight.shape[1])) for n in names]
+        return names, shapes
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def block_layer_rank_scales(block, *, bit_width, base_rank_scale, strength,
+                            min_bits, max_bits):
+    """Build {linear_name: rank_scale} for every Linear in ``block``.
+
+    Returns (rank_scale_map, plan). Uniform (all == base_rank_scale) when strength
+    is 0, but always safe to apply.
+    """
+    names = get_quantizable_linears(block)
+    shapes = []
+    for name in names:
+        lin = _get_submodule(block, name)
+        shapes.append((int(lin.weight.shape[0]), int(lin.weight.shape[1])))
+    plan = compute_block_layer_plan(
+        names, shapes, bit_width=bit_width, base_rank_scale=base_rank_scale,
+        strength=strength, min_bits=min_bits, max_bits=max_bits)
+    rank_scale_map = {name: plan['items'][name]['rank_scale'] for name in names}
+    return rank_scale_map, plan
+
+
+def _resolve_layer_rank_scale(rank_scale_map, base_rank_scale, linear_name):
+    """rank_scale for a layer: the per-layer value if a map is given, else base."""
+    if rank_scale_map is None:
+        return base_rank_scale
+    return rank_scale_map.get(linear_name, base_rank_scale)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -2051,6 +2161,22 @@ def main():
     parser.add_argument('--num_steps', type=int, default=50000)
     parser.add_argument('--rank_scale', type=float, default=1.0)
     parser.add_argument('--seed', type=int, default=0)
+
+    # Progressive per-block bit-width allocation
+    parser.add_argument('--progressive_bits', action='store_true', default=False,
+                        help='Allocate per-block effective bit-width by depth: earlier blocks get '
+                             'fewer bits (their error is absorbed downstream), later blocks get more. '
+                             'Total memory (params x bits) is held equal to a uniform run; the '
+                             'continuous target is realised by scaling rank_scale per block.')
+    parser.add_argument('--progressive_strength', type=float, default=2.0,
+                        help='[progressive] Spread of the schedule in bits: eff_b = base + strength*(fbar - f_b) '
+                             'where f_b is the downstream-param fraction. 0 = uniform; larger = steeper.')
+    parser.add_argument('--progressive_min_bits', type=float, default=1.0,
+                        help='[progressive] Lower clamp on per-block effective bits/param.')
+    parser.add_argument('--progressive_max_bits', type=float, default=8.0,
+                        help='[progressive] Upper clamp on per-block effective bits/param.')
+    parser.add_argument('--print_bit_plan', action='store_true', default=False,
+                        help='[progressive] Print the full per-block bit plan and exit.')
 
     # Dataset
     parser.add_argument('--dataset', type=str, default='wikitext2',
@@ -2170,6 +2296,24 @@ def main():
 
     args = parser.parse_args()
 
+    # --print_bit_plan just reports the schedule; do it before any data/model load.
+    if args.print_bit_plan:
+        if not args.progressive_bits:
+            raise SystemExit('--print_bit_plan requires --progressive_bits')
+        names, shapes = meta_block_linear_shapes(args.model_name, args.block_idx)
+        plan = compute_block_layer_plan(
+            names, shapes,
+            bit_width=args.bit_width,
+            base_rank_scale=args.rank_scale,
+            strength=args.progressive_strength,
+            min_bits=args.progressive_min_bits,
+            max_bits=args.progressive_max_bits,
+        )
+        print(format_bit_plan_table(
+            plan, title=f'Progressive per-layer bit plan (block {args.block_idx})',
+            key_header='layer'))
+        return
+
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
 
@@ -2185,6 +2329,29 @@ def main():
     io_cache_dir = args.io_cache_dir
     if io_cache_dir is None:
         io_cache_dir = default_block_io_cache_dir(args.model_name, args.dataset, args.seqlen, args.nsamples)
+
+    # Progressive per-LAYER bit-width within this (independently quantized) block:
+    # build a {linear_name: rank_scale} map to hand to the quantization routines.
+    progressive_tag = None
+    layer_rank_scales = None
+    if args.progressive_bits:
+        names, shapes = meta_block_linear_shapes(args.model_name, args.block_idx)
+        plan = compute_block_layer_plan(
+            names, shapes,
+            bit_width=args.bit_width,
+            base_rank_scale=args.rank_scale,
+            strength=args.progressive_strength,
+            min_bits=args.progressive_min_bits,
+            max_bits=args.progressive_max_bits,
+        )
+        print(format_bit_plan_table(
+            plan, title=f'Progressive per-layer bit plan (block {args.block_idx})',
+            key_header='layer'))
+        layer_rank_scales = {n: plan['items'][n]['rank_scale'] for n in names}
+        # Keep progressive patches from colliding with a uniform run that shares
+        # the same (bit_width, group_size, num_steps) layerwise path.
+        progressive_tag = (f"prog_s{args.progressive_strength:g}"
+                           f"_{args.progressive_min_bits:g}-{args.progressive_max_bits:g}")
 
     if args.prepare_all_block_io_cache:
         prepare_block_artifacts(
@@ -2257,11 +2424,17 @@ def main():
         ste_refine_row_group_batch_size=args.ste_refine_row_group_batch_size,
         use_multibqq=args.use_multibqq,
         compensation_mode=args.compensation_mode,
+        layer_rank_scales=layer_rank_scales,
     )
 
     layerwise_dir = args.layerwise_dir
     if layerwise_dir is None:
         layerwise_dir = default_compressed_data_dir(args.model_name, args.bit_width, args.group_size, args.num_steps)
+        if progressive_tag is not None:
+            # Per-block rank_scale differs from a uniform run, but the default
+            # layerwise path is keyed only by (bit_width, group_size, num_steps).
+            # Isolate progressive patches so the two do not silently share caches.
+            layerwise_dir = f"{layerwise_dir}_{progressive_tag}"
 
     if args.progressive:
         if args.progressive_mode == 'patch':
@@ -2317,6 +2490,7 @@ def main():
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,
                 tune_after_quantize=not args.no_tune_after_quantize,
+                layer_rank_scales=layer_rank_scales,
             )
         else:
             quantize_block_progressive_closed_form(
@@ -2365,6 +2539,7 @@ def main():
                 ldlq_act_order=args.ldlq_act_order,
                 ldlq_act_order_score=args.ldlq_act_order_score,
                 rank_alloc_mode=args.rank_alloc_mode,
+                layer_rank_scales=layer_rank_scales,
             )
     else:
         quantize_block(

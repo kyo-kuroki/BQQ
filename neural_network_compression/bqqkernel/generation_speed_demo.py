@@ -8,12 +8,15 @@ only PyTorch and Transformers are required.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import csv
 import gc
+import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,6 +154,156 @@ def _compact_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return "..." + text[-limit + 3 :]
+
+
+def _video_font_path() -> str:
+    requested = os.environ.get("BQQ_VIDEO_FONT")
+    candidates = [
+        requested,
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise RuntimeError(
+        "No usable video font found. Set BQQ_VIDEO_FONT to a TrueType/OpenType font."
+    )
+
+
+def _wrapped_tail(text: str, width: int, max_lines: int) -> list[str]:
+    clean = text.replace("\r", "\\r").replace("\t", "    ")
+    lines: list[str] = []
+    for paragraph in clean.splitlines() or [""]:
+        lines.extend(textwrap.wrap(
+            paragraph,
+            width=width,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        ) or [""])
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+        lines[0] = "..." + lines[0][3:]
+    return lines
+
+
+def _render_video_frame(
+    *,
+    name: str,
+    prompt: str,
+    generated: str,
+    stat: "TokenStat",
+    max_new_tokens: int,
+    prefill_ms: float,
+    reference_tps: float,
+    width: int,
+    height: int,
+):
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("--video-out requires Pillow") from exc
+
+    scale = min(width / 1280.0, height / 720.0)
+    margin = max(18, int(34 * scale))
+    title_size = max(22, int(34 * scale))
+    body_size = max(14, int(20 * scale))
+    small_size = max(12, int(16 * scale))
+    font_path = _video_font_path()
+    title_font = ImageFont.truetype(font_path, title_size)
+    body_font = ImageFont.truetype(font_path, body_size)
+    small_font = ImageFont.truetype(font_path, small_size)
+
+    image = Image.new("RGB", (width, height), "#09131f")
+    draw = ImageDraw.Draw(image)
+
+    def line_capacity(font, available_width: float) -> int:
+        sample = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        average_width = draw.textlength(sample, font=font) / len(sample)
+        return max(12, int(available_width / max(average_width, 1.0)))
+
+    draw.rectangle((0, 0, width, max(6, int(8 * scale))), fill="#26d7a0")
+    draw.text((margin, margin), name, font=title_font, fill="#f4f7f5")
+    token_label = f"TOKEN {stat.index:03d} / {max_new_tokens}"
+    token_box = draw.textbbox((0, 0), token_label, font=body_font)
+    draw.text(
+        (width - margin - (token_box[2] - token_box[0]), margin + 6 * scale),
+        token_label,
+        font=body_font,
+        fill="#26d7a0",
+    )
+
+    metrics_y = margin + title_size + int(28 * scale)
+    metrics = (
+        f"PREFILL  {prefill_ms:8.2f} ms     "
+        f"LAST  {stat.latency_ms:7.2f} ms/token     "
+        f"AVERAGE  {stat.cumulative_tps:7.2f} tok/s"
+    )
+    draw.text((margin, metrics_y), metrics, font=small_font, fill="#b7c7d6")
+
+    bar_y = metrics_y + small_size + int(18 * scale)
+    bar_h = max(10, int(14 * scale))
+    bar_width = width - 2 * margin
+    fraction = min(max(stat.cumulative_tps / reference_tps, 0.0), 1.0) if reference_tps > 0 else 0.0
+    draw.rounded_rectangle(
+        (margin, bar_y, margin + bar_width, bar_y + bar_h),
+        radius=bar_h // 2,
+        fill="#26384a",
+    )
+    if fraction > 0:
+        draw.rounded_rectangle(
+            (margin, bar_y, margin + max(bar_h, int(bar_width * fraction)), bar_y + bar_h),
+            radius=bar_h // 2,
+            fill="#26d7a0",
+        )
+
+    panel_top = bar_y + bar_h + int(30 * scale)
+    panel_gap = int(18 * scale)
+    prompt_h = max(100, int(130 * scale))
+    panel_color = "#102333"
+    draw.rounded_rectangle(
+        (margin, panel_top, width - margin, panel_top + prompt_h),
+        radius=max(8, int(12 * scale)),
+        fill=panel_color,
+    )
+    draw.text((margin + 18 * scale, panel_top + 13 * scale), "PROMPT", font=small_font, fill="#f2b84b")
+    text_width = width - 2 * margin - 36 * scale
+    prompt_lines = _wrapped_tail(
+        prompt, line_capacity(small_font, text_width), 3)
+    draw.multiline_text(
+        (margin + 18 * scale, panel_top + 43 * scale),
+        "\n".join(prompt_lines),
+        font=small_font,
+        fill="#e7edf1",
+        spacing=max(3, int(5 * scale)),
+    )
+
+    generated_top = panel_top + prompt_h + panel_gap
+    generated_bottom = height - margin
+    draw.rounded_rectangle(
+        (margin, generated_top, width - margin, generated_bottom),
+        radius=max(8, int(12 * scale)),
+        fill=panel_color,
+    )
+    draw.text(
+        (margin + 18 * scale, generated_top + 13 * scale),
+        "GENERATED",
+        font=small_font,
+        fill="#42bcec",
+    )
+    line_height = body_size + max(4, int(7 * scale))
+    max_lines = max(1, int((generated_bottom - generated_top - 62 * scale) / line_height))
+    generated_lines = _wrapped_tail(
+        generated, line_capacity(body_font, text_width), max_lines)
+    draw.multiline_text(
+        (margin + 18 * scale, generated_top + 48 * scale),
+        "\n".join(generated_lines),
+        font=body_font,
+        fill="#f4f7f5",
+        spacing=max(4, int(7 * scale)),
+    )
+    return image
 
 
 @dataclass
@@ -532,6 +685,109 @@ def _write_json(path: str, results: list[RunResult], args: argparse.Namespace) -
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def _write_video(
+    path: str,
+    results: list[RunResult],
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int,
+    reference_tps: float,
+    fps: int,
+    token_duration: float,
+    width: int,
+    height: int,
+    use_measured_timing: bool = False,
+    time_scale: float = 1.0,
+) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("--video-out requires ffmpeg on PATH")
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise ValueError("video width and height must be positive even numbers")
+    if fps <= 0 or token_duration <= 0 or time_scale <= 0:
+        raise ValueError("video FPS, token duration, and time scale must be positive")
+
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg,
+        "-y",
+        "-loglevel", "error",
+        "-f", "rawvideo",
+        "-pixel_format", "rgb24",
+        "-video_size", f"{width}x{height}",
+        "-framerate", str(fps),
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    ffmpeg_env = os.environ.copy()
+    # Conda CUDA environments can shadow system libffi/ncurses dependencies
+    # required by the distro ffmpeg binary.
+    ffmpeg_env.pop("LD_LIBRARY_PATH", None)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=ffmpeg_env,
+    )
+    if process.stdin is None or process.stderr is None:
+        process.kill()
+        raise RuntimeError("failed to open ffmpeg pipes")
+
+    frames_per_token = max(1, round(fps * token_duration))
+    write_error: Exception | None = None
+    try:
+        for result in results:
+            generated_ids: list[int] = []
+            measured_elapsed_s = 0.0
+            emitted_frames = 0
+            for position, stat in enumerate(result.token_stats):
+                generated_ids.append(stat.token_id)
+                generated = tokenizer.decode(generated_ids, skip_special_tokens=False)
+                frame = _render_video_frame(
+                    name=result.name,
+                    prompt=prompt,
+                    generated=generated,
+                    stat=stat,
+                    max_new_tokens=max_new_tokens,
+                    prefill_ms=result.prefill_ms,
+                    reference_tps=reference_tps,
+                    width=width,
+                    height=height,
+                )
+                repeats = frames_per_token
+                if use_measured_timing and stat.latency_ms > 0:
+                    measured_elapsed_s += stat.latency_ms / 1000.0 * time_scale
+                    target_frames = max(
+                        position + 1,
+                        round(fps * measured_elapsed_s),
+                    )
+                    repeats = max(1, target_frames - emitted_frames)
+                elif position == 0 or position == len(result.token_stats) - 1:
+                    repeats = max(repeats, fps)
+                frame_bytes = frame.tobytes()
+                for _ in range(repeats):
+                    process.stdin.write(frame_bytes)
+                emitted_frames += repeats
+    except Exception as exc:
+        write_error = exc
+    finally:
+        process.stdin.close()
+
+    stderr = process.stderr.read().decode("utf-8", errors="replace").strip()
+    return_code = process.wait()
+    if write_error is not None:
+        raise RuntimeError(f"video encoding failed: {write_error}; ffmpeg: {stderr}") from write_error
+    if return_code != 0:
+        raise RuntimeError(f"ffmpeg exited with status {return_code}: {stderr}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-name", default="Qwen/Qwen3.5-4B")
@@ -551,6 +807,13 @@ def main() -> None:
                         help="Scale used for the terminal speed bar.")
     parser.add_argument("--csv-out", default=None)
     parser.add_argument("--json-out", default=None)
+    parser.add_argument("--video-out", default=None,
+                        help="Save the token-by-token dashboard as an H.264 MP4 after generation.")
+    parser.add_argument("--video-fps", type=int, default=30)
+    parser.add_argument("--video-token-duration", type=float, default=0.15,
+                        help="Seconds to show each generated token in the saved video.")
+    parser.add_argument("--video-width", type=int, default=1280)
+    parser.add_argument("--video-height", type=int, default=720)
     parser.add_argument(
         "--bqq-decode-kernel",
         default=None,
@@ -630,6 +893,21 @@ def main() -> None:
     if args.json_out:
         _write_json(args.json_out, results, args)
         print(f"Saved JSON to {args.json_out}")
+    if args.video_out:
+        print(f"Encoding generation video to {args.video_out}...", flush=True)
+        _write_video(
+            args.video_out,
+            results,
+            tokenizer,
+            args.prompt,
+            args.max_new_tokens,
+            args.reference_tps,
+            args.video_fps,
+            args.video_token_duration,
+            args.video_width,
+            args.video_height,
+        )
+        print(f"Saved video to {args.video_out}")
 
 
 if __name__ == "__main__":

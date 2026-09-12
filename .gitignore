@@ -29,3 +29,9 @@ neural_network_compression/cv/cache/
 
 # Matrix compression results
 matrix_compression/results/
+matrix_compression/grid_*.csv
+
+# Generated experiment artifacts
+neural_network_compression/bqqkernel/vllm_comparison_videos/
+neural_network_compression/lm/e2e_output/
+neural_network_compression/lm/src/hessian_cache/

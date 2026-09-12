@@ -341,10 +341,12 @@ def _quantize_block_worker(rank: int, gpu_tasks: list, common: dict):
             print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name}: no Hessian, skip")
             continue
 
-        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}")
+        task_rank_scale = task.get('rank_scale', common['rank_scale'])
+        _rs_note = '' if task_rank_scale == common['rank_scale'] else f" rank_scale={task_rank_scale:.4f}"
+        print(f"[GPU{gpu_id}/W{rank}] [{display_idx}/{n_total}] {param_name} {tuple(weight.shape)}{_rs_note}")
 
         _qW, _qH, _tdesc = apply_transform(weight, H, common.get('transform', 'none'), common['seed'], gpu_id)
-        quantizer = BinaryQuadraticQuantization(_qW, rank_scale=common['rank_scale'])
+        quantizer = BinaryQuadraticQuantization(_qW, rank_scale=task_rank_scale)
         reconstructed = quantizer.bqq_large_matrix_multi_worker(
             max_patch_size=common['group_size'],
             bit_width=common['bit_width'],
@@ -575,6 +577,7 @@ def layerwise_quantize_block(
     row_group_batch_size: Optional[int],
     use_multibqq: bool,
     compensation_mode: str,
+    layer_rank_scales: Optional[Dict[str, float]] = None,
     bqq_opt_mode: str = 'plain',
     diag_power: float = 1.0,
     transform: str = 'none',
@@ -650,6 +653,10 @@ def layerwise_quantize_block(
         weight = submodule.weight.detach().cpu().float()
         H = H_dict.get(module_name)
 
+        target_rank_scale = rank_scale
+        if layer_rank_scales is not None:
+            target_rank_scale = layer_rank_scales.get(module_name, rank_scale)
+
         target_data.append({
             'module_name': module_name,
             'display_idx': i + 1,
@@ -658,6 +665,7 @@ def layerwise_quantize_block(
             'consolidated_path': str(consolidated_path),
             'weight': weight,
             'H': H,
+            'rank_scale': target_rank_scale,
         })
 
     # Free model

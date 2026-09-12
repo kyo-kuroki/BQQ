@@ -126,10 +126,13 @@ def _time_forward(
     warmup: int,
     iters: int,
     inner_iters: int,
+    before_each=None,
 ) -> tuple[float, float, float]:
     torch.cuda.synchronize()
     with torch.inference_mode():
         for _ in range(warmup):
+            if before_each is not None:
+                before_each()
             fn()
         torch.cuda.synchronize()
 
@@ -137,12 +140,15 @@ def _time_forward(
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         for _ in range(iters):
+            if before_each is not None:
+                before_each()
             start.record()
-            for _ in range(inner_iters):
+            repeats = 1 if before_each is not None else inner_iters
+            for _ in range(repeats):
                 fn()
             end.record()
             torch.cuda.synchronize()
-            samples.append(start.elapsed_time(end) / inner_iters)
+            samples.append(start.elapsed_time(end) / repeats)
 
     mean_ms = statistics.fmean(samples)
     p50_ms = statistics.median(samples)
@@ -171,7 +177,14 @@ def _parse_decode_kernels(value: str) -> list[str | None]:
             continue
         if item.lower() in {"default", "current", "fused"}:
             result.append(None)
-        elif item in {"bitblas_byte", "bitblas_byte2", "bitblas_byte4"}:
+        elif item in {
+            "bitblas_byte",
+            "bitblas_byte2",
+            "bitblas_byte4",
+            "bitblas_byte4_serial",
+            "bitplane_packed",
+            "two_stage_warp",
+        }:
             result.append(item)
         else:
             raise ValueError(f"unknown decode kernel: {item}")
@@ -442,6 +455,12 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--inner-iters", type=int, default=1)
     parser.add_argument(
+        "--l2-flush-mb",
+        type=int,
+        default=0,
+        help="Touch this many MiB before every timed call to approximate cold L2 cache.",
+    )
+    parser.add_argument(
         "--baseline",
         choices=["none", "dense-bf16", "dense-fp16", "all"],
         default="dense-bf16",
@@ -455,7 +474,11 @@ def main() -> None:
     parser.add_argument(
         "--decode-kernels",
         default="default,bitblas_byte4,bitblas_byte2,bitblas_byte",
-        help="Comma-separated decode kernels: default,bitblas_byte4,bitblas_byte2,bitblas_byte.",
+        help=(
+            "Comma-separated decode kernels: default,bitblas_byte4,"
+            "bitblas_byte4_serial,bitplane_packed,bitblas_byte2,"
+            "bitblas_byte,two_stage_warp."
+        ),
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -489,6 +512,16 @@ def main() -> None:
     y_row = args.y_row if args.y_row is not None else default_group
     z_col = args.z_col if args.z_col is not None else default_group
     bit_widths = _parse_ints(args.bit_widths) if args.bit_widths else [args.bit_width]
+    l2_flush = (
+        torch.zeros(
+            args.l2_flush_mb * 1024 * 1024 // 4,
+            device=device,
+            dtype=torch.float32,
+        )
+        if args.l2_flush_mb > 0
+        else None
+    )
+    before_each = (lambda: l2_flush.add_(1.0)) if l2_flush is not None else None
 
     print("method,bits,col_splits,mean_ms,p50_ms,p90_ms,tokens_per_s")
 
@@ -535,6 +568,7 @@ def main() -> None:
                     warmup=args.warmup,
                     iters=args.iters,
                     inner_iters=args.inner_iters,
+                    before_each=before_each,
                 )
                 toks = 1000.0 / mean_ms
                 print(f"{name},{bit_width},n/a,{mean_ms:.4f},{p50_ms:.4f},{p90_ms:.4f},{toks:.2f}")
@@ -560,6 +594,7 @@ def main() -> None:
                         warmup=args.warmup,
                         iters=args.iters,
                         inner_iters=args.inner_iters,
+                        before_each=before_each,
                     )
                     toks = 1000.0 / mean_ms
                     print(

@@ -7,10 +7,19 @@ engine re-imports the main file during worker startup.
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 import time
 from dataclasses import dataclass, replace
 from math import lcm
+from pathlib import Path
+
+package_root = Path(__file__).resolve().parents[1]
+project_root = package_root.parent
+for repo_path in (project_root, package_root):
+    if str(repo_path) not in sys.path:
+        sys.path.insert(0, str(repo_path))
 
 
 def _register_vllm_bqq() -> None:
@@ -90,16 +99,20 @@ class ThroughputResult:
     generated_tokens: int
     elapsed_sec: float
     tokens_per_sec: float
+    token_ids: list[int]
+    generated_text: str
 
 
 def run_demo(args: argparse.Namespace) -> ThroughputResult:
     from vllm import LLM, SamplingParams
 
-    prompts = [args.prompt for _ in range(args.batch_size)]
     sampling = SamplingParams(
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
+        stop=args.stop or None,
+        repetition_penalty=args.repetition_penalty,
+        frequency_penalty=args.frequency_penalty,
     )
 
     print(f"model: {args.model}")
@@ -122,6 +135,12 @@ def run_demo(args: argparse.Namespace) -> ThroughputResult:
         mamba_cache_mode=args.mamba_cache_mode,
         mamba_block_size=args.mamba_block_size,
     )
+    if args.no_repeat_ngram_size:
+        os.environ["BQQ_NO_REPEAT_NGRAM_SIZE"] = str(args.no_repeat_ngram_size)
+        llm_kwargs["logits_processors"] = [
+            "neural_network_compression.bqqkernel.vllm_logits_processors:"
+            "NoRepeatNGramLogitsProcessor"
+        ]
     if args.max_num_batched_tokens is not None:
         llm_kwargs["max_num_batched_tokens"] = args.max_num_batched_tokens
         llm_kwargs["max_num_seqs"] = args.batch_size
@@ -153,6 +172,16 @@ def run_demo(args: argparse.Namespace) -> ThroughputResult:
     llm = LLM(**llm_kwargs)
     print(f"load_sec={time.perf_counter() - load_start:.3f}")
 
+    prompt = args.prompt
+    if args.apply_chat_template:
+        prompt = llm.get_tokenizer().apply_chat_template(
+            [{"role": "user", "content": args.prompt}],
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    prompts = [prompt for _ in range(args.batch_size)]
+
     if args.warmup:
         llm.generate(prompts[:1], sampling)
 
@@ -169,7 +198,31 @@ def run_demo(args: argparse.Namespace) -> ThroughputResult:
     if outputs:
         print("sample_output:")
         print(outputs[0].outputs[0].text[: args.print_chars])
-    return ThroughputResult(len(outputs), generated_tokens, elapsed, tps)
+    token_ids = list(outputs[0].outputs[0].token_ids) if outputs else []
+    generated_text = outputs[0].outputs[0].text if outputs else ""
+    return ThroughputResult(
+        len(outputs), generated_tokens, elapsed, tps, token_ids, generated_text
+    )
+
+
+def _write_result(path: str, result: ThroughputResult, args: argparse.Namespace) -> None:
+    output_path = Path(path).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "name": args.result_name,
+        "model": args.model,
+        "prompt": args.prompt,
+        "cuda_graph": args.decode_only_cuda_graph,
+        "requests": result.requests,
+        "generated_tokens": result.generated_tokens,
+        "elapsed_sec": result.elapsed_sec,
+        "tokens_per_sec": result.tokens_per_sec,
+        "token_ids": result.token_ids,
+        "generated_text": result.generated_text,
+    }
+    with output_path.open("w") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"Saved result JSON to {output_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -192,6 +245,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--frequency-penalty", type=float, default=0.0)
+    parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=0,
+        help="Ban repeated output n-grams; 0 disables the constraint.",
+    )
+    parser.add_argument(
+        "--stop",
+        action="append",
+        default=[],
+        help="Stop string; may be provided more than once.",
+    )
+    parser.add_argument(
+        "--apply-chat-template",
+        action="store_true",
+        help="Format the prompt as a user message before generation.",
+    )
     parser.add_argument("--ignore-eos", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument(
@@ -208,9 +280,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mamba-block-size", type=int, default=16)
     parser.add_argument("--no-warmup", dest="warmup", action="store_false")
     parser.add_argument("--print-chars", type=int, default=500)
+    parser.add_argument("--result-name", default="vLLM")
+    parser.add_argument("--json-out", default=None)
     parser.set_defaults(warmup=True)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    run_demo(parse_args())
+    cli_args = parse_args()
+    demo_result = run_demo(cli_args)
+    if cli_args.json_out:
+        _write_result(cli_args.json_out, demo_result, cli_args)

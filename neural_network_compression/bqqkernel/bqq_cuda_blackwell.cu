@@ -342,8 +342,35 @@ torch::Tensor bqq_forward(
                             col_width, y_row, z_col);
 }
 
+torch::Tensor bqq_forward_core_out(
+    torch::Tensor Y_flat,
+    torch::Tensor Z_flat,
+    torch::Tensor X,
+    torch::Tensor a_flat,
+    torch::Tensor b_flat,
+    torch::Tensor c_flat,
+    torch::Tensor d_flat,
+    torch::Tensor bias,
+    torch::Tensor ws,
+    torch::Tensor output,
+    int64_t output_offset,
+    int64_t bit_width,
+    int64_t row_width,
+    int64_t col_width,
+    int64_t y_row,
+    int64_t z_col)
+{
+    auto result = bqq_forward_core(
+        Y_flat, Z_flat, X, a_flat, b_flat, c_flat, d_flat, bias, ws,
+        bit_width, row_width, col_width, y_row, z_col);
+    output.narrow(-1, output_offset, result.size(-1)).copy_(result);
+    return output;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bqq_forward", &bqq_forward, "Blackwell BQQ forward");
     m.def("bqq_forward_flat", &bqq_forward_core,
           "Blackwell BQQ forward with flattened weights");
+    m.def("bqq_forward_flat_out", &bqq_forward_core_out,
+          "Blackwell BQQ forward writing into an output slice");
 }
